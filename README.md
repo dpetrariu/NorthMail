@@ -81,7 +81,7 @@ northmail/
 
 ## Contributing
 
-Contributions are welcome! Please read our contributing guidelines before submitting PRs.
+This project is in its initial stage of development. Contributions cannot be considered at this moment.
 
 ## License
 

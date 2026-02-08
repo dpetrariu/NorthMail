@@ -26,6 +26,10 @@ Cargo.lock
 \#*\#
 .#*
 
+# Claude Code
+.claude/
+claude.md
+
 # OS files
 .DS_Store
 Thumbs.db
