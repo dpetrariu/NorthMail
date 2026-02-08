@@ -1,0 +1,40 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Build directories
+/build/
+/_build/
+/builddir/
+/.flatpak-builder/
+
+# Generated files
+*.o
+*.a
+*.so
+
+# Editor backup files
+*~
+\#*\#
+.#*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test database
+*.db
+*.db-journal
+
+# Credentials (never commit!)
+*.pem
+*.key
+client_secret*.json

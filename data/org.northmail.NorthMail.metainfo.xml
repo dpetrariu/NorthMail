@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.northmail.NorthMail</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>NorthMail</name>
+  <summary>A modern email client for GNOME</summary>
+
+  <description>
+    <p>
+      NorthMail is a modern, simple email client designed for the GNOME desktop.
+      It focuses on providing a clean, distraction-free email experience with
+      excellent Gmail support.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Native GNOME look and feel with libadwaita</li>
+      <li>Gmail support with GNOME Online Accounts integration</li>
+      <li>Adaptive layout for different screen sizes</li>
+      <li>Fast full-text search</li>
+      <li>Offline message access</li>
+      <li>Real-time email notifications via IMAP IDLE</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">org.northmail.NorthMail.desktop</launchable>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#62a0ea</color>
+    <color type="primary" scheme_preference="dark">#1c71d8</color>
+  </branding>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>The main NorthMail window showing the inbox</caption>
+      <image>https://raw.githubusercontent.com/northmail/northmail/main/data/screenshots/main-window.png</image>
+    </screenshot>
+  </screenshots>
+
+  <url type="homepage">https://github.com/northmail/northmail</url>
+  <url type="bugtracker">https://github.com/northmail/northmail/issues</url>
+  <url type="vcs-browser">https://github.com/northmail/northmail</url>
+  <url type="translate">https://github.com/northmail/northmail/tree/main/po</url>
+
+  <developer id="org.northmail">
+    <name>NorthMail Contributors</name>
+  </developer>
+
+  <provides>
+    <binary>northmail</binary>
+  </provides>
+
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+
+  <recommends>
+    <control>keyboard</control>
+    <control>pointing</control>
+    <control>touch</control>
+  </recommends>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="0.1.0" date="2024-01-01">
+      <description>
+        <p>Initial release of NorthMail.</p>
+      </description>
+    </release>
+  </releases>
+
+  <translation type="gettext">northmail</translation>
+</component>

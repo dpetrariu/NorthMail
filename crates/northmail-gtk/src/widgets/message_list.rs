@@ -1,0 +1,619 @@
+//! Message list widget - Apple Mail inspired design
+
+use gtk4::{glib, prelude::*, subclass::prelude::*};
+use libadwaita as adw;
+use std::cell::Cell;
+
+/// Escape XML/Pango markup special characters
+fn escape_markup(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Format email date for display (like Apple Mail)
+/// Input: "Sat, 08 Feb 2025 14:30:45 +0000" or similar
+/// Output: "2:30 PM" (today), "Yesterday", "Feb 7", "12/25/24"
+fn format_date(date_str: &str) -> String {
+    // Try to parse the date
+    if let Some(formatted) = try_parse_email_date(date_str) {
+        return formatted;
+    }
+
+    // Fallback: just show a cleaned up version
+    // Remove timezone offset and seconds
+    let cleaned = date_str
+        .trim()
+        .replace(" +0000", "")
+        .replace(" -0000", "");
+
+    // Try to extract just time or date
+    if let Some(time_start) = cleaned.rfind(' ') {
+        let time_part = &cleaned[time_start + 1..];
+        // If it looks like a time (HH:MM:SS), strip seconds
+        if time_part.len() >= 5 && time_part.chars().nth(2) == Some(':') {
+            return time_part[..5].to_string();
+        }
+    }
+
+    // Just return first 10 chars or the whole thing
+    if cleaned.len() > 16 {
+        cleaned[..16].to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn try_parse_email_date(date_str: &str) -> Option<String> {
+    // Parse RFC 2822 style date: "Sat, 08 Feb 2025 14:30:45 +0000"
+    let parts: Vec<&str> = date_str.split_whitespace().collect();
+
+    if parts.len() >= 5 {
+        // Extract components
+        let day: u32 = parts.get(1)?.parse().ok()?;
+        let month_str = *parts.get(2)?;
+        let year: i32 = parts.get(3)?.parse().ok()?;
+        let time_str = *parts.get(4)?;
+
+        // Parse time (HH:MM:SS)
+        let time_parts: Vec<&str> = time_str.split(':').collect();
+        let hour: u32 = time_parts.get(0)?.parse().ok()?;
+        let minute: u32 = time_parts.get(1)?.parse().ok()?;
+
+        // Get current date for comparison
+        let now = glib::DateTime::now_local().ok()?;
+        let today_day = now.day_of_month();
+        let today_month = now.month();
+        let today_year = now.year();
+
+        let month = match month_str.to_lowercase().as_str() {
+            "jan" => 1, "feb" => 2, "mar" => 3, "apr" => 4,
+            "may" => 5, "jun" => 6, "jul" => 7, "aug" => 8,
+            "sep" => 9, "oct" => 10, "nov" => 11, "dec" => 12,
+            _ => return None,
+        };
+
+        // Format based on how old the message is
+        if year == today_year && month == today_month && day as i32 == today_day {
+            // Today - show time
+            let hour_12 = if hour == 0 { 12 } else if hour > 12 { hour - 12 } else { hour };
+            let am_pm = if hour < 12 { "AM" } else { "PM" };
+            Some(format!("{}:{:02} {}", hour_12, minute, am_pm))
+        } else if year == today_year && month == today_month && day as i32 == today_day - 1 {
+            // Yesterday
+            Some("Yesterday".to_string())
+        } else if year == today_year {
+            // This year - show month and day
+            Some(format!("{} {}", month_str, day))
+        } else {
+            // Older - show short date
+            Some(format!("{}/{}/{}", month, day, year % 100))
+        }
+    } else {
+        None
+    }
+}
+
+mod imp {
+    use super::*;
+    use glib::subclass::Signal;
+    use std::cell::RefCell;
+    use std::sync::OnceLock;
+
+    #[derive(Default)]
+    pub struct MessageList {
+        pub list_box: RefCell<Option<gtk4::ListBox>>,
+        pub search_entry: RefCell<Option<gtk4::SearchEntry>>,
+        pub scrolled: RefCell<Option<gtk4::ScrolledWindow>>,
+        pub load_more_row: RefCell<Option<gtk4::ListBoxRow>>,
+        pub can_load_more: Cell<bool>,
+        pub is_loading_more: Cell<bool>,
+        pub on_load_more: RefCell<Option<Box<dyn Fn()>>>,
+        pub message_count: Cell<usize>,
+        pub total_count: Cell<u32>,
+        /// Store message info for each row (uid -> MessageInfo)
+        pub messages: RefCell<Vec<super::MessageInfo>>,
+        /// Whether scroll handler for infinite scroll is connected
+        pub scroll_handler_connected: Cell<bool>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for MessageList {
+        const NAME: &'static str = "NorthMailMessageList";
+        type Type = super::MessageList;
+        type ParentType = gtk4::Box;
+    }
+
+    impl ObjectImpl for MessageList {
+        fn signals() -> &'static [Signal] {
+            static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
+            SIGNALS.get_or_init(|| {
+                vec![Signal::builder("message-selected")
+                    .param_types([u32::static_type()]) // message UID
+                    .build()]
+            })
+        }
+
+        fn constructed(&self) {
+            self.parent_constructed();
+
+            let obj = self.obj();
+            obj.set_orientation(gtk4::Orientation::Vertical);
+            obj.set_vexpand(true);
+            obj.set_hexpand(true);
+
+            obj.setup_ui();
+        }
+    }
+
+    impl WidgetImpl for MessageList {}
+    impl BoxImpl for MessageList {}
+}
+
+glib::wrapper! {
+    pub struct MessageList(ObjectSubclass<imp::MessageList>)
+        @extends gtk4::Box, gtk4::Widget,
+        @implements gtk4::Accessible, gtk4::Buildable, gtk4::ConstraintTarget, gtk4::Orientable;
+}
+
+impl MessageList {
+    pub fn new() -> Self {
+        glib::Object::new()
+    }
+
+    fn setup_ui(&self) {
+        let imp = self.imp();
+
+        // Search bar
+        let search_entry = gtk4::SearchEntry::builder()
+            .placeholder_text("Search messages...")
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(6)
+            .margin_bottom(6)
+            .build();
+
+        self.append(&search_entry);
+        imp.search_entry.replace(Some(search_entry));
+
+        // Separator
+        let separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        self.append(&separator);
+
+        // Message list
+        let scrolled = gtk4::ScrolledWindow::builder()
+            .vexpand(true)
+            .hexpand(true)
+            .build();
+
+        let list_box = gtk4::ListBox::builder()
+            .selection_mode(gtk4::SelectionMode::Single)
+            .build();
+
+        // Remove default styling for cleaner look
+        list_box.add_css_class("navigation-sidebar");
+
+        // Placeholder content - initially empty, will be populated when folder is selected
+        let placeholder = adw::StatusPage::builder()
+            .icon_name("mail-inbox-symbolic")
+            .title("Select a folder")
+            .description("Choose a folder from the sidebar to view messages")
+            .build();
+
+        scrolled.set_child(Some(&placeholder));
+        self.append(&scrolled);
+
+        imp.scrolled.replace(Some(scrolled));
+        imp.list_box.replace(Some(list_box));
+    }
+
+    /// Set total message count in folder (for progress display)
+    pub fn set_total_count(&self, count: u32) {
+        self.imp().total_count.set(count);
+    }
+
+    /// Connect to the message-selected signal
+    pub fn connect_message_selected<F>(&self, f: F) -> glib::SignalHandlerId
+    where
+        F: Fn(&Self, u32) + 'static,
+    {
+        self.connect_closure(
+            "message-selected",
+            false,
+            glib::closure_local!(move |list: &MessageList, uid: u32| {
+                f(list, uid);
+            }),
+        )
+    }
+
+    /// Connect callback for when user wants to load more messages
+    pub fn connect_load_more<F: Fn() + 'static>(&self, callback: F) {
+        self.imp().on_load_more.replace(Some(Box::new(callback)));
+    }
+
+    /// Show or hide load more capability (with infinite scroll)
+    pub fn set_can_load_more(&self, can_load: bool) {
+        let imp = self.imp();
+        imp.can_load_more.set(can_load);
+
+        if let Some(list_box) = imp.list_box.borrow().as_ref() {
+            // Remove existing load more row if any
+            if let Some(row) = imp.load_more_row.take() {
+                list_box.remove(&row);
+            }
+
+            if can_load {
+                // Add loading indicator row (spinner, not button)
+                let row = self.create_loading_row();
+                list_box.append(&row);
+                imp.load_more_row.replace(Some(row));
+
+                // Set up scroll detection for infinite scroll
+                self.setup_infinite_scroll();
+            }
+        }
+    }
+
+    /// Set up infinite scroll detection
+    fn setup_infinite_scroll(&self) {
+        let imp = self.imp();
+
+        // Only connect once
+        if imp.scroll_handler_connected.get() {
+            return;
+        }
+
+        if let Some(scrolled) = imp.scrolled.borrow().as_ref() {
+            imp.scroll_handler_connected.set(true);
+
+            let vadjustment = scrolled.vadjustment();
+            let widget = self.clone();
+
+            vadjustment.connect_value_changed(move |adj| {
+                let imp = widget.imp();
+
+                // Don't trigger if we can't load more or already loading
+                if !imp.can_load_more.get() || imp.is_loading_more.get() {
+                    return;
+                }
+
+                // Check if we're near the bottom (within 200 pixels)
+                let value = adj.value();
+                let upper = adj.upper();
+                let page_size = adj.page_size();
+                let threshold = 200.0;
+
+                if value + page_size + threshold >= upper {
+                    // Near bottom - trigger load more
+                    imp.is_loading_more.set(true);
+
+                    // Show the loading spinner
+                    if let Some(row) = imp.load_more_row.borrow().as_ref() {
+                        row.set_visible(true);
+                        if let Some(hbox) = row.child().and_downcast::<gtk4::Box>() {
+                            if let Some(spinner) = hbox.first_child().and_downcast::<gtk4::Spinner>() {
+                                spinner.start();
+                            }
+                        }
+                    }
+
+                    // Call the load more callback
+                    if let Some(callback) = imp.on_load_more.borrow().as_ref() {
+                        callback();
+                    }
+                }
+            });
+        }
+    }
+
+    /// Create a loading indicator row (for infinite scroll)
+    fn create_loading_row(&self) -> gtk4::ListBoxRow {
+        let row = gtk4::ListBoxRow::builder()
+            .activatable(false)
+            .selectable(false)
+            .build();
+
+        let hbox = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(8)
+            .halign(gtk4::Align::Center)
+            .margin_top(12)
+            .margin_bottom(12)
+            .build();
+
+        let spinner = gtk4::Spinner::builder()
+            .spinning(false)
+            .build();
+
+        let label = gtk4::Label::builder()
+            .label("Loading more...")
+            .css_classes(["dim-label"])
+            .build();
+
+        hbox.append(&spinner);
+        hbox.append(&label);
+        row.set_child(Some(&hbox));
+
+        // Initially hidden until we scroll near bottom
+        row.set_visible(false);
+
+        row
+    }
+
+    /// Called when loading more is complete
+    pub fn finish_loading_more(&self) {
+        let imp = self.imp();
+        imp.is_loading_more.set(false);
+
+        // Hide the loading row - it will show again when user scrolls
+        if let Some(row) = imp.load_more_row.borrow().as_ref() {
+            row.set_visible(false);
+            if let Some(hbox) = row.child().and_downcast::<gtk4::Box>() {
+                if let Some(spinner) = hbox.first_child().and_downcast::<gtk4::Spinner>() {
+                    spinner.stop();
+                }
+            }
+        }
+    }
+
+    /// Clear and set initial messages
+    pub fn set_messages(&self, messages: Vec<MessageInfo>) {
+        let imp = self.imp();
+
+        let scrolled = imp.scrolled.borrow();
+        let list_box = imp.list_box.borrow();
+
+        // Reset counters and store messages
+        imp.message_count.set(messages.len());
+        imp.messages.replace(messages.clone());
+
+        if let (Some(scrolled), Some(list_box)) = (scrolled.as_ref(), list_box.as_ref()) {
+            // Clear existing rows
+            while let Some(child) = list_box.first_child() {
+                list_box.remove(&child);
+            }
+            imp.load_more_row.replace(None);
+
+            if messages.is_empty() {
+                // Show empty state for an empty folder
+                let placeholder = adw::StatusPage::builder()
+                    .icon_name("mail-inbox-symbolic")
+                    .title("Empty Folder")
+                    .description("There are no messages in this folder")
+                    .build();
+                scrolled.set_child(Some(&placeholder));
+            } else {
+                // Add new messages and show the list
+                for msg in &messages {
+                    self.add_message_row(list_box, msg);
+                }
+
+                // Connect row activation to emit message-selected signal
+                let widget = self.clone();
+                list_box.connect_row_activated(move |_, row| {
+                    let index = row.index() as usize;
+                    let messages = widget.imp().messages.borrow();
+                    if let Some(msg) = messages.get(index) {
+                        widget.emit_by_name::<()>("message-selected", &[&msg.uid]);
+                    }
+                });
+
+                scrolled.set_child(Some(list_box));
+            }
+        }
+    }
+
+    /// Append more messages to the existing list
+    pub fn append_messages(&self, messages: Vec<MessageInfo>) {
+        let imp = self.imp();
+
+        if let Some(list_box) = imp.list_box.borrow().as_ref() {
+            // Remove load more row temporarily
+            let load_more_row = imp.load_more_row.take();
+            if let Some(ref row) = load_more_row {
+                list_box.remove(row);
+            }
+
+            // Add new messages
+            for msg in &messages {
+                self.add_message_row(list_box, msg);
+            }
+
+            // Update count and stored messages
+            imp.message_count.set(imp.message_count.get() + messages.len());
+            imp.messages.borrow_mut().extend(messages);
+
+            // Re-add load more row if we have one
+            if let Some(row) = load_more_row {
+                list_box.append(&row);
+                imp.load_more_row.replace(Some(row));
+            }
+        }
+
+        self.finish_loading_more();
+    }
+
+    fn add_message_row(&self, list_box: &gtk4::ListBox, msg: &MessageInfo) {
+        // Create a custom row layout like Apple Mail:
+        // ┌─────────────────────────────────────────────────────┐
+        // │ [●] Sender Name                          2:30 PM ⭐ │
+        // │     Subject line here                          📎 │
+        // │     Preview text snippet...                        │
+        // └─────────────────────────────────────────────────────┘
+
+        let row = gtk4::ListBoxRow::builder()
+            .activatable(true)
+            .build();
+
+        // Main horizontal box
+        let hbox = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(8)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(8)
+            .margin_bottom(8)
+            .build();
+
+        // Unread indicator (blue dot)
+        let unread_indicator = gtk4::Box::builder()
+            .width_request(8)
+            .valign(gtk4::Align::Start)
+            .margin_top(6)
+            .build();
+
+        if !msg.is_read {
+            let dot = gtk4::DrawingArea::builder()
+                .width_request(8)
+                .height_request(8)
+                .build();
+            dot.set_draw_func(|_, cr, width, height| {
+                cr.set_source_rgb(0.2, 0.5, 1.0); // Blue
+                cr.arc(width as f64 / 2.0, height as f64 / 2.0, 4.0, 0.0, 2.0 * std::f64::consts::PI);
+                let _ = cr.fill();
+            });
+            unread_indicator.append(&dot);
+        }
+        hbox.append(&unread_indicator);
+
+        // Content area (sender, subject, preview)
+        let content_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .spacing(2)
+            .hexpand(true)
+            .build();
+
+        // Top row: Sender + Date
+        let top_row = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(8)
+            .build();
+
+        // Sender name
+        let sender_label = gtk4::Label::builder()
+            .label(&escape_markup(&msg.from))
+            .use_markup(true)
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk4::pango::EllipsizeMode::End)
+            .build();
+
+        if !msg.is_read {
+            sender_label.add_css_class("heading");
+        }
+        top_row.append(&sender_label);
+
+        // Date (formatted nicely)
+        let formatted_date = format_date(&msg.date);
+        let date_label = gtk4::Label::builder()
+            .label(&formatted_date)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        top_row.append(&date_label);
+
+        // Star indicator
+        if msg.is_starred {
+            let star = gtk4::Image::from_icon_name("starred-symbolic");
+            star.add_css_class("warning");
+            star.set_pixel_size(14);
+            top_row.append(&star);
+        }
+
+        content_box.append(&top_row);
+
+        // Middle row: Subject + attachment icon
+        let middle_row = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(4)
+            .build();
+
+        let subject_text = if msg.subject.is_empty() {
+            "(No Subject)".to_string()
+        } else {
+            msg.subject.clone()
+        };
+
+        let subject_label = gtk4::Label::builder()
+            .label(&escape_markup(&subject_text))
+            .use_markup(true)
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk4::pango::EllipsizeMode::End)
+            .build();
+
+        if msg.is_read {
+            subject_label.add_css_class("dim-label");
+        }
+        middle_row.append(&subject_label);
+
+        // Attachment indicator
+        if msg.has_attachments {
+            let attachment = gtk4::Image::from_icon_name("mail-attachment-symbolic");
+            attachment.add_css_class("dim-label");
+            attachment.set_pixel_size(14);
+            middle_row.append(&attachment);
+        }
+
+        content_box.append(&middle_row);
+
+        // Bottom row: Preview snippet (if available)
+        if let Some(snippet) = &msg.snippet {
+            if !snippet.is_empty() {
+                let preview_label = gtk4::Label::builder()
+                    .label(&escape_markup(snippet))
+                    .use_markup(true)
+                    .xalign(0.0)
+                    .ellipsize(gtk4::pango::EllipsizeMode::End)
+                    .css_classes(["dim-label", "caption"])
+                    .build();
+                content_box.append(&preview_label);
+            }
+        }
+
+        hbox.append(&content_box);
+        row.set_child(Some(&hbox));
+
+        // Add separator between messages
+        list_box.append(&row);
+    }
+}
+
+impl Default for MessageList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Information about a message for display
+#[derive(Clone)]
+pub struct MessageInfo {
+    pub id: i64,
+    pub uid: u32,
+    pub subject: String,
+    pub from: String,
+    pub date: String,
+    pub snippet: Option<String>,
+    pub is_read: bool,
+    pub is_starred: bool,
+    pub has_attachments: bool,
+}
+
+impl From<&northmail_core::models::DbMessage> for MessageInfo {
+    fn from(db_msg: &northmail_core::models::DbMessage) -> Self {
+        MessageInfo {
+            id: db_msg.id,
+            uid: db_msg.uid as u32,
+            subject: db_msg.subject.clone().unwrap_or_default(),
+            from: db_msg
+                .from_name
+                .clone()
+                .or_else(|| db_msg.from_address.clone())
+                .unwrap_or_else(|| "Unknown".to_string()),
+            date: db_msg.date_sent.clone().unwrap_or_default(),
+            snippet: db_msg.snippet.clone(),
+            is_read: db_msg.is_read,
+            is_starred: db_msg.is_starred,
+            has_attachments: db_msg.has_attachments,
+        }
+    }
+}

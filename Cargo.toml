@@ -1,0 +1,71 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/northmail-core",
+    "crates/northmail-imap",
+    "crates/northmail-smtp",
+    "crates/northmail-auth",
+    "crates/northmail-gtk",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["NorthMail Contributors"]
+repository = "https://github.com/northmail/northmail"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# GTK4 / Libadwaita - libadwaita 0.7.2 uses gtk4-sys 0.9
+gtk4 = { version = "0.9", features = ["v4_12"] }
+libadwaita = { version = "0.7.2", features = ["v1_5"] }
+
+# Email protocols
+async-imap = "0.10"
+lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
+
+# Authentication
+oauth2 = "4"
+zbus = "5"
+libsecret = "0.6"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HTML rendering (WebKitGTK for GTK4)
+webkit6 = "0.4"
+
+# Email parsing
+mail-parser = "0.10"
+
+# Utilities
+futures = "0.3"
+async-trait = "0.1"
+base64 = "0.22"
+url = "2"
+rand = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+async-std = { version = "1.12", features = ["attributes"] }
+
+# Internal crates
+northmail-core = { path = "crates/northmail-core" }
+northmail-imap = { path = "crates/northmail-imap" }
+northmail-smtp = { path = "crates/northmail-smtp" }
+northmail-auth = { path = "crates/northmail-auth" }

@@ -1,0 +1,29 @@
+[package]
+name = "northmail-imap"
+description = "IMAP protocol implementation with XOAUTH2 support for NorthMail"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-imap = { workspace = true }
+imap-proto = "0.16"
+async-std = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+base64 = { workspace = true }
+async-trait = { workspace = true }
+mail-parser = { workspace = true }
+async-native-tls = "0.5"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true }
+northmail-auth = { path = "../northmail-auth" }
+base64 = { workspace = true }
+
+[[example]]
+name = "test_gmail"
+path = "examples/test_gmail.rs"

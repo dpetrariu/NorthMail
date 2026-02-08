@@ -1,0 +1,57 @@
+{
+    "app-id" : "org.northmail.NorthMail",
+    "runtime" : "org.gnome.Platform",
+    "runtime-version" : "47",
+    "sdk" : "org.gnome.Sdk",
+    "sdk-extensions" : [
+        "org.freedesktop.Sdk.Extension.rust-stable"
+    ],
+    "command" : "northmail",
+    "finish-args" : [
+        "--share=ipc",
+        "--socket=fallback-x11",
+        "--socket=wayland",
+        "--device=dri",
+        "--share=network",
+        "--talk-name=org.gnome.OnlineAccounts",
+        "--talk-name=org.freedesktop.secrets",
+        "--talk-name=org.freedesktop.Notifications",
+        "--filesystem=xdg-cache/northmail:create",
+        "--filesystem=xdg-data/northmail:create"
+    ],
+    "build-options" : {
+        "append-path" : "/usr/lib/sdk/rust-stable/bin",
+        "env" : {
+            "CARGO_HOME" : "/run/build/northmail/cargo",
+            "RUST_BACKTRACE" : "1"
+        }
+    },
+    "cleanup" : [
+        "/include",
+        "/lib/pkgconfig",
+        "/man",
+        "/share/doc",
+        "/share/gtk-doc",
+        "/share/man",
+        "/share/pkgconfig",
+        "*.la",
+        "*.a"
+    ],
+    "modules" : [
+        {
+            "name" : "northmail",
+            "buildsystem" : "meson",
+            "builddir" : true,
+            "config-opts" : [
+                "--buildtype=release",
+                "--libdir=lib"
+            ],
+            "sources" : [
+                {
+                    "type" : "dir",
+                    "path" : ".."
+                }
+            ]
+        }
+    ]
+}
