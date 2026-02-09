@@ -2,6 +2,8 @@
 
 use gtk4::{glib, prelude::*, subclass::prelude::*};
 use libadwaita as adw;
+#[cfg(feature = "webkit")]
+use webkit6::prelude::*;
 
 mod imp {
     use super::*;
@@ -253,24 +255,43 @@ impl MessageView {
                 content_box.remove(&child);
             }
 
-            // For now, show plain text in a TextView
-            // TODO: Use WebKitWebView for HTML content
-            if let Some(ref text) = message.text_body {
+            // Prefer HTML rendering via WebView, fall back to plain text
+            #[cfg(feature = "webkit")]
+            {
+                if let Some(ref html) = message.html_body {
+                    let webview = webkit6::WebView::new();
+                    webview.set_vexpand(true);
+                    webview.set_hexpand(true);
+
+                    // Configure settings for email display
+                    let settings: webkit6::Settings = webkit6::prelude::WebViewExt::settings(&webview).unwrap();
+                    settings.set_enable_javascript(false);  // Security: no JS in emails
+                    settings.set_auto_load_images(true);
+
+                    webview.load_html(html, None);
+                    content_box.append(&webview);
+                    return;
+                }
+            }
+
+            // Plain text display (or fallback when no webkit)
+            let display_text = if let Some(ref text) = message.text_body {
+                Some(text.clone())
+            } else if let Some(ref html) = message.html_body {
+                Some(Self::strip_html_for_display(html))
+            } else {
+                None
+            };
+
+            if let Some(text) = display_text {
                 let text_view = gtk4::TextView::builder()
                     .editable(false)
                     .cursor_visible(false)
                     .wrap_mode(gtk4::WrapMode::Word)
                     .build();
 
-                text_view.buffer().set_text(text);
+                text_view.buffer().set_text(&text);
                 content_box.append(&text_view);
-            } else if let Some(ref _html) = message.html_body {
-                // TODO: Render HTML with WebKitWebView
-                let label = gtk4::Label::builder()
-                    .label("[HTML content - WebKitWebView not yet implemented]")
-                    .css_classes(["dim-label"])
-                    .build();
-                content_box.append(&label);
             } else {
                 let label = gtk4::Label::builder()
                     .label("[No content]")
@@ -305,6 +326,138 @@ impl MessageView {
 
             content_box.append(&placeholder);
         }
+    }
+
+    /// Strip HTML tags and convert to plain text for display
+    fn strip_html_for_display(html: &str) -> String {
+        let mut result = String::new();
+        let mut in_tag = false;
+        let mut in_style = false;
+        let mut in_script = false;
+        let mut last_was_space = true;
+
+        let html_lower = html.to_lowercase();
+        let mut chars = html.chars().peekable();
+        let mut pos = 0;
+
+        while let Some(c) = chars.next() {
+            // Check for style/script start
+            if !in_tag && html_lower[pos..].starts_with("<style") {
+                in_style = true;
+            } else if !in_tag && html_lower[pos..].starts_with("<script") {
+                in_script = true;
+            } else if in_style && html_lower[pos..].starts_with("</style") {
+                in_style = false;
+            } else if in_script && html_lower[pos..].starts_with("</script") {
+                in_script = false;
+            }
+
+            match c {
+                '<' => in_tag = true,
+                '>' => {
+                    in_tag = false;
+                    // Add newline after block elements
+                    if pos >= 4 {
+                        let prev = &html_lower[pos.saturating_sub(10)..pos + 1];
+                        if prev.contains("</p>")
+                            || prev.contains("</div>")
+                            || prev.contains("</br>")
+                            || prev.contains("<br>")
+                            || prev.contains("<br/>")
+                            || prev.contains("<br />")
+                            || prev.contains("</h1>")
+                            || prev.contains("</h2>")
+                            || prev.contains("</h3>")
+                            || prev.contains("</li>")
+                            || prev.contains("</tr>")
+                        {
+                            if !result.ends_with('\n') {
+                                result.push('\n');
+                                last_was_space = true;
+                            }
+                        }
+                    }
+                }
+                _ if !in_tag && !in_style && !in_script => {
+                    // Decode common HTML entities
+                    if c == '&' {
+                        let rest: String = chars.clone().take(10).collect();
+                        if rest.starts_with("nbsp;") {
+                            result.push(' ');
+                            for _ in 0..5 {
+                                chars.next();
+                                pos += 1;
+                            }
+                        } else if rest.starts_with("lt;") {
+                            result.push('<');
+                            for _ in 0..3 {
+                                chars.next();
+                                pos += 1;
+                            }
+                        } else if rest.starts_with("gt;") {
+                            result.push('>');
+                            for _ in 0..3 {
+                                chars.next();
+                                pos += 1;
+                            }
+                        } else if rest.starts_with("amp;") {
+                            result.push('&');
+                            for _ in 0..4 {
+                                chars.next();
+                                pos += 1;
+                            }
+                        } else if rest.starts_with("quot;") {
+                            result.push('"');
+                            for _ in 0..5 {
+                                chars.next();
+                                pos += 1;
+                            }
+                        } else if rest.starts_with("apos;") {
+                            result.push('\'');
+                            for _ in 0..5 {
+                                chars.next();
+                                pos += 1;
+                            }
+                        } else if rest.starts_with("#39;") {
+                            result.push('\'');
+                            for _ in 0..4 {
+                                chars.next();
+                                pos += 1;
+                            }
+                        } else {
+                            result.push('&');
+                        }
+                    } else if c.is_whitespace() {
+                        if !last_was_space {
+                            result.push(' ');
+                            last_was_space = true;
+                        }
+                    } else {
+                        result.push(c);
+                        last_was_space = false;
+                    }
+                }
+                _ => {}
+            }
+            pos += c.len_utf8();
+        }
+
+        // Clean up: collapse multiple newlines
+        let mut cleaned = String::new();
+        let mut last_was_newline = true;
+        for c in result.chars() {
+            if c == '\n' {
+                if !last_was_newline {
+                    cleaned.push('\n');
+                    last_was_newline = true;
+                }
+            } else {
+                cleaned.push(c);
+                last_was_newline = false;
+            }
+        }
+
+        cleaned.trim().to_string()
     }
 }
 

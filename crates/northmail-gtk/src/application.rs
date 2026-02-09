@@ -265,6 +265,10 @@ mod imp {
         pub(super) fetch_generation: std::cell::Cell<u64>,
         /// IMAP connection pool for reusing connections
         pub(super) imap_pool: OnceCell<Arc<ImapPool>>,
+        /// Current cache pagination offset (how many messages already loaded from cache)
+        pub(super) cache_offset: std::cell::Cell<i64>,
+        /// Current folder ID in the database (for cache-based pagination)
+        pub(super) cache_folder_id: std::cell::Cell<i64>,
     }
 
     #[glib::object_subclass]
@@ -372,6 +376,56 @@ impl NorthMailApplication {
         self.imp().database.get()
     }
 
+    /// Save GOA accounts to database for foreign key relationships
+    fn save_accounts_to_db(&self, accounts: &[northmail_auth::GoaAccount]) {
+        let Some(db) = self.database() else {
+            return;
+        };
+
+        let db = db.clone();
+        let accounts: Vec<northmail_auth::GoaAccount> = accounts.to_vec();
+
+        // Run in background thread with tokio
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                for account in &accounts {
+                    // Convert GOA account to core Account
+                    let config = if account.provider_type == "google" {
+                        northmail_core::AccountConfig::gmail()
+                    } else if account.provider_type == "windows_live" || account.provider_type == "microsoft" {
+                        northmail_core::AccountConfig::outlook()
+                    } else {
+                        northmail_core::AccountConfig {
+                            imap_host: account.imap_host.clone().unwrap_or_default(),
+                            imap_port: 993,
+                            smtp_host: account.smtp_host.clone().unwrap_or_default(),
+                            smtp_port: 587,
+                        }
+                    };
+
+                    let core_account = northmail_core::Account {
+                        id: account.id.clone(),
+                        email: account.email.clone(),
+                        display_name: Some(account.provider_name.clone()),
+                        provider: account.provider_type.clone(),
+                        auth_method: northmail_auth::AuthMethod::Goa {
+                            account_id: account.id.clone(),
+                        },
+                        config,
+                    };
+
+                    if let Err(e) = db.upsert_account(&core_account).await {
+                        warn!("Failed to save account {} to database: {}", account.email, e);
+                    } else {
+                        debug!("Saved account {} to database", account.email);
+                    }
+                }
+                info!("Saved {} accounts to database", accounts.len());
+            });
+        });
+    }
+
     /// Get or create the IMAP connection pool
     fn imap_pool(&self) -> std::sync::Arc<ImapPool> {
         self.imp()
@@ -412,6 +466,9 @@ impl NorthMailApplication {
                                     // Store accounts for later use
                                     app.imp().accounts.replace(accounts.clone());
                                     app.update_sidebar_with_accounts(&accounts);
+
+                                    // Save accounts to database for foreign key relationships
+                                    app.save_accounts_to_db(&accounts);
 
                                     // Restore last selected folder or select unified inbox
                                     app.restore_last_folder();
@@ -986,6 +1043,111 @@ impl NorthMailApplication {
         }
     }
 
+    /// Check if cache has more messages beyond what's loaded
+    fn check_cache_has_more(&self, folder_id: i64, loaded_count: i64) -> bool {
+        let db = match self.database() {
+            Some(db) => db.clone(),
+            None => return false,
+        };
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(db.get_message_count(folder_id));
+            let _ = sender.send(result);
+        });
+
+        match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(Ok(total)) => {
+                debug!("Cache has {} total messages, loaded {}", total, loaded_count);
+                total > loaded_count
+            }
+            _ => false,
+        }
+    }
+
+    /// Load more messages from the SQLite cache (pagination)
+    fn load_more_from_cache(&self) {
+        let folder_id = self.imp().cache_folder_id.get();
+        let offset = self.imp().cache_offset.get();
+        let batch_size: i64 = 50;
+
+        if folder_id == 0 {
+            warn!("No cache folder ID for load more");
+            return;
+        }
+
+        let db = match self.database() {
+            Some(db) => db.clone(),
+            None => {
+                warn!("No database for cache load more");
+                return;
+            }
+        };
+
+        let app = self.clone();
+
+        glib::spawn_future_local(async move {
+            let (sender, receiver) = std::sync::mpsc::channel();
+
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result = rt.block_on(async {
+                    let messages = db.get_messages(folder_id, batch_size, offset).await?;
+                    let total = db.get_message_count(folder_id).await?;
+                    Ok::<_, northmail_core::CoreError>((messages, total))
+                });
+                let _ = sender.send(result);
+            });
+
+            // Poll for result
+            let result = loop {
+                match receiver.try_recv() {
+                    Ok(result) => break Some(result),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        glib::timeout_future(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break None,
+                }
+            };
+
+            match result {
+                Some(Ok((messages, total))) => {
+                    let loaded = messages.len() as i64;
+                    let new_offset = offset + loaded;
+                    info!("📄 Cache page: loaded {} more messages (offset {} -> {})", loaded, offset, new_offset);
+
+                    app.imp().cache_offset.set(new_offset);
+
+                    let message_infos: Vec<MessageInfo> =
+                        messages.iter().map(MessageInfo::from).collect();
+
+                    if let Some(window) = app.active_window() {
+                        if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                            if let Some(message_list) = win.message_list() {
+                                message_list.append_messages(message_infos);
+                                message_list.set_can_load_more(new_offset < total);
+                            }
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    error!("Failed to load more from cache: {}", e);
+                    if let Some(window) = app.active_window() {
+                        if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                            if let Some(message_list) = win.message_list() {
+                                message_list.finish_loading_more();
+                            }
+                        }
+                    }
+                }
+                None => {
+                    warn!("Cache load more channel disconnected");
+                }
+            }
+        });
+    }
+
     /// Save messages to the database cache
     /// Runs in background thread with tokio runtime (fire-and-forget)
     fn save_messages_to_cache(
@@ -1016,43 +1178,65 @@ impl NorthMailApplication {
                     }
                 };
 
-                // Save each message
-                let mut saved_count = 0;
-                for msg in &messages {
-                    let db_msg = northmail_core::models::DbMessage {
-                        id: 0,
-                        folder_id,
-                        uid: msg.uid as i64,
-                        message_id: None,
-                        subject: Some(msg.subject.clone()),
-                        from_address: Some(msg.from.clone()),
-                        from_name: None,
-                        to_addresses: None,
-                        date_sent: Some(msg.date.clone()),
-                        snippet: msg.snippet.clone(),
-                        is_read: msg.is_read,
-                        is_starred: msg.is_starred,
-                        has_attachments: msg.has_attachments,
-                        size: 0,
-                        maildir_path: None,
-                        body_text: None,
-                        body_html: None,
-                    };
+                // Build batch of DbMessages
+                let db_messages: Vec<northmail_core::models::DbMessage> = messages
+                    .iter()
+                    .map(|msg| {
+                        let date_epoch = {
+                            let mut date_str = msg.date.clone();
+                            if let Some(paren) = date_str.rfind('(') {
+                                date_str = date_str[..paren].trim().to_string();
+                            }
+                            while date_str.contains("  ") {
+                                date_str = date_str.replace("  ", " ");
+                            }
+                            date_str = date_str.replace(" ,", ",");
+                            chrono::DateTime::parse_from_rfc2822(&date_str)
+                                .map(|dt| dt.timestamp())
+                                .ok()
+                        };
 
-                    if let Err(e) = db.upsert_message(folder_id, &db_msg).await {
-                        warn!("Failed to cache message {}: {}", msg.uid, e);
-                    } else {
-                        saved_count += 1;
+                        northmail_core::models::DbMessage {
+                            id: 0,
+                            folder_id,
+                            uid: msg.uid as i64,
+                            message_id: None,
+                            subject: Some(msg.subject.clone()),
+                            from_address: Some(msg.from.clone()),
+                            from_name: None,
+                            to_addresses: None,
+                            date_sent: Some(msg.date.clone()),
+                            date_epoch,
+                            snippet: msg.snippet.clone(),
+                            is_read: msg.is_read,
+                            is_starred: msg.is_starred,
+                            has_attachments: msg.has_attachments,
+                            size: 0,
+                            maildir_path: None,
+                            body_text: None,
+                            body_html: None,
+                        }
+                    })
+                    .collect();
+
+                // Batch insert in a single transaction (much faster than individual inserts)
+                match db.upsert_messages_batch(folder_id, &db_messages).await {
+                    Ok(saved_count) => {
+                        info!(
+                            "💾 Cache SAVE: Saved {}/{} messages for {}/{}",
+                            saved_count,
+                            messages.len(),
+                            account_id,
+                            folder_path
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to batch save messages for {}/{}: {}",
+                            account_id, folder_path, e
+                        );
                     }
                 }
-
-                info!(
-                    "💾 Cache SAVE: Saved {}/{} messages for {}/{}",
-                    saved_count,
-                    messages.len(),
-                    account_id,
-                    folder_path
-                );
             });
         });
     }
@@ -1109,8 +1293,10 @@ impl NorthMailApplication {
         let imap_host = account.imap_host.clone();
         let imap_username = account.imap_username.clone();
 
-        // Clear previous load state
+        // Clear previous load state and cache pagination
         self.imp().folder_load_state.replace(None);
+        self.imp().cache_offset.set(0);
+        self.imp().cache_folder_id.set(0);
 
         // Increment fetch generation to detect stale results
         let generation = self.imp().fetch_generation.get() + 1;
@@ -1120,16 +1306,31 @@ impl NorthMailApplication {
             info!("Fetching messages for {}/{}", account_email, folder_path);
 
             // Phase 1: Try to load from cache first (instant display)
-            let has_cache = if let Some((_folder_id, cached_messages)) = app
+            let has_cache = if let Some((folder_id, cached_messages)) = app
                 .load_cached_messages(&account_id, &folder_path)
                 .await
             {
+                let loaded_count = cached_messages.len() as i64;
                 info!(
                     "Displaying {} cached messages for {}/{}",
-                    cached_messages.len(),
+                    loaded_count,
                     account_email,
                     folder_path
                 );
+
+                // Track cache pagination state
+                app.imp().cache_offset.set(loaded_count);
+                app.imp().cache_folder_id.set(folder_id);
+
+                // Set folder_load_state immediately so message body fetching works
+                // This enables clicking on messages while background sync happens
+                app.imp().folder_load_state.replace(Some(FolderLoadState {
+                    account_id: account_id.clone(),
+                    folder_path: folder_path.clone(),
+                    total_count: loaded_count as u32,
+                    lowest_seq: 1, // Will be updated by IMAP sync
+                    batch_size: 50,
+                }));
 
                 // Display cached messages immediately
                 if let Some(window) = app.active_window() {
@@ -1137,6 +1338,16 @@ impl NorthMailApplication {
                         win.restore_message_list();
                         if let Some(message_list) = win.message_list() {
                             message_list.set_messages(cached_messages);
+
+                            // Wire up "load more" from cache
+                            let app_clone = app.clone();
+                            message_list.connect_load_more(move || {
+                                app_clone.load_more_from_cache();
+                            });
+
+                            // Check if there are more messages in cache
+                            let has_more = app.check_cache_has_more(folder_id, loaded_count);
+                            message_list.set_can_load_more(has_more);
                         }
                     }
                 }
@@ -1636,6 +1847,8 @@ impl NorthMailApplication {
         let mut first_batch = true;
         #[allow(unused_assignments)]
         let mut lowest_seq = 0u32;
+        // Track all UIDs seen during sync for cache cleanup
+        let mut synced_uids: Vec<i64> = Vec::new();
 
         loop {
             // Check if this fetch is still valid (user hasn't switched folders)
@@ -1676,6 +1889,9 @@ impl NorthMailApplication {
                         loaded_count += messages.len() as u32;
                         info!("Received batch of {} messages ({}/{})", messages.len(), loaded_count, total_count);
 
+                        // Track UIDs for cache cleanup
+                        synced_uids.extend(messages.iter().map(|m| m.uid as i64));
+
                         // Always save to cache, even if viewing different folder
                         app.save_messages_to_cache(account_id, folder_path, &messages);
 
@@ -1703,14 +1919,19 @@ impl NorthMailApplication {
                             }
                         }
 
-                        // If we had cache displayed, don't replace it with IMAP first batch
-                        // The cache likely has the same or more messages
-                        if has_cache && first_batch {
-                            debug!("Cache was displayed, skipping first batch replacement");
-                            first_batch = false;
-                            continue;
+                        // Set folder_load_state on first batch so body fetching works
+                        // immediately (don't wait for InitialBatchDone)
+                        if first_batch {
+                            app.imp().folder_load_state.replace(Some(FolderLoadState {
+                                account_id: account_id.to_string(),
+                                folder_path: folder_path.to_string(),
+                                total_count,
+                                lowest_seq: 1, // Will be updated by InitialBatchDone
+                                batch_size: 50,
+                            }));
                         }
 
+                        // Always update UI with IMAP messages - they're fresher than cache
                         if let Some(window) = app.active_window() {
                             if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
                                 if first_batch && !has_cache {
@@ -1719,8 +1940,20 @@ impl NorthMailApplication {
                                     win.restore_message_list();
                                 }
                                 if let Some(message_list) = win.message_list() {
+                                    // Always replace with first batch from IMAP - it has the latest messages
                                     if first_batch {
+                                        info!("Replacing message list with {} fresh messages from IMAP", messages.len());
+                                        let msg_count = messages.len() as i64;
                                         message_list.set_messages(messages);
+
+                                        // Wire up cache-based "load more" for IMAP path too
+                                        // (after IMAP saves to cache, pagination pulls from SQLite)
+                                        let app_for_load_more = app.clone();
+                                        message_list.connect_load_more(move || {
+                                            app_for_load_more.load_more_from_cache();
+                                        });
+                                        app.imp().cache_offset.set(msg_count);
+
                                         first_batch = false;
                                     } else {
                                         message_list.append_messages(messages);
@@ -1746,6 +1979,8 @@ impl NorthMailApplication {
                         );
                     }
                     FetchEvent::BackgroundMessages(messages) => {
+                        // Track UIDs for cache cleanup
+                        synced_uids.extend(messages.iter().map(|m| m.uid as i64));
                         // Background sync - just save to cache, don't update UI
                         app.save_messages_to_cache(account_id, folder_path, &messages);
                         // No UI update needed - this is background work
@@ -1788,6 +2023,36 @@ impl NorthMailApplication {
                             batch_size: 50,
                         }));
 
+                        // Update cache folder ID so load-more-from-cache works
+                        if let Some(db) = app.database() {
+                            let db = db.clone();
+                            let aid = account_id.to_string();
+                            let fp = folder_path.to_string();
+                            let (sender, receiver) = std::sync::mpsc::channel();
+                            std::thread::spawn(move || {
+                                let rt = tokio::runtime::Runtime::new().unwrap();
+                                let result = rt.block_on(db.get_or_create_folder_id(&aid, &fp));
+                                let _ = sender.send(result);
+                            });
+                            if let Ok(Ok(fid)) = receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+                                app.imp().cache_folder_id.set(fid);
+                            }
+                        }
+
+                        // Enable "load more" from cache since IMAP has been saving to DB
+                        let cache_folder_id = app.imp().cache_folder_id.get();
+                        let cache_offset = app.imp().cache_offset.get();
+                        if cache_folder_id > 0 {
+                            let has_more = app.check_cache_has_more(cache_folder_id, cache_offset);
+                            if let Some(window) = app.active_window() {
+                                if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                                    if let Some(message_list) = win.message_list() {
+                                        message_list.set_can_load_more(has_more);
+                                    }
+                                }
+                            }
+                        }
+
                         // Update status to show background sync is continuing
                         if lowest_seq > 1 {
                             app.update_simple_sync_status("Syncing older messages...");
@@ -1795,7 +2060,34 @@ impl NorthMailApplication {
                         // Don't return - keep processing background sync events
                     }
                     FetchEvent::FullSyncDone { total_synced } => {
-                        info!("Full sync complete for {}/{}: {} messages", account_id, folder_path, total_synced);
+                        info!("Full sync complete for {}/{}: {} messages (tracked {} UIDs)", account_id, folder_path, total_synced, synced_uids.len());
+
+                        // Clean up stale messages from cache that no longer exist on server
+                        if !synced_uids.is_empty() {
+                            if let Some(db) = app.database() {
+                                let db = db.clone();
+                                let aid = account_id.to_string();
+                                let fp = folder_path.to_string();
+                                let uids = synced_uids.clone();
+                                std::thread::spawn(move || {
+                                    let rt = tokio::runtime::Runtime::new().unwrap();
+                                    rt.block_on(async {
+                                        if let Ok(folder_id) = db.get_or_create_folder_id(&aid, &fp).await {
+                                            match db.delete_messages_not_in_uids(folder_id, &uids).await {
+                                                Ok(deleted) => {
+                                                    if deleted > 0 {
+                                                        info!("🧹 Cache cleanup: removed {} stale messages from {}/{}", deleted, aid, fp);
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!("Failed to clean up stale messages: {}", e);
+                                                }
+                                            }
+                                        }
+                                    });
+                                });
+                            }
+                        }
 
                         // Hide sync indicator
                         app.hide_sync_status();
@@ -1809,11 +2101,16 @@ impl NorthMailApplication {
                             batch_size: 50,
                         }));
 
-                        // Hide "load more" button since everything is now in cache
-                        if let Some(window) = app.active_window() {
-                            if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
-                                if let Some(message_list) = win.message_list() {
-                                    message_list.set_can_load_more(false);
+                        // Now that sync is done, check if there are more cached messages to paginate
+                        let cache_folder_id = app.imp().cache_folder_id.get();
+                        let cache_offset = app.imp().cache_offset.get();
+                        if cache_folder_id > 0 {
+                            let has_more = app.check_cache_has_more(cache_folder_id, cache_offset);
+                            if let Some(window) = app.active_window() {
+                                if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                                    if let Some(message_list) = win.message_list() {
+                                        message_list.set_can_load_more(has_more);
+                                    }
                                 }
                             }
                         }
@@ -2101,14 +2398,20 @@ impl NorthMailApplication {
     pub fn fetch_message_body(&self, uid: u32, callback: impl FnOnce(Result<ParsedEmailBody, String>) + 'static) {
         let load_state = self.imp().folder_load_state.borrow().clone();
         let Some(state) = load_state else {
+            error!("fetch_message_body: No folder_load_state set!");
             callback(Err("No folder selected".to_string()));
             return;
         };
+
+        info!("fetch_message_body: uid={}, account={}, folder={}", uid, state.account_id, state.folder_path);
 
         let accounts = self.imp().accounts.borrow().clone();
         let account = match accounts.iter().find(|a| a.id == state.account_id) {
             Some(a) => a.clone(),
             None => {
+                error!("fetch_message_body: Account not found! Looking for '{}', have: {:?}",
+                    state.account_id,
+                    accounts.iter().map(|a| &a.id).collect::<Vec<_>>());
                 callback(Err("Account not found".to_string()));
                 return;
             }
@@ -2136,37 +2439,47 @@ impl NorthMailApplication {
 
             info!("🌐 Fetching body from IMAP for message {} (not in cache)", uid);
 
-            // Not in cache, fetch from IMAP
+            // Not in cache, fetch from IMAP using connection pool
             match AuthManager::new().await {
                 Ok(auth_manager) => {
-                    // Note: pool disabled for now due to issues - using direct fetch
-                    let _ = pool; // silence unused warning
-
-                    let result = if is_google {
+                    // Build credentials for pool
+                    let credentials = if is_google {
                         match auth_manager.get_xoauth2_token_for_goa(&account_id).await {
                             Ok((email, access_token)) => {
-                                Self::fetch_body_oauth2(email, access_token, &folder_path, uid, true).await
+                                Some(ImapCredentials::Gmail { email, access_token })
                             }
-                            Err(e) => Err(format!("Auth failed: {}", e)),
+                            Err(e) => { callback(Err(format!("Auth failed: {}", e))); return; }
                         }
                     } else if is_microsoft {
                         match auth_manager.get_xoauth2_token_for_goa(&account_id).await {
                             Ok((email, access_token)) => {
-                                Self::fetch_body_oauth2(email, access_token, &folder_path, uid, false).await
+                                Some(ImapCredentials::Microsoft { email, access_token })
                             }
-                            Err(e) => Err(format!("Auth failed: {}", e)),
+                            Err(e) => { callback(Err(format!("Auth failed: {}", e))); return; }
                         }
                     } else {
                         let username = imap_username.unwrap_or(account_email);
                         let host = imap_host.unwrap_or_else(|| "imap.mail.me.com".to_string());
-
                         match auth_manager.get_goa_password(&account_id).await {
                             Ok(password) => {
-                                Self::fetch_body_password(host, username, password, &folder_path, uid).await
+                                Some(ImapCredentials::Password {
+                                    host,
+                                    port: 993,
+                                    username,
+                                    password,
+                                })
                             }
-                            Err(e) => Err(format!("Auth failed: {}", e)),
+                            Err(e) => { callback(Err(format!("Auth failed: {}", e))); return; }
                         }
                     };
+
+                    let Some(credentials) = credentials else {
+                        callback(Err("Failed to get credentials".to_string()));
+                        return;
+                    };
+
+                    // Use pool to fetch body (reuses existing connection)
+                    let result = Self::fetch_body_via_pool(&pool, credentials, &folder_path, uid).await;
 
                     // Save to cache if successful
                     if let Ok(ref body) = result {
@@ -2182,6 +2495,78 @@ impl NorthMailApplication {
                 }
             }
         });
+    }
+
+    /// Fetch body using connection pool (reuses existing IMAP connection)
+    async fn fetch_body_via_pool(
+        pool: &std::sync::Arc<ImapPool>,
+        credentials: ImapCredentials,
+        folder_path: &str,
+        uid: u32,
+    ) -> Result<ParsedEmailBody, String> {
+        info!("fetch_body_via_pool: uid={} folder={}", uid, folder_path);
+
+        // Try up to 2 times (retry once on connection failure)
+        for attempt in 0..2 {
+            let worker = pool.get_or_create(credentials.clone())
+                .map_err(|e| format!("Pool error: {}", e))?;
+
+            let (response_tx, response_rx) = std::sync::mpsc::channel();
+
+            // Send fetch command - if send fails, worker is dead
+            if let Err(e) = worker.send(ImapCommand::FetchBody {
+                folder: folder_path.to_string(),
+                uid,
+                response_tx,
+            }) {
+                warn!("fetch_body_via_pool: send failed (attempt {}): {}", attempt, e);
+                pool.remove_worker(&credentials);
+                if attempt == 0 { continue; }
+                return Err(format!("Failed to send command: {}", e));
+            }
+
+            debug!("fetch_body_via_pool: command sent, waiting for response");
+
+            let timeout = std::time::Duration::from_secs(45);
+            let start = std::time::Instant::now();
+
+            loop {
+                match response_rx.try_recv() {
+                    Ok(ImapResponse::Body(body)) => {
+                        info!("fetch_body_via_pool: got body, {} bytes", body.len());
+                        return Ok(Self::parse_email_body(&body));
+                    }
+                    Ok(ImapResponse::Error(e)) => {
+                        // If connection failed, remove stale worker and retry
+                        if e.contains("Connection failed") && attempt == 0 {
+                            warn!("fetch_body_via_pool: connection failed, retrying...");
+                            pool.remove_worker(&credentials);
+                            break; // break inner loop, continue outer
+                        }
+                        error!("fetch_body_via_pool: error: {}", e);
+                        return Err(e);
+                    }
+                    Ok(other) => {
+                        debug!("fetch_body_via_pool: unexpected response: {:?}", other);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        if start.elapsed() > timeout {
+                            return Err(format!("Timeout waiting for body of message {}", uid));
+                        }
+                        glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        if attempt == 0 {
+                            warn!("fetch_body_via_pool: worker disconnected, retrying...");
+                            pool.remove_worker(&credentials);
+                            break;
+                        }
+                        return Err("Pool worker disconnected".to_string());
+                    }
+                }
+            }
+        }
+        Err(format!("Failed to fetch body for message {} after retries", uid))
     }
 
     /// Get cached message body from database
@@ -2272,6 +2657,11 @@ impl NorthMailApplication {
         let (sender, receiver) = std::sync::mpsc::channel::<Result<String, String>>();
         let folder_path = folder_path.to_string();
 
+        info!(
+            "fetch_body_oauth2: fetching uid {} from folder '{}' for {} (gmail: {})",
+            uid, folder_path, email, is_gmail
+        );
+
         std::thread::spawn(move || {
             async_std::task::block_on(async {
                 let mut client = SimpleImapClient::new();
@@ -2284,26 +2674,35 @@ impl NorthMailApplication {
 
                 match connect_result {
                     Ok(_) => {
+                        debug!("fetch_body_oauth2: connected to server");
                         match client.select(&folder_path).await {
-                            Ok(_) => {
+                            Ok(folder_info) => {
+                                debug!(
+                                    "fetch_body_oauth2: selected folder, {} messages",
+                                    folder_info.message_count.unwrap_or(0)
+                                );
                                 match client.fetch_body(uid).await {
                                     Ok(body) => {
+                                        debug!("fetch_body_oauth2: got body, {} bytes", body.len());
                                         let _ = client.logout().await;
                                         let _ = sender.send(Ok(body));
                                     }
                                     Err(e) => {
+                                        error!("fetch_body_oauth2: fetch failed: {}", e);
                                         let _ = client.logout().await;
                                         let _ = sender.send(Err(format!("Fetch failed: {}", e)));
                                     }
                                 }
                             }
                             Err(e) => {
+                                error!("fetch_body_oauth2: select failed for folder '{}': {}", folder_path, e);
                                 let _ = client.logout().await;
                                 let _ = sender.send(Err(format!("Select failed: {}", e)));
                             }
                         }
                     }
                     Err(e) => {
+                        error!("fetch_body_oauth2: connect failed: {}", e);
                         let _ = sender.send(Err(format!("Connect failed: {}", e)));
                     }
                 }

@@ -341,6 +341,19 @@ impl SyncEngine {
                             .join(", "),
                     ),
                     date_sent: header.envelope.date.clone(),
+                    date_epoch: header.envelope.date.as_deref().and_then(|d| {
+                        let mut s = d.to_string();
+                        if let Some(paren) = s.rfind('(') {
+                            s = s[..paren].trim().to_string();
+                        }
+                        while s.contains("  ") {
+                            s = s.replace("  ", " ");
+                        }
+                        s = s.replace(" ,", ",");
+                        chrono::DateTime::parse_from_rfc2822(&s)
+                            .map(|dt| dt.timestamp())
+                            .ok()
+                    }),
                     snippet: None, // Would need BODY[TEXT] for snippet
                     is_read: header.is_read(),
                     is_starred: header.is_starred(),

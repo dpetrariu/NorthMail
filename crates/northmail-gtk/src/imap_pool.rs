@@ -129,6 +129,15 @@ impl ImapPool {
         }
     }
 
+    /// Remove a dead worker so the next call to get_or_create reconnects
+    pub fn remove_worker(&self, credentials: &ImapCredentials) {
+        let key = credentials.pool_key();
+        let mut workers = self.workers.lock().unwrap();
+        if workers.remove(&key).is_some() {
+            info!("Removed dead worker for {}", key);
+        }
+    }
+
     /// Get or create a worker for the given credentials
     pub fn get_or_create(&self, credentials: ImapCredentials) -> Result<mpsc::Sender<ImapCommand>, String> {
         let key = credentials.pool_key();
@@ -191,16 +200,11 @@ impl ImapPool {
                 }
                 ImapCredentials::Password {
                     host,
-                    port: _,
+                    port,
                     username,
                     password,
                 } => {
-                    // For password auth, we need to use the regular ImapClient
-                    // For now, just return an error - most accounts use OAuth2
-                    let _ = (host, username, password);
-                    Err(northmail_imap::ImapError::ServerError(
-                        "Password auth not yet supported in pool".to_string(),
-                    ))
+                    client.connect_login(host, *port, username, password).await
                 }
             };
 
@@ -214,6 +218,9 @@ impl ImapPool {
             }
 
             info!("IMAP worker connected for {}", credentials.pool_key());
+
+            // Track currently selected folder to avoid redundant SELECTs
+            let mut current_folder: Option<String> = None;
 
             // Process commands
             loop {
@@ -249,13 +256,14 @@ impl ImapPool {
                                     &response_tx,
                                 )
                                 .await;
+                                current_folder = Some(folder);
                             }
                             ImapCommand::FetchBody {
                                 folder,
                                 uid,
                                 response_tx,
                             } => {
-                                Self::handle_fetch_body(&mut client, &folder, uid, &response_tx)
+                                Self::handle_fetch_body(&mut client, &folder, uid, &response_tx, &mut current_folder)
                                     .await;
                             }
                         }
@@ -316,23 +324,35 @@ impl ImapPool {
         }
     }
 
-    /// Handle FetchBody command
+    /// Handle FetchBody command (with folder tracking to avoid redundant SELECTs)
     async fn handle_fetch_body(
         client: &mut SimpleImapClient,
         folder: &str,
         uid: u32,
         response_tx: &mpsc::Sender<ImapResponse>,
+        current_folder: &mut Option<String>,
     ) {
-        debug!("handle_fetch_body: selecting folder {}", folder);
-
-        // Select folder first (in case it changed)
-        if let Err(e) = client.select(folder).await {
-            error!("handle_fetch_body: failed to select folder: {}", e);
-            let _ = response_tx.send(ImapResponse::Error(format!(
-                "Failed to select folder: {}",
-                e
-            )));
-            return;
+        // Only SELECT if folder changed (like Geary's approach)
+        if current_folder.as_deref() != Some(folder) {
+            debug!("handle_fetch_body: selecting folder {} (was {:?})", folder, current_folder);
+            match client.select(folder).await {
+                Ok(info) => {
+                    debug!("handle_fetch_body: selected folder, {} messages",
+                           info.message_count.unwrap_or(0));
+                    *current_folder = Some(folder.to_string());
+                }
+                Err(e) => {
+                    error!("handle_fetch_body: failed to select folder: {}", e);
+                    *current_folder = None;
+                    let _ = response_tx.send(ImapResponse::Error(format!(
+                        "Failed to select folder: {}",
+                        e
+                    )));
+                    return;
+                }
+            }
+        } else {
+            debug!("handle_fetch_body: folder {} already selected", folder);
         }
 
         debug!("handle_fetch_body: fetching body for uid {}", uid);

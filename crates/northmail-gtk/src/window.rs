@@ -443,14 +443,38 @@ impl NorthMailWindow {
                                     {
                                         // Use WebKitWebView for HTML rendering
                                         use webkit6::prelude::WebViewExt;
+
                                         let web_view = webkit6::WebView::new();
                                         web_view.set_vexpand(true);
                                         web_view.set_hexpand(true);
 
-                                        // Security settings - disable JavaScript
+                                        // Security settings for email display
                                         if let Some(settings) = WebViewExt::settings(&web_view) {
                                             settings.set_enable_javascript(false);
+                                            settings.set_auto_load_images(true);
+                                            settings.set_allow_modal_dialogs(false);
+                                            settings.set_enable_html5_database(false);
+                                            settings.set_enable_html5_local_storage(false);
                                         }
+
+                                        // Handle WebKit process crash - show plain text fallback
+                                        let body_box_crash = body_box_ref.clone();
+                                        let html_fallback = html.clone();
+                                        web_view.connect_web_process_terminated(move |_wv, _reason| {
+                                            tracing::warn!("WebKit process crashed, falling back to plain text");
+                                            while let Some(child) = body_box_crash.first_child() {
+                                                body_box_crash.remove(&child);
+                                            }
+                                            let text = NorthMailApplication::strip_html_tags_public(&html_fallback);
+                                            let text_view = gtk4::TextView::builder()
+                                                .editable(false)
+                                                .cursor_visible(false)
+                                                .wrap_mode(gtk4::WrapMode::Word)
+                                                .vexpand(true)
+                                                .build();
+                                            text_view.buffer().set_text(&text);
+                                            body_box_crash.append(&text_view);
+                                        });
 
                                         // Load the HTML content
                                         web_view.load_html(&html, None);

@@ -26,6 +26,16 @@ impl AccountConfig {
             smtp_port: 587,
         }
     }
+
+    /// Microsoft/Outlook configuration
+    pub fn outlook() -> Self {
+        Self {
+            imap_host: "outlook.office365.com".to_string(),
+            imap_port: 993,
+            smtp_host: "smtp.office365.com".to_string(),
+            smtp_port: 587,
+        }
+    }
 }
 
 /// Represents an email account

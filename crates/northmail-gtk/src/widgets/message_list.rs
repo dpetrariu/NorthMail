@@ -115,6 +115,8 @@ mod imp {
         pub messages: RefCell<Vec<super::MessageInfo>>,
         /// Whether scroll handler for infinite scroll is connected
         pub scroll_handler_connected: Cell<bool>,
+        /// Whether row activation handler is connected
+        pub row_handler_connected: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -388,15 +390,22 @@ impl MessageList {
                     self.add_message_row(list_box, msg);
                 }
 
-                // Connect row activation to emit message-selected signal
-                let widget = self.clone();
-                list_box.connect_row_activated(move |_, row| {
-                    let index = row.index() as usize;
-                    let messages = widget.imp().messages.borrow();
-                    if let Some(msg) = messages.get(index) {
-                        widget.emit_by_name::<()>("message-selected", &[&msg.uid]);
-                    }
-                });
+                // Connect row activation handler only once
+                if !imp.row_handler_connected.get() {
+                    let widget = self.clone();
+                    list_box.connect_row_activated(move |_, row| {
+                        let index = row.index() as usize;
+                        let messages = widget.imp().messages.borrow();
+                        if let Some(msg) = messages.get(index) {
+                            tracing::debug!("Row activated: index={}, uid={}", index, msg.uid);
+                            widget.emit_by_name::<()>("message-selected", &[&msg.uid]);
+                        } else {
+                            tracing::warn!("Row activated but no message at index {}", index);
+                        }
+                    });
+                    imp.row_handler_connected.set(true);
+                    tracing::debug!("Row activation handler connected");
+                }
 
                 scrolled.set_child(Some(list_box));
             }

@@ -43,6 +43,88 @@ impl SimpleImapClient {
         self.connect_xoauth2("outlook.office365.com", 993, email, access_token).await
     }
 
+    /// Connect to any IMAP server and authenticate with LOGIN (password)
+    pub async fn connect_login(
+        &mut self,
+        host: &str,
+        port: u16,
+        username: &str,
+        password: &str,
+    ) -> ImapResult<()> {
+        info!("Connecting to {}:{}", host, port);
+
+        let tcp_stream = TcpStream::connect(format!("{}:{}", host, port))
+            .await
+            .map_err(|e| ImapError::ConnectionFailed(e.to_string()))?;
+
+        let tls_connector = TlsConnector::new();
+        let tls_stream = tls_connector
+            .connect(host, tcp_stream)
+            .await
+            .map_err(|e| ImapError::TlsError(e.to_string()))?;
+
+        debug!("TLS connection established");
+
+        let mut stream = BufReader::new(tls_stream);
+
+        // Read greeting
+        let mut greeting = String::new();
+        stream
+            .read_line(&mut greeting)
+            .await
+            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+        debug!("Greeting: {}", greeting.trim());
+
+        if !greeting.starts_with("* OK") {
+            return Err(ImapError::ServerError(format!(
+                "Unexpected greeting: {}",
+                greeting
+            )));
+        }
+
+        // LOGIN command - quote username and password
+        let tag = self.next_tag();
+        let cmd = format!("{} LOGIN \"{}\" \"{}\"\r\n", tag,
+            username.replace('\\', "\\\\").replace('"', "\\\""),
+            password.replace('\\', "\\\\").replace('"', "\\\""));
+
+        stream
+            .get_mut()
+            .write_all(cmd.as_bytes())
+            .await
+            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+        // Read response
+        let mut auth_ok = false;
+        loop {
+            let mut line = String::new();
+            stream
+                .read_line(&mut line)
+                .await
+                .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+            debug!("Login response: {}", line.trim());
+
+            if line.starts_with(&tag) {
+                if line.contains("OK") {
+                    auth_ok = true;
+                }
+                break;
+            }
+        }
+
+        if !auth_ok {
+            return Err(ImapError::AuthenticationFailed(
+                "LOGIN authentication failed".to_string(),
+            ));
+        }
+
+        info!("LOGIN authentication successful");
+        self.stream = Some(stream);
+        Ok(())
+    }
+
     /// Connect to any IMAP server and authenticate with XOAUTH2
     pub async fn connect_xoauth2(
         &mut self,
@@ -526,9 +608,14 @@ impl SimpleImapClient {
 
     /// Fetch message body by UID
     pub async fn fetch_body(&mut self, uid: u32) -> ImapResult<String> {
+        use std::time::Duration;
+        use async_std::future::timeout;
+
         let tag = self.next_tag();
         // Use BODY.PEEK[] to avoid marking the message as read
         let cmd = format!("{} UID FETCH {} BODY.PEEK[]\r\n", tag, uid);
+
+        debug!("fetch_body: sending command: {} UID FETCH {} BODY.PEEK[]", tag, uid);
 
         let stream = self
             .stream
@@ -541,17 +628,36 @@ impl SimpleImapClient {
             .await
             .map_err(|e| ImapError::ServerError(e.to_string()))?;
 
+        debug!("fetch_body: command sent, waiting for response");
+
         let mut body_bytes: Vec<u8> = Vec::new();
+        let read_timeout = Duration::from_secs(30);
 
         loop {
             let mut line = String::new();
-            stream
-                .read_line(&mut line)
-                .await
-                .map_err(|e| ImapError::ServerError(e.to_string()))?;
+            debug!("fetch_body: waiting for line (timeout: 30s)...");
+
+            let read_result = timeout(read_timeout, stream.read_line(&mut line)).await;
+            match read_result {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    return Err(ImapError::ServerError(format!("Read error: {}", e)));
+                }
+                Err(_) => {
+                    return Err(ImapError::ServerError(format!(
+                        "Timeout waiting for response to UID FETCH {} - message may not exist",
+                        uid
+                    )));
+                }
+            }
+
+            debug!("fetch_body: received line: {} chars, starts with: '{}'",
+                   line.len(),
+                   line.chars().take(60).collect::<String>().replace('\r', "\\r").replace('\n', "\\n"));
 
             // Check for our tag (completion)
             if line.starts_with(&tag) {
+                debug!("fetch_body: got completion tag");
                 break;
             }
 
@@ -559,28 +665,46 @@ impl SimpleImapClient {
             if let Some(literal_start) = line.find('{') {
                 if let Some(literal_end) = line.find('}') {
                     if let Ok(size) = line[literal_start + 1..literal_end].parse::<usize>() {
-                        debug!("Reading literal of {} bytes", size);
+                        debug!("fetch_body: reading literal of {} bytes", size);
 
                         // Read exactly 'size' bytes of literal data
+                        // IMPORTANT: Read from BufReader (stream), NOT stream.get_mut(),
+                        // because BufReader may have already buffered part of the literal
                         let mut literal_buf = vec![0u8; size];
-                        let inner_stream = stream.get_mut();
 
                         use async_std::io::ReadExt;
-                        inner_stream
-                            .read_exact(&mut literal_buf)
-                            .await
-                            .map_err(|e| ImapError::ServerError(format!("Failed to read literal: {}", e)))?;
+                        let read_exact_result = timeout(
+                            Duration::from_secs(60),  // Longer timeout for large bodies
+                            stream.read_exact(&mut literal_buf)
+                        ).await;
 
+                        match read_exact_result {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(e)) => {
+                                return Err(ImapError::ServerError(format!("Failed to read literal: {}", e)));
+                            }
+                            Err(_) => {
+                                return Err(ImapError::ServerError("Timeout reading message body".to_string()));
+                            }
+                        }
+
+                        debug!("fetch_body: read {} bytes of literal data", literal_buf.len());
                         body_bytes = literal_buf;
 
                         // Read the closing line (contains ")" and possibly more)
                         let mut closing_line = String::new();
-                        stream
-                            .read_line(&mut closing_line)
-                            .await
-                            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+                        let close_result = timeout(read_timeout, stream.read_line(&mut closing_line)).await;
+                        match close_result {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(e)) => {
+                                return Err(ImapError::ServerError(format!("Read error: {}", e)));
+                            }
+                            Err(_) => {
+                                return Err(ImapError::ServerError("Timeout reading closing line".to_string()));
+                            }
+                        }
 
-                        debug!("Literal closing line: {}", closing_line.trim());
+                        debug!("fetch_body: closing line: {}", closing_line.trim());
                     }
                 }
             }

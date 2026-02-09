@@ -31,6 +31,8 @@ pub struct DbMessage {
     pub from_name: Option<String>,
     pub to_addresses: Option<String>,
     pub date_sent: Option<String>,
+    /// Unix timestamp for proper date sorting
+    pub date_epoch: Option<i64>,
     pub snippet: Option<String>,
     pub is_read: bool,
     pub is_starred: bool,
@@ -127,6 +129,7 @@ impl Database {
                 from_name TEXT,
                 to_addresses TEXT,
                 date_sent TEXT,
+                date_epoch INTEGER,
                 snippet TEXT,
                 is_read INTEGER DEFAULT 0,
                 is_starred INTEGER DEFAULT 0,
@@ -141,7 +144,7 @@ impl Database {
             );
 
             CREATE INDEX IF NOT EXISTS idx_messages_folder ON messages(folder_id);
-            CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date_sent DESC);
+            CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date_epoch DESC);
             CREATE INDEX IF NOT EXISTS idx_messages_message_id ON messages(message_id);
             CREATE INDEX IF NOT EXISTS idx_folders_account ON folders(account_id);
 
@@ -180,6 +183,9 @@ impl Database {
         // Migration: Add body columns if they don't exist (for existing databases)
         self.migrate_add_body_columns().await?;
 
+        // Migration: Add date_epoch column if it doesn't exist
+        self.migrate_add_date_epoch().await?;
+
         info!("Database schema initialized");
         Ok(())
     }
@@ -199,6 +205,28 @@ impl Database {
                 .await
                 .ok(); // Ignore error if column already exists
             sqlx::query("ALTER TABLE messages ADD COLUMN body_html TEXT")
+                .execute(&self.pool)
+                .await
+                .ok();
+        }
+
+        Ok(())
+    }
+
+    /// Add date_epoch column if it doesn't exist
+    async fn migrate_add_date_epoch(&self) -> CoreResult<()> {
+        let result = sqlx::query("SELECT date_epoch FROM messages LIMIT 1")
+            .fetch_optional(&self.pool)
+            .await;
+
+        if result.is_err() {
+            debug!("Migrating database: adding date_epoch column");
+            sqlx::query("ALTER TABLE messages ADD COLUMN date_epoch INTEGER")
+                .execute(&self.pool)
+                .await
+                .ok();
+            // Create index for sorting
+            sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_date_epoch ON messages(date_epoch DESC)")
                 .execute(&self.pool)
                 .await
                 .ok();
@@ -357,16 +385,81 @@ impl Database {
         Ok(())
     }
 
+    /// Insert or update messages in a batch (wrapped in a transaction for performance)
+    pub async fn upsert_messages_batch(
+        &self,
+        folder_id: i64,
+        messages: &[DbMessage],
+    ) -> CoreResult<usize> {
+        let mut tx = self.pool.begin().await?;
+        let mut count = 0;
+
+        for msg in messages {
+            let result = sqlx::query(
+                r#"
+                INSERT INTO messages (
+                    folder_id, uid, message_id, subject, from_address, from_name,
+                    to_addresses, date_sent, date_epoch, snippet, is_read, is_starred,
+                    has_attachments, size, maildir_path
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(folder_id, uid) DO UPDATE SET
+                    message_id = excluded.message_id,
+                    subject = excluded.subject,
+                    from_address = excluded.from_address,
+                    from_name = excluded.from_name,
+                    to_addresses = excluded.to_addresses,
+                    date_sent = excluded.date_sent,
+                    date_epoch = excluded.date_epoch,
+                    snippet = excluded.snippet,
+                    is_read = excluded.is_read,
+                    is_starred = excluded.is_starred,
+                    has_attachments = excluded.has_attachments,
+                    size = excluded.size,
+                    maildir_path = excluded.maildir_path,
+                    updated_at = datetime('now')
+                "#,
+            )
+            .bind(folder_id)
+            .bind(msg.uid)
+            .bind(&msg.message_id)
+            .bind(&msg.subject)
+            .bind(&msg.from_address)
+            .bind(&msg.from_name)
+            .bind(&msg.to_addresses)
+            .bind(&msg.date_sent)
+            .bind(msg.date_epoch)
+            .bind(&msg.snippet)
+            .bind(msg.is_read)
+            .bind(msg.is_starred)
+            .bind(msg.has_attachments)
+            .bind(msg.size)
+            .bind(&msg.maildir_path)
+            .execute(&mut *tx)
+            .await;
+
+            match result {
+                Ok(_) => count += 1,
+                Err(e) => {
+                    tracing::warn!("Failed to upsert message uid={}: {}", msg.uid, e);
+                }
+            }
+        }
+
+        tx.commit().await?;
+        Ok(count)
+    }
+
     /// Insert or update a message
     pub async fn upsert_message(&self, folder_id: i64, msg: &DbMessage) -> CoreResult<i64> {
         let result = sqlx::query(
             r#"
             INSERT INTO messages (
                 folder_id, uid, message_id, subject, from_address, from_name,
-                to_addresses, date_sent, snippet, is_read, is_starred,
+                to_addresses, date_sent, date_epoch, snippet, is_read, is_starred,
                 has_attachments, size, maildir_path
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(folder_id, uid) DO UPDATE SET
                 message_id = excluded.message_id,
                 subject = excluded.subject,
@@ -374,6 +467,7 @@ impl Database {
                 from_name = excluded.from_name,
                 to_addresses = excluded.to_addresses,
                 date_sent = excluded.date_sent,
+                date_epoch = excluded.date_epoch,
                 snippet = excluded.snippet,
                 is_read = excluded.is_read,
                 is_starred = excluded.is_starred,
@@ -392,6 +486,7 @@ impl Database {
         .bind(&msg.from_name)
         .bind(&msg.to_addresses)
         .bind(&msg.date_sent)
+        .bind(msg.date_epoch)
         .bind(&msg.snippet)
         .bind(msg.is_read)
         .bind(msg.is_starred)
@@ -414,11 +509,11 @@ impl Database {
         let messages = sqlx::query_as::<_, DbMessage>(
             r#"
             SELECT id, folder_id, uid, message_id, subject, from_address, from_name,
-                   to_addresses, date_sent, snippet, is_read, is_starred,
+                   to_addresses, date_sent, date_epoch, snippet, is_read, is_starred,
                    has_attachments, size, maildir_path, body_text, body_html
             FROM messages
             WHERE folder_id = ?
-            ORDER BY date_sent DESC
+            ORDER BY date_epoch DESC, uid DESC
             LIMIT ? OFFSET ?
             "#,
         )
@@ -483,8 +578,8 @@ impl Database {
         let messages = sqlx::query_as::<_, DbMessage>(
             r#"
             SELECT m.id, m.folder_id, m.uid, m.message_id, m.subject, m.from_address,
-                   m.from_name, m.to_addresses, m.date_sent, m.snippet, m.is_read,
-                   m.is_starred, m.has_attachments, m.size, m.maildir_path,
+                   m.from_name, m.to_addresses, m.date_sent, m.date_epoch, m.snippet,
+                   m.is_read, m.is_starred, m.has_attachments, m.size, m.maildir_path,
                    m.body_text, m.body_html
             FROM messages m
             JOIN messages_fts fts ON m.id = fts.rowid
