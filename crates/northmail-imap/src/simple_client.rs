@@ -357,11 +357,60 @@ impl SimpleImapClient {
     }
 
     /// Detect attachments from BODYSTRUCTURE in the raw FETCH response.
-    /// Scans for "attachment" disposition (case-insensitive) which servers emit
-    /// as ("attachment" ...) or ("ATTACHMENT" ...) in the BODYSTRUCTURE portion.
+    /// Checks the BODYSTRUCTURE portion for:
+    /// 1. Explicit "attachment" disposition
+    /// 2. Non-text/non-multipart MIME primary types (application, image, audio, video)
+    ///    which indicate file attachments even without explicit disposition
     fn detect_attachments(line: &str) -> bool {
-        let lower = line.to_ascii_lowercase();
-        lower.contains("\"attachment\"")
+        // Only search the BODYSTRUCTURE portion to avoid false positives from envelope fields
+        let search_area = if let Some(idx) = line.find("BODYSTRUCTURE ") {
+            &line[idx..]
+        } else {
+            return false;
+        };
+        let lower = search_area.to_ascii_lowercase();
+
+        // Explicit attachment disposition
+        if lower.contains("\"attachment\"") {
+            // But exclude S/MIME signatures even if marked as attachment
+            if lower.contains("\"pkcs7-signature\"") || lower.contains("\"pgp-signature\"")
+                || lower.contains("\"x-pkcs7-signature\"") || lower.contains("\"pkcs7-mime\"")
+            {
+                // Only count as attachment if there are OTHER attachment-like types too
+                return lower.contains("\"image\"") || lower.contains("\"audio\"")
+                    || lower.contains("\"video\"")
+                    || (lower.contains("\"application\"")
+                        && !lower.contains("\"pkcs7-signature\"")
+                        && !lower.contains("\"x-pkcs7-signature\"")
+                        && !lower.contains("\"pgp-signature\"")
+                        && !lower.contains("\"pkcs7-mime\""));
+            }
+            return true;
+        }
+
+        // Non-text MIME types, but exclude S/MIME signatures and inline images
+        // S/MIME: pkcs7-signature, x-pkcs7-signature, pgp-signature, pkcs7-mime
+        // Inline images: have Content-ID (appear as "image" type without "attachment" disposition)
+        if lower.contains("\"application\"") {
+            // Only count application/* as attachment if it's NOT a signature type
+            if !lower.contains("\"pkcs7-signature\"") && !lower.contains("\"x-pkcs7-signature\"")
+                && !lower.contains("\"pgp-signature\"") && !lower.contains("\"pkcs7-mime\"")
+            {
+                return true;
+            }
+        }
+
+        // Images/audio/video: only count if explicitly marked as "attachment" disposition
+        // (inline images with Content-ID should not count as attachments)
+        // Since we already checked for "attachment" above, these would be inline
+        // Only flag if there's no Content-ID-like structure nearby
+        if lower.contains("\"audio\"") || lower.contains("\"video\"") {
+            return true;
+        }
+
+        // For images, only count as attachment if there's an explicit "attachment" disposition
+        // (already handled above). Images without "attachment" are likely inline.
+        false
     }
 
     fn extract_uid(line: &str) -> Option<u32> {
@@ -439,17 +488,16 @@ impl SimpleImapClient {
 
             match chars[i] {
                 '"' => {
-                    // Quoted string
+                    // Quoted string — unescape \" and \\
                     i += 1;
-                    let start = i;
+                    let mut value = String::new();
                     while i < chars.len() && chars[i] != '"' {
                         if chars[i] == '\\' && i + 1 < chars.len() {
-                            i += 2; // Skip escaped char
-                        } else {
-                            i += 1;
+                            i += 1; // skip backslash, take next char literally
                         }
+                        value.push(chars[i]);
+                        i += 1;
                     }
-                    let value: String = chars[start..i].iter().collect();
                     parts.push(value);
                     i += 1; // Skip closing quote
                 }
@@ -549,17 +597,16 @@ impl SimpleImapClient {
                     }
 
                     if chars[i] == '"' {
-                        // Quoted string
+                        // Quoted string — collect and unescape \" and \\
                         i += 1;
-                        let start = i;
+                        let mut value = String::new();
                         while i < chars.len() && chars[i] != '"' {
                             if chars[i] == '\\' && i + 1 < chars.len() {
-                                i += 2;
-                            } else {
-                                i += 1;
+                                i += 1; // skip backslash, take next char literally
                             }
+                            value.push(chars[i]);
+                            i += 1;
                         }
-                        let value: String = chars[start..i].iter().collect();
                         addr_parts.push(value);
                         i += 1;
                     } else if i + 2 < chars.len() {
@@ -613,6 +660,94 @@ impl SimpleImapClient {
         } else {
             Some(addresses)
         }
+    }
+
+    /// Fetch message headers by UID range (uses UID FETCH instead of FETCH)
+    pub async fn uid_fetch_headers(&mut self, range: &str) -> ImapResult<Vec<MessageHeader>> {
+        let tag = self.next_tag();
+        let cmd = format!("{} UID FETCH {} (UID FLAGS ENVELOPE BODYSTRUCTURE)\r\n", tag, range);
+
+        let mut raw_lines = Vec::new();
+        {
+            let stream = self
+                .stream
+                .as_mut()
+                .ok_or(ImapError::NotConnected)?;
+
+            stream
+                .get_mut()
+                .write_all(cmd.as_bytes())
+                .await
+                .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+            loop {
+                let mut line = String::new();
+                stream
+                    .read_line(&mut line)
+                    .await
+                    .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+                if line.starts_with(&tag) {
+                    break;
+                }
+
+                if line.starts_with("* ") && line.contains("FETCH") {
+                    raw_lines.push(line);
+                }
+            }
+        }
+
+        let mut headers = Vec::new();
+        for line in raw_lines {
+            if let Some(header) = self.parse_fetch_response(&line) {
+                headers.push(header);
+            }
+        }
+
+        Ok(headers)
+    }
+
+    /// Fetch flags for all messages by UID range
+    /// Returns Vec<(uid, is_read, is_starred)>
+    pub async fn uid_fetch_flags(&mut self, range: &str) -> ImapResult<Vec<(u32, bool, bool)>> {
+        let tag = self.next_tag();
+        let cmd = format!("{} UID FETCH {} (UID FLAGS)\r\n", tag, range);
+
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or(ImapError::NotConnected)?;
+
+        stream
+            .get_mut()
+            .write_all(cmd.as_bytes())
+            .await
+            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+        let mut results = Vec::new();
+
+        loop {
+            let mut line = String::new();
+            stream
+                .read_line(&mut line)
+                .await
+                .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+            if line.starts_with(&tag) {
+                break;
+            }
+
+            if line.starts_with("* ") && line.contains("FETCH") {
+                if let Some(uid) = Self::extract_uid(&line) {
+                    let flag_strs = Self::extract_flags(&line);
+                    let is_read = flag_strs.iter().any(|f| f.eq_ignore_ascii_case("\\Seen"));
+                    let is_starred = flag_strs.iter().any(|f| f.eq_ignore_ascii_case("\\Flagged"));
+                    results.push((uid, is_read, is_starred));
+                }
+            }
+        }
+
+        Ok(results)
     }
 
     /// Fetch message body by UID
@@ -1067,6 +1202,173 @@ impl SimpleImapClient {
     /// Check if the client has a connection
     pub fn is_connected(&self) -> bool {
         self.stream.is_some()
+    }
+
+    /// APPEND a message to a folder, returning the UID if the server provides APPENDUID
+    pub async fn append(
+        &mut self,
+        folder: &str,
+        flags: &[&str],
+        message_data: &[u8],
+    ) -> ImapResult<Option<u32>> {
+        let tag = self.next_tag();
+        let flags_str = if flags.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", flags.join(" "))
+        };
+        let cmd = format!(
+            "{} APPEND \"{}\"{} {{{}}}\r\n",
+            tag,
+            folder,
+            flags_str,
+            message_data.len()
+        );
+
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or(ImapError::NotConnected)?;
+
+        // Send the APPEND command with literal size
+        stream
+            .get_mut()
+            .write_all(cmd.as_bytes())
+            .await
+            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+        // Wait for continuation response "+ "
+        let mut line = String::new();
+        stream
+            .read_line(&mut line)
+            .await
+            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+        debug!("APPEND continuation: {}", line.trim());
+
+        if !line.starts_with('+') {
+            return Err(ImapError::ServerError(format!(
+                "Expected continuation, got: {}",
+                line.trim()
+            )));
+        }
+
+        // Send the literal message data followed by CRLF
+        stream
+            .get_mut()
+            .write_all(message_data)
+            .await
+            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+        stream
+            .get_mut()
+            .write_all(b"\r\n")
+            .await
+            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+        // Read the tagged response
+        let mut uid = None;
+        loop {
+            let mut resp = String::new();
+            stream
+                .read_line(&mut resp)
+                .await
+                .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+            debug!("APPEND response: {}", resp.trim());
+
+            if resp.starts_with(&tag) {
+                if !resp.contains("OK") {
+                    return Err(ImapError::ServerError(format!(
+                        "APPEND failed: {}",
+                        resp.trim()
+                    )));
+                }
+                // Parse [APPENDUID uidvalidity uid] from OK response
+                if let Some(start) = resp.find("[APPENDUID ") {
+                    let rest = &resp[start + 11..];
+                    if let Some(end) = rest.find(']') {
+                        let parts: Vec<&str> = rest[..end].split_whitespace().collect();
+                        if parts.len() == 2 {
+                            uid = parts[1].parse().ok();
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        debug!("APPEND successful, uid: {:?}", uid);
+        Ok(uid)
+    }
+
+    /// Set \Deleted flag on a message by UID and EXPUNGE it
+    pub async fn uid_store_deleted_and_expunge(&mut self, uid: u32) -> ImapResult<()> {
+        // Generate both tags before borrowing stream
+        let tag1 = self.next_tag();
+        let tag2 = self.next_tag();
+        let cmd1 = format!("{} UID STORE {} +FLAGS (\\Deleted)\r\n", tag1, uid);
+        let cmd2 = format!("{} EXPUNGE\r\n", tag2);
+
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or(ImapError::NotConnected)?;
+
+        // UID STORE +FLAGS (\Deleted)
+        stream
+            .get_mut()
+            .write_all(cmd1.as_bytes())
+            .await
+            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+        loop {
+            let mut line = String::new();
+            stream
+                .read_line(&mut line)
+                .await
+                .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+            debug!("STORE response: {}", line.trim());
+
+            if line.starts_with(&tag1) {
+                if !line.contains("OK") {
+                    return Err(ImapError::ServerError(format!(
+                        "UID STORE failed: {}",
+                        line.trim()
+                    )));
+                }
+                break;
+            }
+        }
+
+        // EXPUNGE
+        stream
+            .get_mut()
+            .write_all(cmd2.as_bytes())
+            .await
+            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+        loop {
+            let mut line = String::new();
+            stream
+                .read_line(&mut line)
+                .await
+                .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+            debug!("EXPUNGE response: {}", line.trim());
+
+            if line.starts_with(&tag2) {
+                if !line.contains("OK") {
+                    return Err(ImapError::ServerError(format!(
+                        "EXPUNGE failed: {}",
+                        line.trim()
+                    )));
+                }
+                break;
+            }
+        }
+
+        Ok(())
     }
 
     /// Logout

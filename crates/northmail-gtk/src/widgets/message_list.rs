@@ -501,6 +501,13 @@ impl MessageList {
         }
     }
 
+    /// Check if any filter or search query is currently active
+    pub fn has_active_filter(&self) -> bool {
+        let state = self.imp().filter_state.borrow();
+        let query = self.imp().search_query.borrow();
+        state.is_active() || !query.is_empty()
+    }
+
     /// Show or hide load more capability (with infinite scroll)
     pub fn set_can_load_more(&self, can_load: bool) {
         let imp = self.imp();
@@ -798,6 +805,22 @@ impl MessageList {
         }
 
         self.finish_loading_more();
+    }
+
+    /// Append messages, skipping any whose UID is already in the list (dedup).
+    /// Used during background sync to add new messages without duplicating
+    /// those already loaded from cache or a previous batch.
+    pub fn append_new_messages(&self, messages: Vec<MessageInfo>) {
+        let existing_uids: std::collections::HashSet<u32> = self.imp().messages.borrow()
+            .iter()
+            .map(|m| m.uid)
+            .collect();
+        let new_msgs: Vec<MessageInfo> = messages.into_iter()
+            .filter(|m| !existing_uids.contains(&m.uid))
+            .collect();
+        if !new_msgs.is_empty() {
+            self.append_messages(new_msgs);
+        }
     }
 
     fn add_message_row(&self, list_box: &gtk4::ListBox, msg: &MessageInfo) {

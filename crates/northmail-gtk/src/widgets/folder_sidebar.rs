@@ -321,6 +321,10 @@ impl FolderSidebar {
             None => return,
         };
 
+        // Remember the currently selected row so we can restore it after rebuild
+        let selected_name = list_box.selected_row()
+            .map(|row| row.widget_name().to_string());
+
         // Clear all rows
         while let Some(row) = list_box.row_at_index(0) {
             list_box.remove(&row);
@@ -383,6 +387,18 @@ impl FolderSidebar {
         }
 
         imp.expanded_states.replace(expanded_states);
+
+        // Restore the previously selected row
+        if let Some(ref name) = selected_name {
+            let mut idx = 0;
+            while let Some(row) = list_box.row_at_index(idx) {
+                if row.widget_name() == name.as_str() {
+                    list_box.select_row(Some(&row));
+                    break;
+                }
+                idx += 1;
+            }
+        }
     }
 
     // ── Row factories ────────────────────────────────────────────────

@@ -711,6 +711,24 @@ impl Database {
         Ok(())
     }
 
+    /// Update message has_attachments flag (corrected after body parsing)
+    pub async fn set_message_has_attachments_by_uid(
+        &self,
+        folder_id: i64,
+        uid: i64,
+        has_attachments: bool,
+    ) -> CoreResult<()> {
+        sqlx::query(
+            "UPDATE messages SET has_attachments = ?, updated_at = datetime('now') WHERE folder_id = ? AND uid = ?",
+        )
+        .bind(has_attachments)
+        .bind(folder_id)
+        .bind(uid)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Delete messages by UID (for sync)
     pub async fn delete_messages_not_in_uids(
         &self,
@@ -1093,6 +1111,68 @@ impl Database {
         }
         let row = query.fetch_one(&self.pool).await?;
         Ok(row.get::<i64, _>("count"))
+    }
+
+    /// Get the Drafts folder path for an account
+    pub async fn get_drafts_folder(&self, account_id: &str) -> CoreResult<Option<String>> {
+        let row = sqlx::query(
+            "SELECT full_path FROM folders WHERE account_id = ? AND folder_type = 'drafts' LIMIT 1",
+        )
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| r.get::<String, _>("full_path")))
+    }
+
+    /// Get the minimum UID in a folder (for resume sync)
+    pub async fn get_min_uid(&self, folder_id: i64) -> CoreResult<Option<u32>> {
+        let row = sqlx::query("SELECT MIN(uid) as min_uid FROM messages WHERE folder_id = ?")
+            .bind(folder_id)
+            .fetch_one(&self.pool)
+            .await?;
+
+        Ok(row.get::<Option<i64>, _>("min_uid").map(|v| v as u32))
+    }
+
+    /// Batch update is_read and is_starred flags by UID within a transaction
+    pub async fn batch_update_flags(
+        &self,
+        folder_id: i64,
+        flags: &[(u32, bool, bool)],
+    ) -> CoreResult<usize> {
+        if flags.is_empty() {
+            return Ok(0);
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let mut count = 0;
+
+        for &(uid, is_read, is_starred) in flags {
+            let result = sqlx::query(
+                "UPDATE messages SET is_read = ?, is_starred = ?, updated_at = datetime('now') WHERE folder_id = ? AND uid = ?",
+            )
+            .bind(is_read)
+            .bind(is_starred)
+            .bind(folder_id)
+            .bind(uid as i64)
+            .execute(&mut *tx)
+            .await;
+
+            match result {
+                Ok(r) => {
+                    if r.rows_affected() > 0 {
+                        count += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to update flags for uid={}: {}", uid, e);
+                }
+            }
+        }
+
+        tx.commit().await?;
+        Ok(count)
     }
 
     /// Clear all cached data

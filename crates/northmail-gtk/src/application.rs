@@ -9,6 +9,7 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 use northmail_auth::AuthManager;
 use northmail_imap::{ImapClient, SimpleImapClient};
+use mail_parser::MimeHeaders;
 use tracing::{debug, error, info, warn};
 
 const APP_ID: &str = "org.northmail.NorthMail";
@@ -260,6 +261,8 @@ enum FetchEvent {
     FullSyncDone { total_synced: u32 },
     /// Progress update during background sync
     SyncProgress { synced: u32, total: u32 },
+    /// Flags updated for cached messages: Vec<(uid, is_read, is_starred)>
+    FlagsUpdated(Vec<(u32, bool, bool)>),
     Error(String),
 }
 
@@ -293,11 +296,20 @@ struct SyncedFolder {
     unseen_count: u32,
 }
 
+/// A single attachment extracted from an email
+#[derive(Debug, Clone, Default)]
+pub struct ParsedAttachment {
+    pub filename: String,
+    pub mime_type: String,
+    pub data: Vec<u8>,
+}
+
 /// Parsed email body
 #[derive(Debug, Clone, Default)]
 pub struct ParsedEmailBody {
     pub text: Option<String>,
     pub html: Option<String>,
+    pub attachments: Vec<ParsedAttachment>,
 }
 
 mod imp {
@@ -325,6 +337,8 @@ mod imp {
         pub(super) cache_offset: std::cell::Cell<i64>,
         /// Current folder ID in the database (for cache-based pagination)
         pub(super) cache_folder_id: std::cell::Cell<i64>,
+        /// Cached contacts from EDS (preloaded at startup)
+        pub(super) contacts_cache: RefCell<Vec<(String, String)>>,
     }
 
     #[glib::object_subclass]
@@ -352,6 +366,9 @@ mod imp {
 
             // Load accounts on startup
             app.load_accounts();
+
+            // Preload contacts from GNOME Contacts (EDS) in background
+            app.preload_contacts();
         }
 
         fn startup(&self) {
@@ -541,10 +558,53 @@ impl NorthMailApplication {
                                     // Save accounts to database for foreign key relationships
                                     app.save_accounts_to_db(&accounts);
 
-                                    // Restore last selected folder or select unified inbox
-                                    app.restore_last_folder();
+                                    // Check if DB is fresh (no cached messages)
+                                    let is_fresh_db = if let Some(db) = app.database() {
+                                        let db = db.clone();
+                                        let (sender, receiver) = std::sync::mpsc::channel();
+                                        std::thread::spawn(move || {
+                                            let rt = tokio::runtime::Runtime::new().unwrap();
+                                            let count = rt.block_on(db.get_inbox_message_count()).unwrap_or(0);
+                                            let _ = sender.send(count);
+                                        });
+                                        let count = loop {
+                                            match receiver.try_recv() {
+                                                Ok(c) => break c,
+                                                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                                    glib::timeout_future(std::time::Duration::from_millis(5)).await;
+                                                }
+                                                Err(std::sync::mpsc::TryRecvError::Disconnected) => break 0,
+                                            }
+                                        };
+                                        count == 0
+                                    } else {
+                                        true
+                                    };
+
+                                    if is_fresh_db {
+                                        // Fresh DB: show loading state, sync will populate inbox
+                                        info!("Fresh database detected, showing loading state");
+                                        {
+                                            let mut state = app.imp().state.borrow_mut();
+                                            state.unified_inbox = true;
+                                            state.last_folder = None;
+                                        }
+                                        app.imp().state.borrow().save();
+                                        if let Some(window) = app.active_window() {
+                                            if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                                                win.show_loading_with_status("Loading messages...", None);
+                                                if let Some(sidebar) = win.folder_sidebar() {
+                                                    sidebar.select_unified_inbox();
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        // Existing DB: restore last selected folder
+                                        app.restore_last_folder();
+                                    }
 
                                     // Start background sync for all supported accounts
+                                    // On fresh DB, this will also stream INBOX messages
                                     app.sync_all_accounts();
                                 }
                             }
@@ -659,14 +719,32 @@ impl NorthMailApplication {
 
         glib::spawn_future_local(async move {
             for account in supported_accounts.iter() {
-                // Update sync status - show just email (spinner indicates syncing)
-                app.update_simple_sync_status(&account.email);
+                // Update sync status
+                app.update_simple_sync_status(&format!("Syncing {}...", account.email));
 
-                // Sync this account's inbox
+                // Sync this account's folder metadata (STATUS queries)
                 app.sync_account_inbox(&account.id).await;
 
                 // Refresh sidebar after each account so counts appear progressively
                 app.refresh_sidebar_folders();
+
+                // Check if this account has no cached inbox messages
+                // If so, stream INBOX messages from IMAP to populate the cache
+                let needs_streaming = app.account_inbox_is_empty(&account.id).await;
+                if needs_streaming {
+                    app.update_simple_sync_status(&format!("Loading {}...", account.email));
+                    app.stream_inbox_to_cache(account).await;
+
+                    // If unified inbox is the current view, refresh it with new messages
+                    if app.imp().state.borrow().unified_inbox {
+                        app.fetch_unified_inbox();
+                    }
+                }
+            }
+
+            // Final refresh of unified inbox to show all accounts' messages
+            if app.imp().state.borrow().unified_inbox {
+                app.fetch_unified_inbox();
             }
 
             // Show completion briefly
@@ -762,7 +840,7 @@ impl NorthMailApplication {
                 let _ = sender.send(result);
             });
             match receiver.recv_timeout(std::time::Duration::from_secs(2)) {
-                Ok(Ok(folders)) if !folders.is_empty() => {
+                Ok(Ok(folders)) if folders.len() > 1 => {
                     let cached: Vec<(String, String, String)> = folders
                         .iter()
                         .map(|f| (f.full_path.clone(), f.name.clone(), f.folder_type.clone()))
@@ -1754,10 +1832,41 @@ impl NorthMailApplication {
                 false
             };
 
+            // Query min cached UID for resume sync
+            let min_cached_uid = if has_cache {
+                let cache_fid = app.imp().cache_folder_id.get();
+                if cache_fid > 0 {
+                    if let Some(db) = app.database() {
+                        let db = db.clone();
+                        let (s, r) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let rt = tokio::runtime::Runtime::new().unwrap();
+                            let result = rt.block_on(db.get_min_uid(cache_fid));
+                            let _ = s.send(result);
+                        });
+                        match r.recv_timeout(std::time::Duration::from_secs(1)) {
+                            Ok(Ok(uid)) => {
+                                if uid.is_some() {
+                                    info!("Resume sync: min_cached_uid={:?} for {}/{}", uid, account_email, folder_path);
+                                }
+                                uid
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             // Phase 2: Fetch from IMAP (updates cache and UI)
             debug!(
-                "Starting IMAP sync for {}/{} (has_cache: {})",
-                account_email, folder_path, has_cache
+                "Starting IMAP sync for {}/{} (has_cache: {}, min_cached_uid: {:?})",
+                account_email, folder_path, has_cache, min_cached_uid
             );
 
             match AuthManager::new().await {
@@ -1773,7 +1882,7 @@ impl NorthMailApplication {
 
                                 let folder_path_clone = folder_path.clone();
                                 let result =
-                                    Self::fetch_folder_streaming_oauth2(account_id_clone.clone(), email, access_token, folder_path_clone, has_cache, generation, &app)
+                                    Self::fetch_folder_streaming_oauth2(account_id_clone.clone(), email, access_token, folder_path_clone, has_cache, generation, min_cached_uid, &app)
                                         .await;
 
                                 if let Err(e) = result {
@@ -1797,7 +1906,7 @@ impl NorthMailApplication {
 
                                 let folder_path_clone = folder_path.clone();
                                 let result =
-                                    Self::fetch_folder_streaming_microsoft(account_id_clone.clone(), email, access_token, folder_path_clone, has_cache, generation, &app)
+                                    Self::fetch_folder_streaming_microsoft(account_id_clone.clone(), email, access_token, folder_path_clone, has_cache, generation, min_cached_uid, &app)
                                         .await;
 
                                 if let Err(e) = result {
@@ -1821,7 +1930,7 @@ impl NorthMailApplication {
 
                                 let folder_path_clone = folder_path.clone();
                                 let result =
-                                    Self::fetch_folder_streaming_password(account_id_clone.clone(), host, username, password, folder_path_clone, has_cache, generation, &app)
+                                    Self::fetch_folder_streaming_password(account_id_clone.clone(), host, username, password, folder_path_clone, has_cache, generation, min_cached_uid, &app)
                                         .await;
 
                                 if let Err(e) = result {
@@ -1926,6 +2035,7 @@ impl NorthMailApplication {
         folder_path: String,
         has_cache: bool,
         generation: u64,
+        min_cached_uid: Option<u32>,
         app: &NorthMailApplication,
     ) -> Result<(), String> {
         let (sender, receiver) = std::sync::mpsc::channel::<FetchEvent>();
@@ -1937,7 +2047,7 @@ impl NorthMailApplication {
 
                 match client.connect_gmail(&email, &access_token).await {
                     Ok(_) => {
-                        Self::fetch_streaming(&mut client, &folder_path_clone, &sender, true).await;
+                        Self::fetch_streaming(&mut client, &folder_path_clone, &sender, true, min_cached_uid).await;
                     }
                     Err(e) => {
                         let _ = sender.send(FetchEvent::Error(format!("Authentication failed: {}", e)));
@@ -1957,6 +2067,7 @@ impl NorthMailApplication {
         folder_path: String,
         has_cache: bool,
         generation: u64,
+        min_cached_uid: Option<u32>,
         app: &NorthMailApplication,
     ) -> Result<(), String> {
         let (sender, receiver) = std::sync::mpsc::channel::<FetchEvent>();
@@ -1968,7 +2079,7 @@ impl NorthMailApplication {
 
                 match client.connect_outlook(&email, &access_token).await {
                     Ok(_) => {
-                        Self::fetch_streaming(&mut client, &folder_path_clone, &sender, true).await;
+                        Self::fetch_streaming(&mut client, &folder_path_clone, &sender, true, min_cached_uid).await;
                     }
                     Err(e) => {
                         let _ = sender.send(FetchEvent::Error(format!("Authentication failed: {}", e)));
@@ -1989,6 +2100,7 @@ impl NorthMailApplication {
         folder_path: String,
         has_cache: bool,
         generation: u64,
+        min_cached_uid: Option<u32>,
         app: &NorthMailApplication,
     ) -> Result<(), String> {
         let (sender, receiver) = std::sync::mpsc::channel::<FetchEvent>();
@@ -2000,7 +2112,7 @@ impl NorthMailApplication {
 
                 match client.connect_login(&host, 993, &username, &password).await {
                     Ok(_) => {
-                        Self::fetch_streaming(&mut client, &folder_path_clone, &sender, true).await;
+                        Self::fetch_streaming(&mut client, &folder_path_clone, &sender, true, min_cached_uid).await;
                     }
                     Err(e) => {
                         let _ = sender.send(FetchEvent::Error(format!("Authentication failed: {}", e)));
@@ -2013,12 +2125,14 @@ impl NorthMailApplication {
     }
 
     /// Common streaming fetch using SimpleImapClient
-    /// Fetches initial batch for display, then continues syncing ALL messages in background
+    /// Fetches initial batch for display, syncs flags, then continues syncing remaining messages.
+    /// If `min_cached_uid` is provided, Phase 2 resumes from that UID downward using UID FETCH.
     async fn fetch_streaming(
         client: &mut SimpleImapClient,
         folder_path: &str,
         sender: &std::sync::mpsc::Sender<FetchEvent>,
         _is_initial: bool,
+        min_cached_uid: Option<u32>,
     ) {
         match client.select(folder_path).await {
             Ok(folder_info) => {
@@ -2032,7 +2146,7 @@ impl NorthMailApplication {
                     return;
                 }
 
-                // Phase 1: Fetch initial batch for immediate display
+                // Phase 1: Fetch initial batch for immediate display (sequence-number FETCH)
                 const INITIAL_BATCH: u32 = 50;
                 const PREFETCH_BODIES: usize = 5;
 
@@ -2071,57 +2185,130 @@ impl NorthMailApplication {
                     }
                 }
 
-                // Phase 2: Background sync - fetch ALL remaining messages
-                // This runs after initial display, user can interact while this continues
-                if initial_start > 1 {
-                    let mut synced = INITIAL_BATCH.min(count);
-                    let mut current_end = initial_start - 1;
-                    const BACKGROUND_BATCH: u32 = 500; // Larger batches for background sync
-
-                    tracing::info!(
-                        "Starting background sync: {} more messages to fetch",
-                        current_end
-                    );
-
-                    while current_end > 0 {
-                        let batch_start = if current_end > BACKGROUND_BATCH {
-                            current_end - BACKGROUND_BATCH + 1
-                        } else {
-                            1
-                        };
-
-                        let range = format!("{}:{}", batch_start, current_end);
-                        match client.fetch_headers(&range).await {
-                            Ok(headers) => {
-                                let messages = Self::headers_to_message_info(&headers);
-                                let batch_count = messages.len() as u32;
-                                synced += batch_count;
-
-                                // Send as background messages (saved to DB, not displayed)
-                                let _ = sender.send(FetchEvent::BackgroundMessages(messages));
-                                let _ = sender.send(FetchEvent::SyncProgress {
-                                    synced,
-                                    total: count,
-                                });
-
-                                current_end = batch_start - 1;
-                            }
-                            Err(e) => {
-                                tracing::warn!("Background sync batch failed: {}", e);
-                                // Continue with next batch on error
-                                current_end = if current_end > BACKGROUND_BATCH {
-                                    current_end - BACKGROUND_BATCH
-                                } else {
-                                    0
-                                };
-                            }
+                // Phase 1.5: Sync flags for all cached messages
+                // Lightweight UID FETCH 1:* (FLAGS) to detect read/starred changes from other devices
+                tracing::info!("Phase 1.5: syncing flags for all messages");
+                match client.uid_fetch_flags("1:*").await {
+                    Ok(flags) => {
+                        if !flags.is_empty() {
+                            tracing::info!("Flags sync: got {} flag entries", flags.len());
+                            let _ = sender.send(FetchEvent::FlagsUpdated(flags));
                         }
                     }
+                    Err(e) => {
+                        tracing::warn!("Flags sync failed (non-fatal): {}", e);
+                    }
+                }
 
-                    tracing::info!("Background sync complete: {} messages synced", synced);
-                    let _ = sender.send(FetchEvent::FullSyncDone { total_synced: synced });
+                // Phase 2: Background sync - fetch remaining messages
+                if let Some(min_uid) = min_cached_uid {
+                    // Resume mode: only fetch UIDs below the oldest cached message
+                    if min_uid > 1 {
+                        let mut synced = INITIAL_BATCH.min(count);
+                        let mut current_upper = min_uid - 1;
+                        const UID_BATCH: u32 = 5000;
+
+                        tracing::info!(
+                            "Phase 2 (resume): fetching UIDs 1..{} (below min_cached_uid={})",
+                            current_upper, min_uid
+                        );
+
+                        while current_upper > 0 {
+                            let batch_lower = if current_upper > UID_BATCH {
+                                current_upper - UID_BATCH + 1
+                            } else {
+                                1
+                            };
+
+                            let range = format!("{}:{}", batch_lower, current_upper);
+                            match client.uid_fetch_headers(&range).await {
+                                Ok(headers) => {
+                                    let messages = Self::headers_to_message_info(&headers);
+                                    let batch_count = messages.len() as u32;
+                                    synced += batch_count;
+
+                                    if sender.send(FetchEvent::BackgroundMessages(messages)).is_err() {
+                                        tracing::info!("Background sync cancelled (receiver dropped) at {}/{}", synced, count);
+                                        break;
+                                    }
+                                    let _ = sender.send(FetchEvent::SyncProgress {
+                                        synced,
+                                        total: count,
+                                    });
+
+                                    current_upper = if batch_lower > 1 { batch_lower - 1 } else { 0 };
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Background UID sync batch failed: {}", e);
+                                    current_upper = if current_upper > UID_BATCH {
+                                        current_upper - UID_BATCH
+                                    } else {
+                                        0
+                                    };
+                                }
+                            }
+                        }
+
+                        tracing::info!("Background sync (resume) complete: {} messages synced", synced);
+                        let _ = sender.send(FetchEvent::FullSyncDone { total_synced: synced });
+                    } else {
+                        // min_cached_uid == 1 means all UIDs are cached
+                        tracing::info!("All UIDs already cached (min_uid=1), skipping Phase 2");
+                        let _ = sender.send(FetchEvent::FullSyncDone { total_synced: count });
+                    }
                 } else {
-                    let _ = sender.send(FetchEvent::FullSyncDone { total_synced: count });
+                    // First sync: use sequence-number FETCH (original behavior)
+                    if initial_start > 1 {
+                        let mut synced = INITIAL_BATCH.min(count);
+                        let mut current_end = initial_start - 1;
+                        const BACKGROUND_BATCH: u32 = 500;
+
+                        tracing::info!(
+                            "Phase 2 (first sync): {} more messages to fetch",
+                            current_end
+                        );
+
+                        while current_end > 0 {
+                            let batch_start = if current_end > BACKGROUND_BATCH {
+                                current_end - BACKGROUND_BATCH + 1
+                            } else {
+                                1
+                            };
+
+                            let range = format!("{}:{}", batch_start, current_end);
+                            match client.fetch_headers(&range).await {
+                                Ok(headers) => {
+                                    let messages = Self::headers_to_message_info(&headers);
+                                    let batch_count = messages.len() as u32;
+                                    synced += batch_count;
+
+                                    if sender.send(FetchEvent::BackgroundMessages(messages)).is_err() {
+                                        tracing::info!("Background sync cancelled (receiver dropped) at {}/{}", synced, count);
+                                        break;
+                                    }
+                                    let _ = sender.send(FetchEvent::SyncProgress {
+                                        synced,
+                                        total: count,
+                                    });
+
+                                    current_end = batch_start - 1;
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Background sync batch failed: {}", e);
+                                    current_end = if current_end > BACKGROUND_BATCH {
+                                        current_end - BACKGROUND_BATCH
+                                    } else {
+                                        0
+                                    };
+                                }
+                            }
+                        }
+
+                        tracing::info!("Background sync complete: {} messages synced", synced);
+                        let _ = sender.send(FetchEvent::FullSyncDone { total_synced: synced });
+                    } else {
+                        let _ = sender.send(FetchEvent::FullSyncDone { total_synced: count });
+                    }
                 }
 
                 let _ = client.logout().await;
@@ -2142,6 +2329,188 @@ impl NorthMailApplication {
             false
         }
     }
+
+    /// Check if an account has no cached inbox messages
+    async fn account_inbox_is_empty(&self, account_id: &str) -> bool {
+        let Some(db) = self.database() else { return true };
+        let db = db.clone();
+        let aid = account_id.to_string();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let count = rt.block_on(db.get_account_message_count(&aid)).unwrap_or(0);
+            let _ = sender.send(count);
+        });
+        loop {
+            match receiver.try_recv() {
+                Ok(count) => return count == 0,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    glib::timeout_future(std::time::Duration::from_millis(5)).await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return true,
+            }
+        }
+    }
+
+    /// Stream an account's INBOX messages from IMAP to cache (background sync)
+    /// Returns after the initial batch (first ~50 messages) is cached.
+    /// Remaining messages continue syncing in a background task.
+    async fn stream_inbox_to_cache(&self, account: &northmail_auth::GoaAccount) {
+        let account_id = account.id.clone();
+        let email = account.email.clone();
+        let is_google = Self::is_google_account(account);
+        let is_microsoft = Self::is_microsoft_account(account);
+        let is_password = Self::is_password_account(account);
+        let imap_username = account.imap_username.clone();
+        let imap_host = account.imap_host.clone();
+
+        // Get auth credentials
+        let auth_manager = match AuthManager::new().await {
+            Ok(am) => am,
+            Err(e) => {
+                warn!("Failed to create auth manager for background sync of {}: {}", email, e);
+                return;
+            }
+        };
+
+        let (sender, receiver) = std::sync::mpsc::channel::<FetchEvent>();
+
+        if is_google || is_microsoft {
+            match auth_manager.get_xoauth2_token_for_goa(&account_id).await {
+                Ok((email_addr, access_token)) => {
+                    let is_gmail = is_google;
+                    std::thread::spawn(move || {
+                        async_std::task::block_on(async {
+                            let mut client = SimpleImapClient::new();
+                            let result = if is_gmail {
+                                client.connect_gmail(&email_addr, &access_token).await
+                            } else {
+                                client.connect_outlook(&email_addr, &access_token).await
+                            };
+                            match result {
+                                Ok(_) => {
+                                    Self::fetch_streaming(&mut client, "INBOX", &sender, true, None).await;
+                                }
+                                Err(e) => {
+                                    let _ = sender.send(FetchEvent::Error(format!("Auth failed: {}", e)));
+                                }
+                            }
+                        });
+                    });
+                }
+                Err(e) => {
+                    warn!("Failed to get OAuth2 token for {}: {}", email, e);
+                    return;
+                }
+            }
+        } else if is_password {
+            match auth_manager.get_goa_password(&account_id).await {
+                Ok(password) => {
+                    let username = imap_username.unwrap_or(email.clone());
+                    let host = imap_host.unwrap_or_else(|| "imap.mail.me.com".to_string());
+                    std::thread::spawn(move || {
+                        async_std::task::block_on(async {
+                            let mut client = SimpleImapClient::new();
+                            match client.connect_login(&host, 993, &username, &password).await {
+                                Ok(_) => {
+                                    Self::fetch_streaming(&mut client, "INBOX", &sender, true, None).await;
+                                }
+                                Err(e) => {
+                                    let _ = sender.send(FetchEvent::Error(format!("Auth failed: {}", e)));
+                                }
+                            }
+                        });
+                    });
+                }
+                Err(e) => {
+                    warn!("Failed to get password for {}: {}", email, e);
+                    return;
+                }
+            }
+        } else {
+            return;
+        }
+
+        // Process events until initial batch is done, then continue in background
+        let account_id_ref = &account_id;
+        loop {
+            match receiver.try_recv() {
+                Ok(event) => match event {
+                    FetchEvent::FolderInfo { total_count } => {
+                        info!("Background streaming {}: INBOX has {} messages", email, total_count);
+                        if total_count > 0 {
+                            self.update_simple_sync_status(
+                                &format!("Loading {}... 0/{}", email, total_count),
+                            );
+                        }
+                    }
+                    FetchEvent::Messages(messages) => {
+                        let count = messages.len();
+                        self.save_messages_to_cache(account_id_ref, "INBOX", &messages);
+                        info!("Background streaming {}: cached {} messages", email, count);
+                    }
+                    FetchEvent::BackgroundMessages(messages) => {
+                        self.save_messages_to_cache(account_id_ref, "INBOX", &messages);
+                    }
+                    FetchEvent::BodyPrefetched { uid, body } => {
+                        let parsed = Self::parse_email_body(&body);
+                        if let Some(db) = self.imp().database.get() {
+                            Self::save_body_to_cache(db, account_id_ref, "INBOX", uid, &parsed);
+                        }
+                    }
+                    FetchEvent::FlagsUpdated(flags) => {
+                        // Save updated flags to cache for background streaming
+                        if let Some(db) = self.database() {
+                            let db = db.clone();
+                            let aid = account_id_ref.to_string();
+                            std::thread::spawn(move || {
+                                let rt = tokio::runtime::Runtime::new().unwrap();
+                                rt.block_on(async {
+                                    if let Ok(folder_id) = db.get_or_create_folder_id(&aid, "INBOX").await {
+                                        match db.batch_update_flags(folder_id, &flags).await {
+                                            Ok(updated) => {
+                                                tracing::info!("Background flags sync: updated {} cached messages for {}", updated, aid);
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("Background flags sync failed: {}", e);
+                                            }
+                                        }
+                                    }
+                                });
+                            });
+                        }
+                    }
+                    FetchEvent::SyncProgress { synced, total } => {
+                        self.update_simple_sync_status(
+                            &format!("Loading {}... {}/{}", email, synced, total),
+                        );
+                    }
+                    FetchEvent::InitialBatchDone { .. } => {
+                        info!("Background streaming {}: initial batch done", email);
+                        // Drop the receiver - this will cause the IMAP thread's
+                        // Phase 2 sends to fail, stopping background sync early.
+                        // We only need the initial batch for unified inbox display.
+                        drop(receiver);
+                        return;
+                    }
+                    FetchEvent::FullSyncDone { .. } => {
+                        info!("Background streaming {}: complete", email);
+                        return;
+                    }
+                    FetchEvent::Error(e) => {
+                        warn!("Background streaming {} error: {}", email, e);
+                        return;
+                    }
+                },
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    glib::timeout_future(std::time::Duration::from_millis(10)).await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+            }
+        }
+    }
+
+
 
     /// Check if the given generation is still current (no new folder was selected)
     fn is_current_generation(&self, generation: u64) -> bool {
@@ -2255,23 +2624,52 @@ impl NorthMailApplication {
                                     win.restore_message_list();
                                 }
                                 if let Some(message_list) = win.message_list() {
-                                    // Always replace with first batch from IMAP - it has the latest messages
                                     if first_batch {
-                                        info!("Replacing message list with {} fresh messages from IMAP", messages.len());
-                                        let msg_count = messages.len() as i64;
-                                        message_list.set_messages(messages);
+                                        // When a filter/search is active and we already have
+                                        // cached data, don't replace the filtered view with the
+                                        // small IMAP initial batch (only ~50 msgs). Instead,
+                                        // just append any genuinely new messages (deduped by UID).
+                                        // The IMAP data is already saved to cache above.
+                                        if has_cache && message_list.has_active_filter() {
+                                            info!("Filter active — keeping filtered view, appending {} new IMAP messages", messages.len());
+                                            message_list.append_new_messages(messages);
+                                        } else {
+                                            info!("Replacing message list with {} fresh messages from IMAP", messages.len());
+                                            let msg_count = messages.len() as i64;
+                                            message_list.set_messages(messages);
 
-                                        // Wire up cache-based "load more" for IMAP path too
-                                        // (after IMAP saves to cache, pagination pulls from SQLite)
-                                        let app_for_load_more = app.clone();
-                                        message_list.connect_load_more(move || {
-                                            app_for_load_more.load_more_from_cache();
-                                        });
-                                        app.imp().cache_offset.set(msg_count);
+                                            // Wire up cache-based "load more" for IMAP path too
+                                            // (after IMAP saves to cache, pagination pulls from SQLite)
+                                            let app_for_load_more = app.clone();
+                                            message_list.connect_load_more(move || {
+                                                app_for_load_more.load_more_from_cache();
+                                            });
+                                            app.imp().cache_offset.set(msg_count);
+
+                                            // Resolve cache_folder_id now so load_more_from_cache works
+                                            // before InitialBatchDone fires
+                                            if app.imp().cache_folder_id.get() == 0 {
+                                                if let Some(db) = app.database() {
+                                                    let db = db.clone();
+                                                    let aid = account_id.to_string();
+                                                    let fp = folder_path.to_string();
+                                                    let (s, r) = std::sync::mpsc::channel();
+                                                    std::thread::spawn(move || {
+                                                        let rt = tokio::runtime::Runtime::new().unwrap();
+                                                        let result = rt.block_on(db.get_or_create_folder_id(&aid, &fp));
+                                                        let _ = s.send(result);
+                                                    });
+                                                    if let Ok(Ok(fid)) = r.recv_timeout(std::time::Duration::from_secs(1)) {
+                                                        app.imp().cache_folder_id.set(fid);
+                                                    }
+                                                }
+                                            }
+                                        }
 
                                         first_batch = false;
                                     } else {
-                                        message_list.append_messages(messages);
+                                        // Subsequent IMAP batches — append with dedup
+                                        message_list.append_new_messages(messages);
                                     }
                                 }
                             }
@@ -2293,12 +2691,51 @@ impl NorthMailApplication {
                             parsed.html.as_ref().map(|h| h.len()).unwrap_or(0)
                         );
                     }
+                    FetchEvent::FlagsUpdated(flags) => {
+                        // FlagsUpdated comes from UID FETCH 1:* (FLAGS), so it contains ALL server UIDs.
+                        // Track them for cache cleanup (critical for resume sync where Phase 2
+                        // only fetches a subset of UIDs).
+                        synced_uids.extend(flags.iter().map(|&(uid, _, _)| uid as i64));
+
+                        // Batch update flags in cache so next load shows correct read/starred state
+                        let flag_count = flags.len();
+                        if let Some(db) = app.database() {
+                            let db = db.clone();
+                            let aid = account_id.to_string();
+                            let fp = folder_path.to_string();
+                            std::thread::spawn(move || {
+                                let rt = tokio::runtime::Runtime::new().unwrap();
+                                rt.block_on(async {
+                                    if let Ok(folder_id) = db.get_or_create_folder_id(&aid, &fp).await {
+                                        match db.batch_update_flags(folder_id, &flags).await {
+                                            Ok(updated) => {
+                                                tracing::info!("Flags sync: updated {}/{} cached messages for {}/{}", updated, flag_count, aid, fp);
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("Failed to batch update flags: {}", e);
+                                            }
+                                        }
+                                    }
+                                });
+                            });
+                        }
+                    }
                     FetchEvent::BackgroundMessages(messages) => {
                         // Track UIDs for cache cleanup
                         synced_uids.extend(messages.iter().map(|m| m.uid as i64));
-                        // Background sync - just save to cache, don't update UI
+                        // Save to cache
                         app.save_messages_to_cache(account_id, folder_path, &messages);
-                        // No UI update needed - this is background work
+                        // If still viewing this folder, append new matching messages
+                        // (deduped by UID, filtered by message_matches)
+                        if !is_stale {
+                            if let Some(window) = app.active_window() {
+                                if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                                    if let Some(message_list) = win.message_list() {
+                                        message_list.append_new_messages(messages);
+                                    }
+                                }
+                            }
+                        }
                     }
                     FetchEvent::SyncProgress { synced, total } => {
                         // Update sync progress in sidebar (non-intrusive)
@@ -2436,11 +2873,14 @@ impl NorthMailApplication {
                         if !is_stale {
                             app.hide_sync_status();
                             // If we were showing loading spinner (no cache, first batch),
-                            // restore message list to avoid stuck spinner
+                            // restore message list and show empty state
                             if first_batch && !has_cache {
                                 if let Some(window) = app.active_window() {
                                     if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
                                         win.restore_message_list();
+                                        if let Some(message_list) = win.message_list() {
+                                            message_list.set_messages(vec![]);
+                                        }
                                     }
                                 }
                             }
@@ -2452,6 +2892,17 @@ impl NorthMailApplication {
                     glib::timeout_future(std::time::Duration::from_millis(50)).await;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if !is_stale && first_batch && !has_cache {
+                        app.hide_sync_status();
+                        if let Some(window) = app.active_window() {
+                            if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                                win.restore_message_list();
+                                if let Some(message_list) = win.message_list() {
+                                    message_list.set_messages(vec![]);
+                                }
+                            }
+                        }
+                    }
                     return Err("Connection lost".to_string());
                 }
             }
@@ -2600,7 +3051,7 @@ impl NorthMailApplication {
                             }
                         }
                     }
-                    FetchEvent::BackgroundMessages(_) | FetchEvent::SyncProgress { .. } => {
+                    FetchEvent::BackgroundMessages(_) | FetchEvent::SyncProgress { .. } | FetchEvent::FlagsUpdated(_) => {
                         // Not used in load more
                     }
                     FetchEvent::InitialBatchDone { lowest_seq } | FetchEvent::FullSyncDone { total_synced: lowest_seq } => {
@@ -2981,18 +3432,17 @@ impl NorthMailApplication {
         let pool = self.imap_pool();
 
         glib::spawn_future_local(async move {
-            // First, check cache for message body
-            if let Some(ref db) = db {
-                if let Some(cached_body) = Self::get_cached_body(db, &account_id, &folder_path, uid).await {
-                    info!("📧 Using cached body for message {} - instant display!", uid);
-                    callback(Ok(cached_body));
-                    return;
-                }
-            }
+            // Check cache for text/html body (instant display if no IMAP needed)
+            let cached_body = if let Some(ref db) = db {
+                Self::get_cached_body(db, &account_id, &folder_path, uid).await
+            } else {
+                None
+            };
 
-            info!("🌐 Fetching body from IMAP for message {} (not in cache)", uid);
+            // Always fetch from IMAP to get attachments (parse_email_body extracts them)
+            // The pool reuses connections, so this is fast even on cache hit
+            info!("🌐 Fetching body from IMAP for message {} (cache={})", uid, cached_body.is_some());
 
-            // Not in cache, fetch from IMAP using connection pool
             match AuthManager::new().await {
                 Ok(auth_manager) => {
                     // Build credentials for pool
@@ -3001,14 +3451,29 @@ impl NorthMailApplication {
                             Ok((email, access_token)) => {
                                 Some(ImapCredentials::Gmail { email, access_token })
                             }
-                            Err(e) => { callback(Err(format!("Auth failed: {}", e))); return; }
+                            Err(e) => {
+                                // Fall back to cached body if available
+                                if let Some(cached) = cached_body {
+                                    callback(Ok(cached));
+                                } else {
+                                    callback(Err(format!("Auth failed: {}", e)));
+                                }
+                                return;
+                            }
                         }
                     } else if is_microsoft {
                         match auth_manager.get_xoauth2_token_for_goa(&account_id).await {
                             Ok((email, access_token)) => {
                                 Some(ImapCredentials::Microsoft { email, access_token })
                             }
-                            Err(e) => { callback(Err(format!("Auth failed: {}", e))); return; }
+                            Err(e) => {
+                                if let Some(cached) = cached_body {
+                                    callback(Ok(cached));
+                                } else {
+                                    callback(Err(format!("Auth failed: {}", e)));
+                                }
+                                return;
+                            }
                         }
                     } else {
                         let username = imap_username.unwrap_or(account_email);
@@ -3022,29 +3487,71 @@ impl NorthMailApplication {
                                     password,
                                 })
                             }
-                            Err(e) => { callback(Err(format!("Auth failed: {}", e))); return; }
+                            Err(e) => {
+                                if let Some(cached) = cached_body {
+                                    callback(Ok(cached));
+                                } else {
+                                    callback(Err(format!("Auth failed: {}", e)));
+                                }
+                                return;
+                            }
                         }
                     };
 
                     let Some(credentials) = credentials else {
-                        callback(Err("Failed to get credentials".to_string()));
+                        if let Some(cached) = cached_body {
+                            callback(Ok(cached));
+                        } else {
+                            callback(Err("Failed to get credentials".to_string()));
+                        }
                         return;
                     };
 
                     // Use pool to fetch body (reuses existing connection)
                     let result = Self::fetch_body_via_pool(&pool, credentials, &folder_path, uid).await;
 
-                    // Save to cache if successful
-                    if let Ok(ref body) = result {
-                        if let Some(ref db) = db {
-                            Self::save_body_to_cache(db, &account_id, &folder_path, uid, body);
+                    match result {
+                        Ok(body) => {
+                            // Save to cache if successful
+                            if let Some(ref db) = db {
+                                Self::save_body_to_cache(db, &account_id, &folder_path, uid, &body);
+
+                                // Correct has_attachments flag based on actual parsed attachments
+                                // (BODYSTRUCTURE heuristic may differ from mail-parser extraction)
+                                let has_attachments = !body.attachments.is_empty();
+                                let db_clone = db.clone();
+                                let aid = account_id.clone();
+                                let fp = folder_path.clone();
+                                std::thread::spawn(move || {
+                                    let rt = tokio::runtime::Runtime::new().unwrap();
+                                    rt.block_on(async {
+                                        if let Ok(fid) = db_clone.get_or_create_folder_id(&aid, &fp).await {
+                                            let _ = db_clone.set_message_has_attachments_by_uid(
+                                                fid, uid as i64, has_attachments,
+                                            ).await;
+                                        }
+                                    });
+                                });
+                            }
+                            callback(Ok(body));
+                        }
+                        Err(e) => {
+                            // IMAP failed — fall back to cached body if available
+                            if let Some(cached) = cached_body {
+                                info!("📧 IMAP fetch failed, using cached body for message {}", uid);
+                                callback(Ok(cached));
+                            } else {
+                                callback(Err(e));
+                            }
                         }
                     }
-
-                    callback(result);
                 }
                 Err(e) => {
-                    callback(Err(format!("Auth manager error: {}", e)));
+                    if let Some(cached) = cached_body {
+                        callback(Ok(cached));
+                    } else {
+                        callback(Err(format!("Auth manager error: {}", e)));
+                    }
                 }
             }
         });
@@ -3153,6 +3660,7 @@ impl NorthMailApplication {
                     Some(ParsedEmailBody {
                         text: body_text,
                         html: body_html,
+                        attachments: Vec::new(),
                     })
                 } else {
                     info!("📭 Body cache MISS: No cached body for message {}", uid);
@@ -3409,355 +3917,119 @@ impl NorthMailApplication {
         }
     }
 
-    /// Parse raw email body to extract text and HTML parts
+    /// Parse raw email body to extract text, HTML, and attachments using mail-parser
     fn parse_email_body(raw: &str) -> ParsedEmailBody {
+        use base64::Engine;
+
         let mut result = ParsedEmailBody::default();
 
-        // Find the boundary if this is multipart
-        let boundary = Self::find_boundary(raw);
-
-        if let Some(boundary) = boundary {
-            // Multipart message - find text/plain and text/html parts
-            // Skip first element (preamble before first boundary marker)
-            let parts: Vec<&str> = raw.split(&format!("--{}", boundary)).collect();
-
-            for part in parts.iter().skip(1) {
-                let part = part.trim();
-                if part.is_empty() || part == "--" || part.starts_with("--") {
-                    continue;
-                }
-
-                // Find content-type header in this part
-                let content_type = Self::find_part_header(part, "Content-Type");
-                let transfer_encoding = Self::find_part_header(part, "Content-Transfer-Encoding");
-
-                // Split headers from body - headers end at first blank line
-                let body = Self::extract_body_after_headers(part);
-
-                if let Some(ct) = &content_type {
-                    let ct_lower = ct.to_lowercase();
-                    if ct_lower.contains("text/plain") && result.text.is_none() {
-                        if !body.is_empty() {
-                            result.text = Some(Self::decode_body_content(&body, transfer_encoding.as_deref()));
-                        }
-                    } else if ct_lower.contains("text/html") && result.html.is_none() {
-                        if !body.is_empty() {
-                            result.html = Some(Self::decode_body_content(&body, transfer_encoding.as_deref()));
-                        }
-                    } else if ct_lower.contains("multipart/") {
-                        // Any nested multipart (alternative, related, mixed) - parse recursively
-                        if let Some(nested_boundary) = Self::find_boundary_in_header(ct) {
-                            let nested = Self::parse_multipart_recursive(part, &nested_boundary);
-                            if result.text.is_none() && nested.text.is_some() {
-                                result.text = nested.text;
-                            }
-                            if result.html.is_none() && nested.html.is_some() {
-                                result.html = nested.html;
-                            }
-                        }
-                    }
-                } else if body.is_empty() {
-                    continue;
-                }
-            }
-
-            // Log when parsing yields no content for debugging
-            if result.text.is_none() && result.html.is_none() {
-                let top_ct = Self::find_part_header(raw, "Content-Type").unwrap_or_default();
-                warn!("parse_email_body: No text/html found! Top Content-Type: {}", top_ct);
-            }
-        } else {
-            // Single part message
-            let content_type = Self::find_part_header(raw, "Content-Type");
-            let transfer_encoding = Self::find_part_header(raw, "Content-Transfer-Encoding");
-
-            // Find body after headers
-            let body = Self::extract_body_after_headers(raw);
-            if !body.is_empty() {
-                let decoded = Self::decode_body_content(&body, transfer_encoding.as_deref());
-
-                if let Some(ct) = content_type {
-                    if ct.to_lowercase().contains("text/html") {
-                        result.html = Some(decoded);
-                    } else {
-                        result.text = Some(decoded);
-                    }
-                } else {
-                    // Assume plain text if no content-type
-                    result.text = Some(decoded);
-                }
-            }
-        }
-
-        result
-    }
-
-    /// Parse a nested multipart section (alternative, related, mixed, etc.)
-    fn parse_multipart_recursive(content: &str, boundary: &str) -> ParsedEmailBody {
-        let mut result = ParsedEmailBody::default();
-        // Skip first element (preamble before first boundary marker)
-        let parts: Vec<&str> = content.split(&format!("--{}", boundary)).collect();
-
-        for part in parts.iter().skip(1) {
-            let part = part.trim();
-            if part.is_empty() || part == "--" || part.starts_with("--") {
-                continue;
-            }
-
-            let content_type = Self::find_part_header(part, "Content-Type");
-            let transfer_encoding = Self::find_part_header(part, "Content-Transfer-Encoding");
-
-            let body = Self::extract_body_after_headers(part);
-
-            if let Some(ct) = &content_type {
-                let ct_lower = ct.to_lowercase();
-                if ct_lower.contains("text/plain") && result.text.is_none() {
-                    if !body.is_empty() {
-                        result.text = Some(Self::decode_body_content(&body, transfer_encoding.as_deref()));
-                    }
-                } else if ct_lower.contains("text/html") && result.html.is_none() {
-                    if !body.is_empty() {
-                        result.html = Some(Self::decode_body_content(&body, transfer_encoding.as_deref()));
-                    }
-                } else if ct_lower.contains("multipart/") {
-                    // Recursively parse nested multipart
-                    if let Some(nested_boundary) = Self::find_boundary_in_header(ct) {
-                        let nested = Self::parse_multipart_recursive(part, &nested_boundary);
-                        if result.text.is_none() && nested.text.is_some() {
-                            result.text = nested.text;
-                        }
-                        if result.html.is_none() && nested.html.is_some() {
-                            result.html = nested.html;
-                        }
-                    }
-                }
-            }
-        }
-
-        result
-    }
-
-    /// Extract body content after headers (headers end at blank line)
-    fn extract_body_after_headers(content: &str) -> String {
-        // Find the blank line that separates headers from body
-        if let Some(pos) = content.find("\r\n\r\n") {
-            content[pos + 4..].to_string()
-        } else if let Some(pos) = content.find("\n\n") {
-            content[pos + 2..].to_string()
-        } else {
-            // No blank line found - might be all headers or all body
-            // Check if first line looks like a header
-            if let Some(first_line) = content.lines().next() {
-                if first_line.contains(':') && !first_line.starts_with(' ') && !first_line.starts_with('\t') {
-                    // Looks like headers only
-                    String::new()
-                } else {
-                    // Assume it's all body
-                    content.to_string()
-                }
-            } else {
-                String::new()
-            }
-        }
-    }
-
-    /// Find a header in a MIME part (only searches the header section)
-    fn find_part_header(part: &str, header_name: &str) -> Option<String> {
-        let header_lower = header_name.to_lowercase();
-
-        // Only look at lines before the first blank line (header section)
-        let header_section = if let Some(pos) = part.find("\r\n\r\n") {
-            &part[..pos]
-        } else if let Some(pos) = part.find("\n\n") {
-            &part[..pos]
-        } else {
-            part
+        let message = match mail_parser::MessageParser::default().parse(raw.as_bytes()) {
+            Some(msg) => msg,
+            None => return result,
         };
 
-        let mut current_header: Option<(String, String)> = None;
+        // Extract text and HTML body
+        result.text = message.body_text(0).map(|s| s.into_owned());
+        result.html = message.body_html(0).map(|s| s.into_owned());
 
-        for line in header_section.lines() {
-            // Check for continuation line (starts with whitespace)
-            if (line.starts_with(' ') || line.starts_with('\t')) && current_header.is_some() {
-                if let Some((_, ref mut value)) = current_header {
-                    value.push(' ');
-                    value.push_str(line.trim());
-                }
+        // Collect inline images (Content-ID parts) for cid: replacement in HTML
+        // and separate real attachments from inline resources
+        let mut cid_map: Vec<(String, String, Vec<u8>)> = Vec::new(); // (cid, mime_type, data)
+
+        for attachment in message.attachments() {
+            let mime_type = MimeHeaders::content_type(attachment)
+                .map(|ct| {
+                    if let Some(subtype) = ct.subtype() {
+                        format!("{}/{}", ct.ctype(), subtype)
+                    } else {
+                        ct.ctype().to_string()
+                    }
+                })
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            let mime_lower = mime_type.to_lowercase();
+
+            // Skip S/MIME and PGP signatures — not user-facing attachments
+            if mime_lower == "application/pkcs7-signature"
+                || mime_lower == "application/x-pkcs7-signature"
+                || mime_lower == "application/pgp-signature"
+            {
                 continue;
             }
 
-            // Check if previous header matches what we're looking for
-            if let Some((name, value)) = current_header.take() {
-                if name.to_lowercase() == header_lower {
-                    return Some(value);
-                }
-            }
-
-            // Parse new header
-            if let Some(colon_pos) = line.find(':') {
-                let name = line[..colon_pos].trim().to_string();
-                let value = line[colon_pos + 1..].trim().to_string();
-                current_header = Some((name, value));
-            }
-        }
-
-        // Check last header
-        if let Some((name, value)) = current_header {
-            if name.to_lowercase() == header_lower {
-                return Some(value);
-            }
-        }
-
-        None
-    }
-
-    /// Find boundary in a Content-Type header value
-    fn find_boundary_in_header(content_type: &str) -> Option<String> {
-        if let Some(boundary_start) = content_type.find("boundary=") {
-            let after = &content_type[boundary_start + 9..];
-            let boundary = if after.starts_with('"') {
-                after[1..].split('"').next()
-            } else {
-                after.split(&[';', ' ', '\r', '\n'][..]).next()
-            };
-            return boundary.map(|s| s.to_string());
-        }
-        None
-    }
-
-    /// Find MIME boundary in email
-    fn find_boundary(raw: &str) -> Option<String> {
-        // First, try to find boundary in Content-Type header
-        let mut in_content_type = false;
-        let mut content_type_value = String::new();
-
-        for line in raw.lines() {
-            let line_lower = line.to_lowercase();
-
-            // Check for Content-Type header start
-            if line_lower.starts_with("content-type:") {
-                in_content_type = true;
-                content_type_value = line.to_string();
+            let data = attachment.contents().to_vec();
+            if data.is_empty() {
                 continue;
             }
 
-            // Check for continuation of Content-Type header
-            if in_content_type && (line.starts_with(' ') || line.starts_with('\t')) {
-                content_type_value.push_str(line);
+            // Parts with Content-ID are inline resources for the HTML body (images, etc.)
+            // Collect them for cid: replacement, don't show as attachment pills
+            if let Some(cid) = attachment.content_id() {
+                let cid_clean = cid.trim_start_matches('<').trim_end_matches('>').to_string();
+                cid_map.push((cid_clean, mime_type, data));
                 continue;
             }
 
-            // End of Content-Type header
-            if in_content_type && !line.is_empty() {
-                in_content_type = false;
-                if let Some(boundary) = Self::find_boundary_in_header(&content_type_value) {
-                    return Some(boundary);
-                }
-            }
+            let filename = attachment
+                .attachment_name()
+                .unwrap_or("attachment")
+                .to_string();
 
-            // Empty line means end of headers
-            if line.is_empty() && !content_type_value.is_empty() {
-                if let Some(boundary) = Self::find_boundary_in_header(&content_type_value) {
-                    return Some(boundary);
-                }
-                break;
-            }
+            result.attachments.push(ParsedAttachment {
+                filename,
+                mime_type,
+                data,
+            });
         }
 
-        // Check the accumulated Content-Type if we haven't found boundary yet
-        if !content_type_value.is_empty() {
-            if let Some(boundary) = Self::find_boundary_in_header(&content_type_value) {
-                return Some(boundary);
-            }
-        }
+        // Replace cid: references in HTML with data: URIs so WebKit can display inline images
+        if let Some(ref mut html) = result.html {
+            for (cid, mime_type, data) in &cid_map {
+                let b64 = base64::prelude::BASE64_STANDARD.encode(data);
+                let data_uri = format!("data:{};base64,{}", mime_type, b64);
+                tracing::debug!(
+                    "CID image: id={}, type={}, data_size={}",
+                    cid, mime_type, data.len()
+                );
 
-        // Fallback: Try to detect boundary from content itself
-        // Look for lines that look like MIME boundaries (start with --)
-        for line in raw.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("--") && !trimmed.starts_with("---") && trimmed.len() > 10 {
-                // This looks like a boundary line, extract the boundary (without leading --)
-                let potential_boundary = &trimmed[2..];
-                // Remove trailing -- if present (end marker)
-                let boundary = potential_boundary.trim_end_matches("--").to_string();
-                if !boundary.is_empty() && !boundary.contains(' ') {
-                    return Some(boundary);
-                }
-            }
-        }
+                // Case-insensitive replacement of cid: references
+                // Also handle URL-encoded CID values (e.g. %40 for @)
+                let cid_url_encoded = cid.replace('@', "%40");
+                let needles: Vec<String> = vec![
+                    format!("cid:{}", cid),
+                    format!("cid:{}", cid_url_encoded),
+                ];
 
-        None
-    }
-    /// Decode body content based on transfer encoding
-    fn decode_body_content(body: &str, transfer_encoding: Option<&str>) -> String {
-        match transfer_encoding.map(|s| s.to_lowercase()).as_deref() {
-            Some("base64") => {
-                // Remove whitespace and decode
-                let clean: String = body.chars().filter(|c| !c.is_whitespace()).collect();
-                match base64::prelude::BASE64_STANDARD.decode(&clean) {
-                    Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                    Err(_) => body.to_string(),
-                }
-            }
-            Some("quoted-printable") => {
-                Self::decode_quoted_printable_body(body)
-            }
-            _ => body.to_string(),
-        }
-    }
-
-    /// Decode quoted-printable body
-    fn decode_quoted_printable_body(input: &str) -> String {
-        let mut result = Vec::new();
-        let mut lines = input.lines().peekable();
-
-        while let Some(line) = lines.next() {
-            let mut chars = line.chars().peekable();
-
-            while let Some(c) = chars.next() {
-                match c {
-                    '=' => {
-                        // Check for soft line break or hex encoding
-                        let next1 = chars.next();
-                        let next2 = chars.next();
-
-                        match (next1, next2) {
-                            (Some(h1), Some(h2)) => {
-                                // Try to decode as hex
-                                let hex = format!("{}{}", h1, h2);
-                                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                                    result.push(byte);
-                                } else {
-                                    result.push(b'=');
-                                    result.push(h1 as u8);
-                                    result.push(h2 as u8);
-                                }
-                            }
-                            (None, _) => {
-                                // Soft line break - continue to next line
-                            }
-                            (Some(h1), None) => {
-                                result.push(b'=');
-                                result.push(h1 as u8);
-                            }
+                let mut replaced = false;
+                for needle in &needles {
+                    // Case-insensitive search: find all positions where needle matches
+                    let html_lower = html.to_lowercase();
+                    let needle_lower = needle.to_lowercase();
+                    if html_lower.contains(&needle_lower) {
+                        // Replace all case-insensitive occurrences
+                        let mut new_html = String::with_capacity(html.len());
+                        let mut search_start = 0;
+                        while let Some(pos) = html_lower[search_start..].find(&needle_lower) {
+                            let abs_pos = search_start + pos;
+                            new_html.push_str(&html[search_start..abs_pos]);
+                            new_html.push_str(&data_uri);
+                            search_start = abs_pos + needle.len();
                         }
-                    }
-                    _ if c.is_ascii() => result.push(c as u8),
-                    _ => {
-                        // Non-ASCII, encode as UTF-8
-                        let mut buf = [0u8; 4];
-                        result.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                        new_html.push_str(&html[search_start..]);
+                        *html = new_html;
+                        replaced = true;
+                        tracing::debug!("Replaced CID reference '{}' in HTML", needle);
                     }
                 }
-            }
-
-            // Add newline unless this line ended with a soft break
-            if !line.ends_with('=') {
-                result.push(b'\n');
+                if !replaced {
+                    tracing::warn!(
+                        "CID '{}' collected but no matching reference found in HTML",
+                        cid
+                    );
+                }
             }
         }
 
-        String::from_utf8_lossy(&result).into_owned()
+        result
     }
 
     /// Strip HTML tags from content (public wrapper)
@@ -4472,20 +4744,263 @@ impl NorthMailApplication {
         });
     }
 
-    /// Query EDS (Evolution Data Server) contacts matching a prefix
-    pub fn query_contacts(
+    /// Save a draft to the account's IMAP Drafts folder via APPEND.
+    /// Returns the UID of the saved draft (if server provides APPENDUID).
+    pub fn save_draft(
         &self,
-        prefix: String,
-        callback: impl FnOnce(Vec<(String, String)>) + 'static,
+        account_index: u32,
+        msg: northmail_smtp::OutgoingMessage,
+        callback: impl FnOnce(Result<Option<u32>, String>) + 'static,
     ) {
+        let accounts = self.imp().accounts.borrow().clone();
+        let account = match accounts.get(account_index as usize) {
+            Some(a) => a.clone(),
+            None => {
+                callback(Err("Invalid account selection".to_string()));
+                return;
+            }
+        };
+
+        let db = match self.database_ref() {
+            Some(db) => db.clone(),
+            None => {
+                callback(Err("Database not initialized".to_string()));
+                return;
+            }
+        };
+
+        let account_id = account.id.clone();
+        let email = account.email.clone();
+        let auth_type = account.auth_type.clone();
+        let provider_type = account.provider_type.clone();
+        let imap_host = account.imap_host.clone();
+        let imap_username = account.imap_username.clone();
+
         glib::spawn_future_local(async move {
             let (sender, receiver) = std::sync::mpsc::channel();
-            let prefix_clone = prefix.clone();
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
-                    let results = Self::eds_query_contacts(&prefix_clone).await;
+                    let result = async {
+                        // Build RFC 2822 message bytes
+                        let lettre_msg = northmail_smtp::build_lettre_message(&msg)
+                            .map_err(|e| format!("Failed to build message: {}", e))?;
+                        let message_bytes = lettre_msg.formatted();
+
+                        // Find drafts folder path from DB
+                        let drafts_path = db
+                            .get_drafts_folder(&account_id)
+                            .await
+                            .map_err(|e| format!("DB error: {}", e))?
+                            .unwrap_or_else(|| "Drafts".to_string());
+
+                        // Connect a SimpleImapClient and APPEND
+                        let auth_manager = AuthManager::new()
+                            .await
+                            .map_err(|e| format!("Auth init failed: {}", e))?;
+
+                        let mut client = SimpleImapClient::new();
+
+                        match auth_type {
+                            northmail_auth::GoaAuthType::OAuth2 => {
+                                let (_email, token) = auth_manager
+                                    .get_xoauth2_token_for_goa(&account_id)
+                                    .await
+                                    .map_err(|e| format!("Failed to get token: {}", e))?;
+
+                                match provider_type.as_str() {
+                                    "google" => client.connect_gmail(&email, &token).await,
+                                    _ => client.connect_outlook(&email, &token).await,
+                                }
+                                .map_err(|e| format!("IMAP connect failed: {}", e))?;
+                            }
+                            northmail_auth::GoaAuthType::Password => {
+                                let password = auth_manager
+                                    .get_goa_password(&account_id)
+                                    .await
+                                    .map_err(|e| format!("Failed to get password: {}", e))?;
+
+                                let host = imap_host
+                                    .as_deref()
+                                    .unwrap_or("imap.mail.me.com");
+                                let username = imap_username
+                                    .as_deref()
+                                    .unwrap_or(&email);
+
+                                client
+                                    .connect_login(host, 993, username, &password)
+                                    .await
+                                    .map_err(|e| format!("IMAP connect failed: {}", e))?;
+                            }
+                            northmail_auth::GoaAuthType::Unknown => {
+                                return Err("Unsupported auth type".to_string());
+                            }
+                        }
+
+                        let uid = client
+                            .append(&drafts_path, &["\\Draft", "\\Seen"], &message_bytes)
+                            .await
+                            .map_err(|e| format!("APPEND failed: {}", e))?;
+
+                        let _ = client.logout().await;
+                        Ok(uid)
+                    }
+                    .await;
+
+                    let _ = sender.send(result);
+                });
+            });
+
+            let result = loop {
+                match receiver.try_recv() {
+                    Ok(result) => break result,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        break Err("Draft save thread crashed".to_string());
+                    }
+                }
+            };
+
+            callback(result);
+        });
+    }
+
+    /// Delete a draft from the IMAP Drafts folder by UID
+    pub fn delete_draft(
+        &self,
+        account_index: u32,
+        draft_uid: u32,
+        callback: impl FnOnce(Result<(), String>) + 'static,
+    ) {
+        let accounts = self.imp().accounts.borrow().clone();
+        let account = match accounts.get(account_index as usize) {
+            Some(a) => a.clone(),
+            None => {
+                callback(Err("Invalid account selection".to_string()));
+                return;
+            }
+        };
+
+        let db = match self.database_ref() {
+            Some(db) => db.clone(),
+            None => {
+                callback(Err("Database not initialized".to_string()));
+                return;
+            }
+        };
+
+        let account_id = account.id.clone();
+        let email = account.email.clone();
+        let auth_type = account.auth_type.clone();
+        let provider_type = account.provider_type.clone();
+        let imap_host = account.imap_host.clone();
+        let imap_username = account.imap_username.clone();
+
+        glib::spawn_future_local(async move {
+            let (sender, receiver) = std::sync::mpsc::channel();
+
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let result = async {
+                        let drafts_path = db
+                            .get_drafts_folder(&account_id)
+                            .await
+                            .map_err(|e| format!("DB error: {}", e))?
+                            .unwrap_or_else(|| "Drafts".to_string());
+
+                        let auth_manager = AuthManager::new()
+                            .await
+                            .map_err(|e| format!("Auth init failed: {}", e))?;
+
+                        let mut client = SimpleImapClient::new();
+
+                        match auth_type {
+                            northmail_auth::GoaAuthType::OAuth2 => {
+                                let (_email, token) = auth_manager
+                                    .get_xoauth2_token_for_goa(&account_id)
+                                    .await
+                                    .map_err(|e| format!("Failed to get token: {}", e))?;
+
+                                match provider_type.as_str() {
+                                    "google" => client.connect_gmail(&email, &token).await,
+                                    _ => client.connect_outlook(&email, &token).await,
+                                }
+                                .map_err(|e| format!("IMAP connect failed: {}", e))?;
+                            }
+                            northmail_auth::GoaAuthType::Password => {
+                                let password = auth_manager
+                                    .get_goa_password(&account_id)
+                                    .await
+                                    .map_err(|e| format!("Failed to get password: {}", e))?;
+
+                                let host = imap_host
+                                    .as_deref()
+                                    .unwrap_or("imap.mail.me.com");
+                                let username = imap_username
+                                    .as_deref()
+                                    .unwrap_or(&email);
+
+                                client
+                                    .connect_login(host, 993, username, &password)
+                                    .await
+                                    .map_err(|e| format!("IMAP connect failed: {}", e))?;
+                            }
+                            northmail_auth::GoaAuthType::Unknown => {
+                                return Err("Unsupported auth type".to_string());
+                            }
+                        }
+
+                        // SELECT the Drafts folder, then delete
+                        client
+                            .select(&drafts_path)
+                            .await
+                            .map_err(|e| format!("SELECT Drafts failed: {}", e))?;
+
+                        client
+                            .uid_store_deleted_and_expunge(draft_uid)
+                            .await
+                            .map_err(|e| format!("Delete draft failed: {}", e))?;
+
+                        let _ = client.logout().await;
+                        Ok(())
+                    }
+                    .await;
+
+                    let _ = sender.send(result);
+                });
+            });
+
+            let result = loop {
+                match receiver.try_recv() {
+                    Ok(result) => break result,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        break Err("Draft delete thread crashed".to_string());
+                    }
+                }
+            };
+
+            callback(result);
+        });
+    }
+
+    /// Query EDS (Evolution Data Server) contacts matching a prefix
+    /// Preload all contacts from EDS at startup (runs in background)
+    pub fn preload_contacts(&self) {
+        let app = self.clone();
+        glib::spawn_future_local(async move {
+            let (sender, receiver) = std::sync::mpsc::channel();
+
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let results = Self::eds_fetch_all_contacts().await;
                     let _ = sender.send(results);
                 });
             });
@@ -4494,7 +5009,7 @@ impl NorthMailApplication {
                 match receiver.try_recv() {
                     Ok(results) => break results,
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        glib::timeout_future(std::time::Duration::from_millis(20)).await;
+                        glib::timeout_future(std::time::Duration::from_millis(50)).await;
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         break Vec::new();
@@ -4502,12 +5017,32 @@ impl NorthMailApplication {
                 }
             };
 
-            callback(results);
+            eprintln!("[eds] preloaded {} contacts", results.len());
+            *app.imp().contacts_cache.borrow_mut() = results;
         });
     }
 
-    /// Query EDS address books via D-Bus for contacts matching a prefix
-    async fn eds_query_contacts(prefix: &str) -> Vec<(String, String)> {
+    /// Query contacts by filtering the preloaded cache (instant, no D-Bus)
+    pub fn query_contacts(
+        &self,
+        prefix: String,
+        callback: impl FnOnce(Vec<(String, String)>) + 'static,
+    ) {
+        let prefix_lower = prefix.to_lowercase();
+        let cache = self.imp().contacts_cache.borrow();
+        let results: Vec<(String, String)> = cache
+            .iter()
+            .filter(|(name, email)| {
+                name.to_lowercase().contains(&prefix_lower)
+                    || email.to_lowercase().contains(&prefix_lower)
+            })
+            .cloned()
+            .collect();
+        callback(results);
+    }
+
+    /// Fetch ALL contacts from EDS address books (called once at startup)
+    async fn eds_fetch_all_contacts() -> Vec<(String, String)> {
         let mut results = Vec::new();
 
         let conn = match zbus::Connection::session().await {
@@ -4518,7 +5053,6 @@ impl NorthMailApplication {
             }
         };
 
-        // Discover versioned EDS service names dynamically
         let (sources_bus, addressbook_bus) = match Self::eds_discover_services(&conn).await {
             Some(pair) => {
                 eprintln!("[eds] services: {} / {}", pair.0, pair.1);
@@ -4530,7 +5064,6 @@ impl NorthMailApplication {
             }
         };
 
-        // Get address book source UIDs via ObjectManager
         let source_uids = match Self::eds_get_address_book_uids(&conn, &sources_bus).await {
             Ok(uids) => {
                 eprintln!("[eds] {} address books found", uids.len());
@@ -4542,21 +5075,15 @@ impl NorthMailApplication {
             }
         };
 
-        // Query each address book
-        let escaped = prefix.replace('\\', "\\\\").replace('\"', "\\\"");
-        let sexp = format!(
-            "(or (contains \"full_name\" \"{}\") (contains \"email\" \"{}\"))",
-            escaped, escaped
-        );
-
+        // Fetch all contacts from each address book (empty sexp = all)
         for uid in &source_uids {
-            match Self::eds_query_address_book(&conn, &addressbook_bus, uid, &sexp).await {
+            match Self::eds_query_address_book(&conn, &addressbook_bus, uid, "").await {
                 Ok(contacts) => {
                     eprintln!("[eds] {} contacts from {}", contacts.len(), uid);
                     results.extend(contacts);
                 }
                 Err(e) => {
-                    eprintln!("[eds] query error for {}: {}", uid, e);
+                    eprintln!("[eds] fetch error for {}: {}", uid, e);
                 }
             }
         }

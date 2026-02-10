@@ -187,97 +187,102 @@ impl SmtpClient {
 
     /// Build a lettre Message from OutgoingMessage
     fn build_message(&self, msg: &OutgoingMessage) -> SmtpResult<Message> {
-        // Parse from address
-        let from_mailbox = if let Some(ref name) = msg.from_name {
-            Mailbox::new(
-                Some(name.clone()),
-                msg.from
-                    .parse()
-                    .map_err(|e| SmtpError::InvalidAddress(format!("{}: {}", msg.from, e)))?,
-            )
-        } else {
-            Mailbox::new(
-                None,
-                msg.from
-                    .parse()
-                    .map_err(|e| SmtpError::InvalidAddress(format!("{}: {}", msg.from, e)))?,
-            )
-        };
-
-        let mut builder = Message::builder().from(from_mailbox).subject(&msg.subject);
-
-        // Add To recipients
-        for to in &msg.to {
-            let mailbox = Mailbox::new(
-                None,
-                to.parse()
-                    .map_err(|e| SmtpError::InvalidAddress(format!("{}: {}", to, e)))?,
-            );
-            builder = builder.to(mailbox);
-        }
-
-        // Add CC recipients
-        for cc in &msg.cc {
-            let mailbox = Mailbox::new(
-                None,
-                cc.parse()
-                    .map_err(|e| SmtpError::InvalidAddress(format!("{}: {}", cc, e)))?,
-            );
-            builder = builder.cc(mailbox);
-        }
-
-        // Add BCC recipients
-        for bcc in &msg.bcc {
-            let mailbox = Mailbox::new(
-                None,
-                bcc.parse()
-                    .map_err(|e| SmtpError::InvalidAddress(format!("{}: {}", bcc, e)))?,
-            );
-            builder = builder.bcc(mailbox);
-        }
-
-        // Add In-Reply-To header if present
-        if let Some(ref reply_to) = msg.in_reply_to {
-            builder = builder.in_reply_to(reply_to.clone());
-        }
-
-        // Add References header if present
-        if !msg.references.is_empty() {
-            builder = builder.references(msg.references.join(" "));
-        }
-
-        // Build body
-        let message = match (&msg.text_body, &msg.html_body) {
-            (Some(text), Some(html)) => {
-                // Multipart alternative for both text and HTML
-                builder
-                    .multipart(
-                        MultiPart::alternative()
-                            .singlepart(
-                                SinglePart::builder()
-                                    .header(ContentType::TEXT_PLAIN)
-                                    .body(text.clone()),
-                            )
-                            .singlepart(
-                                SinglePart::builder()
-                                    .header(ContentType::TEXT_HTML)
-                                    .body(html.clone()),
-                            ),
-                    )
-                    .map_err(|e| SmtpError::MessageBuildError(e.to_string()))?
-            }
-            (Some(text), None) => builder
-                .body(text.clone())
-                .map_err(|e| SmtpError::MessageBuildError(e.to_string()))?,
-            (None, Some(html)) => builder
-                .header(ContentType::TEXT_HTML)
-                .body(html.clone())
-                .map_err(|e| SmtpError::MessageBuildError(e.to_string()))?,
-            (None, None) => builder
-                .body(String::new())
-                .map_err(|e| SmtpError::MessageBuildError(e.to_string()))?,
-        };
-
-        Ok(message)
+        build_lettre_message(msg)
     }
+}
+
+/// Build a lettre Message from OutgoingMessage (standalone, no SmtpClient needed)
+pub fn build_lettre_message(msg: &OutgoingMessage) -> SmtpResult<Message> {
+    // Parse from address
+    let from_mailbox = if let Some(ref name) = msg.from_name {
+        Mailbox::new(
+            Some(name.clone()),
+            msg.from
+                .parse()
+                .map_err(|e| SmtpError::InvalidAddress(format!("{}: {}", msg.from, e)))?,
+        )
+    } else {
+        Mailbox::new(
+            None,
+            msg.from
+                .parse()
+                .map_err(|e| SmtpError::InvalidAddress(format!("{}: {}", msg.from, e)))?,
+        )
+    };
+
+    let mut builder = Message::builder().from(from_mailbox).subject(&msg.subject);
+
+    // Add To recipients
+    for to in &msg.to {
+        let mailbox = Mailbox::new(
+            None,
+            to.parse()
+                .map_err(|e| SmtpError::InvalidAddress(format!("{}: {}", to, e)))?,
+        );
+        builder = builder.to(mailbox);
+    }
+
+    // Add CC recipients
+    for cc in &msg.cc {
+        let mailbox = Mailbox::new(
+            None,
+            cc.parse()
+                .map_err(|e| SmtpError::InvalidAddress(format!("{}: {}", cc, e)))?,
+        );
+        builder = builder.cc(mailbox);
+    }
+
+    // Add BCC recipients
+    for bcc in &msg.bcc {
+        let mailbox = Mailbox::new(
+            None,
+            bcc.parse()
+                .map_err(|e| SmtpError::InvalidAddress(format!("{}: {}", bcc, e)))?,
+        );
+        builder = builder.bcc(mailbox);
+    }
+
+    // Add In-Reply-To header if present
+    if let Some(ref reply_to) = msg.in_reply_to {
+        builder = builder.in_reply_to(reply_to.clone());
+    }
+
+    // Add References header if present
+    if !msg.references.is_empty() {
+        builder = builder.references(msg.references.join(" "));
+    }
+
+    // Build body
+    let message = match (&msg.text_body, &msg.html_body) {
+        (Some(text), Some(html)) => {
+            // Multipart alternative for both text and HTML
+            builder
+                .multipart(
+                    MultiPart::alternative()
+                        .singlepart(
+                            SinglePart::builder()
+                                .header(ContentType::TEXT_PLAIN)
+                                .body(text.clone()),
+                        )
+                        .singlepart(
+                            SinglePart::builder()
+                                .header(ContentType::TEXT_HTML)
+                                .body(html.clone()),
+                        ),
+                )
+                .map_err(|e| SmtpError::MessageBuildError(e.to_string()))?
+        }
+        (Some(text), None) => builder
+            .body(text.clone())
+            .map_err(|e| SmtpError::MessageBuildError(e.to_string()))?,
+        (None, Some(html)) => builder
+            .header(ContentType::TEXT_HTML)
+            .body(html.clone())
+            .map_err(|e| SmtpError::MessageBuildError(e.to_string()))?,
+        (None, None) => builder
+            .body(String::new())
+            .map_err(|e| SmtpError::MessageBuildError(e.to_string()))?,
+    };
+
+    Ok(message)
 }

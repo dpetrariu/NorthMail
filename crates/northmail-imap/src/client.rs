@@ -424,19 +424,51 @@ impl ImapClient {
     /// Recursively check if a BODYSTRUCTURE contains any attachment parts
     fn bodystructure_has_attachments(bs: &imap_proto::BodyStructure<'_>) -> bool {
         match bs {
-            imap_proto::BodyStructure::Basic { common, .. }
-            | imap_proto::BodyStructure::Text { common, .. }
-            | imap_proto::BodyStructure::Message { common, .. } => {
+            imap_proto::BodyStructure::Basic { common, .. } => {
+                let mime_type = common.ty.ty.to_ascii_lowercase();
+                let mime_subtype = common.ty.subtype.to_ascii_lowercase();
+
+                // Skip S/MIME signatures and encrypted containers
+                if mime_type == "application" && (
+                    mime_subtype == "pkcs7-signature"
+                    || mime_subtype == "x-pkcs7-signature"
+                    || mime_subtype == "pgp-signature"
+                    || mime_subtype == "pkcs7-mime"
+                ) {
+                    return false;
+                }
+
+                // Explicit attachment disposition → real attachment
                 if let Some(disp) = &common.disposition {
                     if disp.ty.eq_ignore_ascii_case("attachment") {
                         return true;
                     }
                 }
-                // For Message type, also check the nested body
-                if let imap_proto::BodyStructure::Message { body, .. } = bs {
-                    return Self::bodystructure_has_attachments(body);
+
+                // Images without explicit "attachment" disposition are likely inline
+                if mime_type == "image" {
+                    return false;
+                }
+
+                // Other non-text types (application/*, audio/*, video/*) are likely attachments
+                true
+            }
+            imap_proto::BodyStructure::Text { common, .. } => {
+                // Text parts are only attachments if explicitly marked as such
+                if let Some(disp) = &common.disposition {
+                    if disp.ty.eq_ignore_ascii_case("attachment") {
+                        return true;
+                    }
                 }
                 false
+            }
+            imap_proto::BodyStructure::Message { common, body, .. } => {
+                if let Some(disp) = &common.disposition {
+                    if disp.ty.eq_ignore_ascii_case("attachment") {
+                        return true;
+                    }
+                }
+                Self::bodystructure_has_attachments(body)
             }
             imap_proto::BodyStructure::Multipart { common, bodies, .. } => {
                 if let Some(disp) = &common.disposition {

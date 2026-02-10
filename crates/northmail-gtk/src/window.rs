@@ -1,10 +1,11 @@
 //! Main application window
 
-use crate::application::NorthMailApplication;
+use crate::application::{NorthMailApplication, ParsedAttachment};
 use crate::widgets::{FolderSidebar, MessageList, MessageView};
 use gtk4::{gio, glib, prelude::*, subclass::prelude::*};
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use std::rc::Rc;
 use tracing::debug;
 
 
@@ -427,8 +428,17 @@ impl NorthMailWindow {
             let date_value = gtk4::Label::builder()
                 .label(&formatted_date)
                 .xalign(0.0)
+                .hexpand(true)
                 .build();
             date_box.append(&date_value);
+
+            // Attachment dropdown placeholder (populated after body fetch)
+            // Sits on the same row as the date, pushed to the right
+            let attachment_box = gtk4::Box::builder()
+                .orientation(gtk4::Orientation::Horizontal)
+                .halign(gtk4::Align::End)
+                .build();
+            date_box.append(&attachment_box);
 
             header_box.append(&date_box);
 
@@ -483,6 +493,7 @@ impl NorthMailWindow {
 
             // Fetch message body
             let body_box_ref = body_box.clone();
+            let attachment_box_ref = attachment_box.clone();
             if let Some(app) = self.application() {
                 if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
                     let msg_folder_id = if msg.folder_id != 0 { Some(msg.folder_id) } else { None };
@@ -570,6 +581,63 @@ impl NorthMailWindow {
                                         .css_classes(["dim-label"])
                                         .build();
                                     body_box_ref.append(&label);
+                                }
+
+                                // Show attachment dropdown in header if any
+                                if !parsed.attachments.is_empty() {
+                                    let count = parsed.attachments.len();
+
+                                    // Build button content: attachment icon + count
+                                    let btn_content = gtk4::Box::builder()
+                                        .orientation(gtk4::Orientation::Horizontal)
+                                        .spacing(4)
+                                        .build();
+                                    btn_content.append(&gtk4::Image::from_icon_name("mail-attachment-symbolic"));
+                                    btn_content.append(&gtk4::Label::builder()
+                                        .label(&format!("{}", count))
+                                        .css_classes(["caption"])
+                                        .build());
+
+                                    let menu_btn = gtk4::MenuButton::builder()
+                                        .child(&btn_content)
+                                        .tooltip_text(&format!("{} attachment{}", count, if count == 1 { "" } else { "s" }))
+                                        .css_classes(["flat"])
+                                        .direction(gtk4::ArrowType::Down)
+                                        .build();
+
+                                    let popover = gtk4::Popover::builder()
+                                        .halign(gtk4::Align::End)
+                                        .build();
+                                    popover.set_position(gtk4::PositionType::Bottom);
+                                    let popover_box = gtk4::Box::builder()
+                                        .orientation(gtk4::Orientation::Vertical)
+                                        .spacing(0)
+                                        .build();
+
+                                    let list_box = gtk4::ListBox::builder()
+                                        .selection_mode(gtk4::SelectionMode::None)
+                                        .css_classes(["boxed-list"])
+                                        .build();
+
+                                    for attachment in parsed.attachments {
+                                        let row = build_attachment_row(attachment);
+                                        list_box.append(&row);
+                                    }
+
+                                    if count > 5 {
+                                        let scrolled = gtk4::ScrolledWindow::builder()
+                                            .max_content_height(300)
+                                            .propagate_natural_height(true)
+                                            .build();
+                                        scrolled.set_child(Some(&list_box));
+                                        popover_box.append(&scrolled);
+                                    } else {
+                                        popover_box.append(&list_box);
+                                    }
+
+                                    popover.set_child(Some(&popover_box));
+                                    menu_btn.set_popover(Some(&popover));
+                                    attachment_box_ref.append(&menu_btn);
                                 }
                             }
                             Err(e) => {
@@ -667,7 +735,7 @@ impl NorthMailWindow {
     }
 
     fn show_compose_dialog(&self) {
-        debug!("Opening compose dialog");
+        debug!("Opening compose window");
 
         // Compose-specific CSS
         let css_provider = gtk4::CssProvider::new();
@@ -676,9 +744,9 @@ impl NorthMailWindow {
             .compose-entry { background: transparent; border: none; outline: none; box-shadow: none; min-height: 28px; }
             .compose-entry:focus { background: transparent; border: none; outline: none; box-shadow: none; }
             .compose-entry > text { background: transparent; border: none; outline: none; box-shadow: none; }
-            .compose-chip { background: alpha(currentColor, 0.08); border-radius: 14px; padding: 2px 4px 2px 10px; margin: 1px 0; }
+            .compose-chip { background: alpha(currentColor, 0.08); border-radius: 12px; padding: 0px 2px 0px 8px; margin: 0; }
             .compose-chip label { font-size: 0.9em; }
-            .compose-chip button { min-width: 20px; min-height: 20px; padding: 0; margin: 0; }
+            .compose-chip button { min-width: 18px; min-height: 18px; padding: 0; margin: 0; }
             .compose-field-label { font-size: 0.9em; min-width: 52px; }
             ",
         );
@@ -688,15 +756,15 @@ impl NorthMailWindow {
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
 
-        let dialog = adw::Dialog::builder()
+        let compose_window = adw::Window::builder()
             .title("New Message")
-            .content_width(640)
-            .content_height(560)
+            .default_width(640)
+            .default_height(560)
             .build();
 
         let toolbar_view = adw::ToolbarView::new();
 
-        // Header bar — Send on right, close via dialog X
+        // Header bar — Send on right
         let header = adw::HeaderBar::new();
 
         let send_button = gtk4::Button::builder()
@@ -822,12 +890,179 @@ impl NorthMailWindow {
         content.append(&scrolled);
 
         toolbar_view.set_content(Some(&content));
-        dialog.set_child(Some(&toolbar_view));
+        compose_window.set_content(Some(&toolbar_view));
 
-        // Send
-        let window = self.clone();
-        let dialog_ref = dialog.clone();
+        // --- Draft auto-save state ---
+        // Track the saved draft: (account_index, uid)
+        let draft_state: std::rc::Rc<std::cell::RefCell<Option<(u32, u32)>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        // Track the auto-save timer source ID so we can cancel/reset it
+        let timer_source: std::rc::Rc<std::cell::Cell<Option<glib::SourceId>>> =
+            std::rc::Rc::new(std::cell::Cell::new(None));
+        // Whether the message was sent (skip close confirmation)
+        let was_sent: std::rc::Rc<std::cell::Cell<bool>> =
+            std::rc::Rc::new(std::cell::Cell::new(false));
+        // Whether draft save is currently in progress (prevent overlapping saves)
+        let save_in_progress: std::rc::Rc<std::cell::Cell<bool>> =
+            std::rc::Rc::new(std::cell::Cell::new(false));
+
+        // --- Auto-save helper: resets timer on any edit ---
+        let setup_auto_save_timer = {
+            let timer_source = timer_source.clone();
+            let draft_state = draft_state.clone();
+            let save_in_progress = save_in_progress.clone();
+            let to_chips_save = to_chips.clone();
+            let cc_chips_save = cc_chips.clone();
+            let subject_entry_save = subject_entry.clone();
+            let text_view_save = text_view.clone();
+            let from_dropdown_save = from_dropdown.clone();
+            let main_window = self.clone();
+
+            move || {
+                // Cancel any existing timer
+                if let Some(source_id) = timer_source.take() {
+                    source_id.remove();
+                }
+
+                // Don't schedule if a save is already in progress
+                if save_in_progress.get() {
+                    return;
+                }
+
+                let draft_state_timer = draft_state.clone();
+                let save_in_progress_timer = save_in_progress.clone();
+                let to_chips_timer = to_chips_save.clone();
+                let cc_chips_timer = cc_chips_save.clone();
+                let subject_entry_timer = subject_entry_save.clone();
+                let text_view_timer = text_view_save.clone();
+                let from_dropdown_timer = from_dropdown_save.clone();
+                let main_window_timer = main_window.clone();
+
+                let source_id = glib::timeout_add_seconds_local_once(30, move || {
+                    let subject = subject_entry_timer.text().to_string();
+                    let body = {
+                        let buf = text_view_timer.buffer();
+                        let (start, end) = buf.bounds();
+                        buf.text(&start, &end, false).to_string()
+                    };
+
+                    // Only save if there's content in subject or body
+                    if subject.trim().is_empty() && body.trim().is_empty() {
+                        return;
+                    }
+
+                    let to_list = to_chips_timer.borrow().clone();
+                    let cc_list = cc_chips_timer.borrow().clone();
+                    let account_index = from_dropdown_timer.selected();
+
+                    let Some(app) = main_window_timer.application() else { return };
+                    let Some(app) = app.downcast_ref::<NorthMailApplication>() else { return };
+
+                    // Get account email for From
+                    let email = {
+                        let accs = app.imp().accounts.borrow();
+                        match accs.get(account_index as usize) {
+                            Some(a) => a.email.clone(),
+                            None => return,
+                        }
+                    };
+
+                    let real_name = glib::real_name().to_string_lossy().to_string();
+                    let from_name = if real_name.is_empty() || real_name == "Unknown" {
+                        None
+                    } else {
+                        Some(real_name)
+                    };
+
+                    let mut msg = northmail_smtp::OutgoingMessage::new(&email, &subject);
+                    if let Some(name) = from_name {
+                        msg = msg.from_name(name);
+                    }
+                    for addr in &to_list {
+                        msg = msg.to(addr);
+                    }
+                    for addr in &cc_list {
+                        msg = msg.cc(addr);
+                    }
+                    msg = msg.text(&body);
+
+                    save_in_progress_timer.set(true);
+
+                    // Delete old draft first (if any), then save new one
+                    let old_state = *draft_state_timer.borrow();
+                    let draft_state_cb = draft_state_timer.clone();
+                    let save_in_progress_cb = save_in_progress_timer.clone();
+
+                    if let Some((old_acct, old_uid)) = old_state {
+                        let app_delete = app.clone();
+                        let app_save = app.clone();
+                        app_delete.delete_draft(old_acct, old_uid, move |_| {
+                            // Ignore delete errors — old draft may already be gone
+                            app_save.save_draft(account_index, msg, move |result| {
+                                save_in_progress_cb.set(false);
+                                match result {
+                                    Ok(Some(uid)) => {
+                                        *draft_state_cb.borrow_mut() = Some((account_index, uid));
+                                        debug!("Draft auto-saved (uid: {})", uid);
+                                    }
+                                    Ok(None) => {
+                                        // Server didn't return APPENDUID — clear state
+                                        // (we can't delete what we can't identify)
+                                        *draft_state_cb.borrow_mut() = None;
+                                        debug!("Draft auto-saved (no uid returned)");
+                                    }
+                                    Err(e) => {
+                                        debug!("Draft auto-save failed: {}", e);
+                                    }
+                                }
+                            });
+                        });
+                    } else {
+                        let app_save = app.clone();
+                        app_save.save_draft(account_index, msg, move |result| {
+                            save_in_progress_cb.set(false);
+                            match result {
+                                Ok(Some(uid)) => {
+                                    *draft_state_cb.borrow_mut() = Some((account_index, uid));
+                                    debug!("Draft auto-saved (uid: {})", uid);
+                                }
+                                Ok(None) => {
+                                    *draft_state_cb.borrow_mut() = None;
+                                    debug!("Draft auto-saved (no uid returned)");
+                                }
+                                Err(e) => {
+                                    debug!("Draft auto-save failed: {}", e);
+                                }
+                            }
+                        });
+                    }
+                });
+
+                timer_source.set(Some(source_id));
+            }
+        };
+
+        // Wire up change handlers to reset the auto-save timer
+        {
+            let reset = setup_auto_save_timer.clone();
+            subject_entry.connect_changed(move |_| {
+                reset();
+            });
+        }
+        {
+            let reset = setup_auto_save_timer.clone();
+            text_view.buffer().connect_changed(move |_| {
+                reset();
+            });
+        }
+
+        // Send button
+        let window_ref = self.clone();
+        let compose_win_ref = compose_window.clone();
         let send_btn_ref = send_button.clone();
+        let was_sent_send = was_sent.clone();
+        let draft_state_send = draft_state.clone();
+        let timer_source_send = timer_source.clone();
         send_button.connect_clicked(move |_| {
             let to_list = to_chips.borrow().clone();
             let cc_list = cc_chips.borrow().clone();
@@ -839,7 +1074,7 @@ impl NorthMailWindow {
             };
 
             if to_list.is_empty() {
-                if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                if let Some(win) = window_ref.downcast_ref::<NorthMailWindow>() {
                     win.add_toast(adw::Toast::new("Please add at least one recipient"));
                 }
                 return;
@@ -847,14 +1082,22 @@ impl NorthMailWindow {
 
             let account_index = from_dropdown.selected();
 
+            // Cancel auto-save timer
+            if let Some(source_id) = timer_source_send.take() {
+                source_id.remove();
+            }
+
             send_btn_ref.set_sensitive(false);
             send_btn_ref.set_label("Sending…");
 
-            if let Some(app) = window.application() {
+            if let Some(app) = window_ref.application() {
                 if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
-                    let dialog_close = dialog_ref.clone();
-                    let window_ref = window.clone();
+                    let compose_win_close = compose_win_ref.clone();
+                    let window_for_toast = window_ref.clone();
                     let send_btn_restore = send_btn_ref.clone();
+                    let was_sent_cb = was_sent_send.clone();
+                    let draft_state_cb = draft_state_send.clone();
+                    let app_for_delete = app.clone();
                     app.send_message(
                         account_index,
                         to_list,
@@ -864,13 +1107,20 @@ impl NorthMailWindow {
                         move |result| {
                             match result {
                                 Ok(()) => {
-                                    if let Some(win) = window_ref.downcast_ref::<NorthMailWindow>() {
+                                    if let Some(win) = window_for_toast.downcast_ref::<NorthMailWindow>() {
                                         win.add_toast(adw::Toast::new("Message sent"));
                                     }
-                                    dialog_close.close();
+                                    was_sent_cb.set(true);
+
+                                    // Delete draft if one was saved
+                                    if let Some((acct_idx, uid)) = *draft_state_cb.borrow() {
+                                        app_for_delete.delete_draft(acct_idx, uid, |_| {});
+                                    }
+
+                                    compose_win_close.close();
                                 }
                                 Err(e) => {
-                                    if let Some(win) = window_ref.downcast_ref::<NorthMailWindow>() {
+                                    if let Some(win) = window_for_toast.downcast_ref::<NorthMailWindow>() {
                                         win.add_toast(adw::Toast::new(&format!("Send failed: {}", e)));
                                     }
                                     send_btn_restore.set_sensitive(true);
@@ -883,10 +1133,58 @@ impl NorthMailWindow {
             }
         });
 
-        dialog.present(Some(self));
+        // Handle close: ask user whether to keep or delete the draft
+        let main_window_close = self.clone();
+        let was_sent_close = was_sent;
+        let draft_state_close = draft_state;
+        let timer_source_close = timer_source;
+        compose_window.connect_close_request(move |win| {
+            // Cancel any pending auto-save timer
+            if let Some(source_id) = timer_source_close.take() {
+                source_id.remove();
+            }
+
+            // If already sent, just close
+            if was_sent_close.get() {
+                return glib::Propagation::Proceed;
+            }
+
+            // If we have a saved draft, ask the user
+            let saved_state = *draft_state_close.borrow();
+            if let Some((acct_idx, uid)) = saved_state {
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Delete draft?")
+                    .body("A draft of this message has been saved. Do you want to keep it or delete it?")
+                    .build();
+                dialog.add_response("keep", "Keep Draft");
+                dialog.add_response("delete", "Delete Draft");
+                dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+                dialog.set_default_response(Some("keep"));
+                dialog.set_close_response("keep");
+
+                let win_ref = win.clone();
+                let main_window_ref = main_window_close.clone();
+                dialog.connect_response(None, move |_dlg, response| {
+                    if response == "delete" {
+                        if let Some(app) = main_window_ref.application() {
+                            if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                                app.delete_draft(acct_idx, uid, |_| {});
+                            }
+                        }
+                    }
+                    win_ref.destroy();
+                });
+                dialog.present(Some(win));
+                return glib::Propagation::Stop;
+            }
+
+            glib::Propagation::Proceed
+        });
+
+        compose_window.present();
     }
 
-    /// Build an inline chip-based recipient row (label + chips + entry)
+    /// Build an inline chip-based recipient row (label + wrapping chips + entry)
     fn build_chip_row(
         label_text: &str,
         chips: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
@@ -904,16 +1202,22 @@ impl NorthMailWindow {
             .label(label_text)
             .xalign(1.0)
             .width_request(label_width)
-            .valign(gtk4::Align::Center)
+            .valign(gtk4::Align::Start)
+            .margin_top(6)
             .css_classes(["dim-label", "compose-field-label"])
             .build();
 
-        // Horizontal box for chips + entry
-        let chip_box = gtk4::Box::builder()
-            .orientation(gtk4::Orientation::Horizontal)
-            .spacing(4)
+        // FlowBox wraps chips + entry to the next line when space runs out.
+        // Wrapped in a ScrolledWindow (no horizontal scroll) to constrain
+        // width so the FlowBox actually triggers line wrapping.
+        let chip_flow = gtk4::FlowBox::builder()
+            .selection_mode(gtk4::SelectionMode::None)
+            .homogeneous(false)
+            .max_children_per_line(100)
+            .min_children_per_line(1)
             .hexpand(true)
-            .valign(gtk4::Align::Center)
+            .row_spacing(4)
+            .column_spacing(4)
             .build();
 
         // Inline entry (no frame, blends into the row)
@@ -922,12 +1226,20 @@ impl NorthMailWindow {
             .has_frame(false)
             .placeholder_text("Add recipient")
             .css_classes(["compose-entry"])
+            .width_request(150)
             .build();
 
-        chip_box.append(&entry);
+        chip_flow.append(&entry);
+
+        let chip_scroll = gtk4::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk4::PolicyType::Never)
+            .vscrollbar_policy(gtk4::PolicyType::Never)
+            .hexpand(true)
+            .child(&chip_flow)
+            .build();
 
         row.append(&label);
-        row.append(&chip_box);
+        row.append(&chip_scroll);
 
         // Autocomplete popover — appears directly below the entry
         let popover = gtk4::Popover::builder()
@@ -953,7 +1265,7 @@ impl NorthMailWindow {
 
         // --- Add chip helper ---
         let add_chip = {
-            let chip_box = chip_box.clone();
+            let chip_flow = chip_flow.clone();
             let chips = chips.clone();
             let entry = entry.clone();
             move |display: &str, email: &str| {
@@ -987,19 +1299,26 @@ impl NorthMailWindow {
                 chip.append(&chip_label);
                 chip.append(&remove_btn);
 
-                // Insert chip before the entry
-                chip_box.insert_child_after(&chip, entry.prev_sibling().as_ref());
-                // Move entry to the end if needed — it should already be last
-                // but GTK keeps insertion order, so just reorder
-                chip_box.reorder_child_after(&entry, Some(&chip));
+                // Count children to find position before the entry (which is always last)
+                let mut count = 0;
+                let mut child = chip_flow.first_child();
+                while let Some(c) = child {
+                    count += 1;
+                    child = c.next_sibling();
+                }
+                // Insert chip before the entry's FlowBoxChild (entry is at position count-1)
+                chip_flow.insert(&chip, count as i32 - 1);
 
-                // Remove handler
-                let chip_box_ref = chip_box.clone();
+                // Remove handler — remove the FlowBoxChild wrapper
+                let chip_flow_ref = chip_flow.clone();
                 let chips_ref = chips.clone();
                 let email_owned = email.to_string();
                 let chip_ref = chip.clone();
                 remove_btn.connect_clicked(move |_| {
-                    chip_box_ref.remove(&chip_ref);
+                    // chip_ref's parent is the FlowBoxChild wrapper
+                    if let Some(flow_child) = chip_ref.parent() {
+                        chip_flow_ref.remove(&flow_child);
+                    }
                     chips_ref.borrow_mut().retain(|e| e != &email_owned);
                 });
 
@@ -1037,99 +1356,74 @@ impl NorthMailWindow {
             entry_suggest.grab_focus();
         });
 
-        // Debounced autocomplete
-        let debounce_source: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>> =
-            std::rc::Rc::new(std::cell::RefCell::new(None));
-
+        // Instant autocomplete — filter preloaded contacts on every keystroke
         let window_clone = window.clone();
         let popover_change = popover.clone();
         let suggestion_list_ref = suggestion_list;
         entry.connect_changed(move |entry| {
             let text = entry.text().to_string();
-            eprintln!("[autocomplete] changed: {:?}", text);
-
-            if let Some(source_id) = debounce_source.borrow_mut().take() {
-                source_id.remove();
-            }
 
             if text.trim().is_empty() {
                 popover_change.popdown();
                 return;
             }
 
-            let window_ref = window_clone.clone();
-            let popover_ref = popover_change.clone();
-            let suggestion_list_clone = suggestion_list_ref.clone();
-            let debounce_ref = debounce_source.clone();
+            let Some(app) = window_clone.application() else { return };
+            let Some(app) = app.downcast_ref::<NorthMailApplication>() else { return };
+
+            let popover_cb = popover_change.clone();
+            let list_cb = suggestion_list_ref.clone();
             let entry_ref = entry.clone();
 
-            let source_id = glib::timeout_add_local_once(
-                std::time::Duration::from_millis(300),
-                move || {
-                    debounce_ref.borrow_mut().take();
-                    eprintln!("[autocomplete] debounce fired for {:?}", text);
+            app.query_contacts(text, move |results| {
+                while let Some(row) = list_cb.row_at_index(0) {
+                    list_cb.remove(&row);
+                }
 
-                    if let Some(app) = window_ref.application() {
-                        if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
-                            let popover_cb = popover_ref.clone();
-                            let list_cb = suggestion_list_clone.clone();
-                            let entry_popup = entry_ref.clone();
-                            app.query_contacts(text, move |results| {
-                                eprintln!("[autocomplete] callback: {} results", results.len());
-                                while let Some(row) = list_cb.row_at_index(0) {
-                                    list_cb.remove(&row);
-                                }
+                if results.is_empty() {
+                    popover_cb.popdown();
+                    return;
+                }
 
-                                if results.is_empty() {
-                                    popover_cb.popdown();
-                                    return;
-                                }
+                for (name, email) in &results {
+                    let row_box = gtk4::Box::builder()
+                        .orientation(gtk4::Orientation::Vertical)
+                        .spacing(1)
+                        .margin_start(12)
+                        .margin_end(12)
+                        .margin_top(6)
+                        .margin_bottom(6)
+                        .build();
 
-                                for (name, email) in &results {
-                                    let row_box = gtk4::Box::builder()
-                                        .orientation(gtk4::Orientation::Vertical)
-                                        .spacing(1)
-                                        .margin_start(12)
-                                        .margin_end(12)
-                                        .margin_top(6)
-                                        .margin_bottom(6)
-                                        .build();
-
-                                    if !name.is_empty() && name != "Unknown" {
-                                        let name_lbl = gtk4::Label::builder()
-                                            .label(name)
-                                            .xalign(0.0)
-                                            .build();
-                                        row_box.append(&name_lbl);
-                                    }
-
-                                    let email_lbl = gtk4::Label::builder()
-                                        .label(email)
-                                        .xalign(0.0)
-                                        .css_classes(["dim-label", "caption"])
-                                        .build();
-                                    row_box.append(&email_lbl);
-
-                                    let suggestion_row = gtk4::ListBoxRow::builder()
-                                        .child(&row_box)
-                                        .tooltip_text(format!("{}\t{}", name, email))
-                                        .build();
-
-                                    list_cb.append(&suggestion_row);
-                                }
-
-                                // Position popover below the entry text area
-                                let w = entry_popup.allocated_width();
-                                let h = entry_popup.allocated_height();
-                                popover_cb.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(0, 0, w, h)));
-                                popover_cb.popup();
-                            });
-                        }
+                    if !name.is_empty() && name != "Unknown" {
+                        let name_lbl = gtk4::Label::builder()
+                            .label(name)
+                            .xalign(0.0)
+                            .build();
+                        row_box.append(&name_lbl);
                     }
-                },
-            );
 
-            debounce_source.borrow_mut().replace(source_id);
+                    let email_lbl = gtk4::Label::builder()
+                        .label(email)
+                        .xalign(0.0)
+                        .css_classes(["dim-label", "caption"])
+                        .build();
+                    row_box.append(&email_lbl);
+
+                    let suggestion_row = gtk4::ListBoxRow::builder()
+                        .child(&row_box)
+                        .tooltip_text(format!("{}\t{}", name, email))
+                        .build();
+
+                    list_cb.append(&suggestion_row);
+                }
+
+                // Position popover below the entry
+                let h = entry_ref.height();
+                popover_cb.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(0, 0, 1, h)));
+                popover_cb.set_offset(160, 4);
+                popover_cb.popup();
+            });
         });
 
         row
@@ -1366,4 +1660,133 @@ impl NorthMailWindow {
             imp.message_list_box.append(message_list);
         }
     }
+}
+
+fn format_file_size(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+fn icon_for_mime_type(mime_type: &str) -> &'static str {
+    if mime_type.starts_with("image/") {
+        "image-x-generic-symbolic"
+    } else if mime_type.starts_with("audio/") {
+        "audio-x-generic-symbolic"
+    } else if mime_type.starts_with("video/") {
+        "video-x-generic-symbolic"
+    } else if mime_type == "application/pdf" {
+        "x-office-document-symbolic"
+    } else if mime_type.starts_with("text/") {
+        "text-x-generic-symbolic"
+    } else {
+        "document-symbolic"
+    }
+}
+
+fn build_attachment_row(attachment: ParsedAttachment) -> adw::ActionRow {
+    let data = Rc::new(attachment.data);
+    let filename = attachment.filename;
+    let mime_type = attachment.mime_type;
+    let size = data.len();
+
+    let row = adw::ActionRow::builder()
+        .title(&filename)
+        .subtitle(&format!("{} — {}", mime_type, format_file_size(size)))
+        .build();
+
+    // Prefix: mime type icon
+    let icon = gtk4::Image::builder()
+        .icon_name(icon_for_mime_type(&mime_type))
+        .build();
+    row.add_prefix(&icon);
+
+    // Suffix: Open button
+    let open_btn = gtk4::Button::builder()
+        .icon_name("eye-open-negative-filled-symbolic")
+        .css_classes(["flat", "circular"])
+        .tooltip_text("Preview")
+        .valign(gtk4::Align::Center)
+        .build();
+
+    let data_open = data.clone();
+    let filename_open = filename.clone();
+    let open_btn_ref = open_btn.clone();
+    open_btn.connect_clicked(move |_| {
+        open_attachment(&filename_open, &data_open, &open_btn_ref);
+    });
+    row.add_suffix(&open_btn);
+
+    // Suffix: Save button
+    let save_btn = gtk4::Button::builder()
+        .icon_name("document-save-symbolic")
+        .css_classes(["flat", "circular"])
+        .tooltip_text("Save")
+        .valign(gtk4::Align::Center)
+        .build();
+
+    let data_save = data.clone();
+    let filename_save = filename.clone();
+    let save_btn_ref = save_btn.clone();
+    save_btn.connect_clicked(move |_| {
+        save_attachment(&filename_save, &data_save, &save_btn_ref);
+    });
+    row.add_suffix(&save_btn);
+
+    row
+}
+
+fn open_attachment(filename: &str, data: &Rc<Vec<u8>>, widget: &impl gtk4::prelude::IsA<gtk4::Widget>) {
+    let temp_dir = std::env::temp_dir().join("northmail-attachments");
+    if std::fs::create_dir_all(&temp_dir).is_err() {
+        tracing::warn!("Failed to create temp dir for attachment");
+        return;
+    }
+
+    let temp_path = temp_dir.join(filename);
+    if let Err(e) = std::fs::write(&temp_path, data.as_slice()) {
+        tracing::warn!("Failed to write temp attachment: {}", e);
+        return;
+    }
+
+    let file = gio::File::for_path(&temp_path);
+    let launcher = gtk4::FileLauncher::new(Some(&file));
+    let window = widget.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+    launcher.launch(window.as_ref(), gio::Cancellable::NONE, |result| {
+        if let Err(e) = result {
+            tracing::warn!("Failed to open attachment: {}", e);
+        }
+    });
+}
+
+fn save_attachment(filename: &str, data: &Rc<Vec<u8>>, widget: &impl gtk4::prelude::IsA<gtk4::Widget>) {
+    let dialog = gtk4::FileDialog::builder()
+        .initial_name(filename)
+        .build();
+
+    let window = widget.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+    let data = data.clone();
+    dialog.save(window.as_ref(), gio::Cancellable::NONE, move |result| {
+        match result {
+            Ok(file) => {
+                if let Some(path) = file.path() {
+                    if let Err(e) = std::fs::write(&path, data.as_slice()) {
+                        tracing::warn!("Failed to save attachment: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                // User cancelled or error
+                if !e.matches(gio::IOErrorEnum::Cancelled) {
+                    tracing::warn!("Save dialog error: {}", e);
+                }
+            }
+        }
+    });
 }
