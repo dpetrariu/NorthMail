@@ -100,23 +100,50 @@ mod imp {
     use std::cell::RefCell;
     use std::sync::OnceLock;
 
+    #[derive(Default, Clone)]
+    pub struct FilterState {
+        pub unread_only: bool,
+        pub starred_only: bool,
+        pub has_attachments: bool,
+        pub from_contains: String,
+        pub date_after: Option<i64>,
+        pub date_before: Option<i64>,
+    }
+
+    impl FilterState {
+        pub fn is_active(&self) -> bool {
+            self.unread_only
+                || self.starred_only
+                || self.has_attachments
+                || !self.from_contains.is_empty()
+                || self.date_after.is_some()
+                || self.date_before.is_some()
+        }
+    }
+
     #[derive(Default)]
     pub struct MessageList {
         pub list_box: RefCell<Option<gtk4::ListBox>>,
         pub search_entry: RefCell<Option<gtk4::SearchEntry>>,
+        pub filter_button: RefCell<Option<gtk4::MenuButton>>,
         pub scrolled: RefCell<Option<gtk4::ScrolledWindow>>,
         pub load_more_row: RefCell<Option<gtk4::ListBoxRow>>,
         pub can_load_more: Cell<bool>,
         pub is_loading_more: Cell<bool>,
         pub on_load_more: RefCell<Option<Box<dyn Fn()>>>,
+        pub on_filter_changed: RefCell<Option<Box<dyn Fn()>>>,
         pub message_count: Cell<usize>,
         pub total_count: Cell<u32>,
-        /// Store message info for each row (uid -> MessageInfo)
+        /// Store message info for each row
         pub messages: RefCell<Vec<super::MessageInfo>>,
         /// Whether scroll handler for infinite scroll is connected
         pub scroll_handler_connected: Cell<bool>,
         /// Whether row activation handler is connected
         pub row_handler_connected: Cell<bool>,
+        /// Multi-field filter state
+        pub filter_state: RefCell<FilterState>,
+        /// Current text search query (as-you-type)
+        pub search_query: RefCell<String>,
     }
 
     #[glib::object_subclass]
@@ -130,9 +157,14 @@ mod imp {
         fn signals() -> &'static [Signal] {
             static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
             SIGNALS.get_or_init(|| {
-                vec![Signal::builder("message-selected")
-                    .param_types([u32::static_type()]) // message UID
-                    .build()]
+                vec![
+                    Signal::builder("message-selected")
+                        .param_types([u32::static_type()])
+                        .build(),
+                    Signal::builder("search-requested")
+                        .param_types([String::static_type()])
+                        .build(),
+                ]
             })
         }
 
@@ -166,17 +198,53 @@ impl MessageList {
     fn setup_ui(&self) {
         let imp = self.imp();
 
-        // Search bar
-        let search_entry = gtk4::SearchEntry::builder()
-            .placeholder_text("Search messages...")
+        // Search bar + filter button
+        let search_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(6)
             .margin_start(12)
             .margin_end(12)
             .margin_top(6)
             .margin_bottom(6)
             .build();
 
-        self.append(&search_entry);
+        let search_entry = gtk4::SearchEntry::builder()
+            .placeholder_text("Search messages...")
+            .hexpand(true)
+            .build();
+
+        // As-you-type filtering
+        let widget_search = self.clone();
+        search_entry.connect_search_changed(move |entry| {
+            let query = entry.text().to_string();
+            widget_search.imp().search_query.replace(query);
+            widget_search.apply_filter();
+        });
+
+        // Enter → emit search-requested for FTS database search
+        let widget_activate = self.clone();
+        search_entry.connect_activate(move |entry| {
+            let query = entry.text().to_string();
+            widget_activate.emit_by_name::<()>("search-requested", &[&query]);
+        });
+
+        // Escape / clear → reset search, emit empty search-requested to reload
+        let widget_stop = self.clone();
+        search_entry.connect_stop_search(move |entry| {
+            entry.set_text("");
+            widget_stop.imp().search_query.replace(String::new());
+            widget_stop.emit_by_name::<()>("search-requested", &[&String::new()]);
+        });
+
+        // --- Filter MenuButton with Popover ---
+        let filter_button = self.build_filter_button();
+
+        search_box.append(&search_entry);
+        search_box.append(&filter_button);
+        self.append(&search_box);
+
         imp.search_entry.replace(Some(search_entry));
+        imp.filter_button.replace(Some(filter_button));
 
         // Separator
         let separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
@@ -209,6 +277,174 @@ impl MessageList {
         imp.list_box.replace(Some(list_box));
     }
 
+    /// Build the filter MenuButton with its popover
+    fn build_filter_button(&self) -> gtk4::MenuButton {
+        let popover_content = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .spacing(8)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(12)
+            .margin_bottom(12)
+            .build();
+
+        // --- Checkboxes (custom child labels for indicator–text spacing) ---
+        let unread_check = gtk4::CheckButton::new();
+        unread_check.set_child(Some(&gtk4::Label::builder().label("Unread only").margin_start(6).build()));
+        let starred_check = gtk4::CheckButton::new();
+        starred_check.set_child(Some(&gtk4::Label::builder().label("Starred").margin_start(6).build()));
+        let attachment_check = gtk4::CheckButton::new();
+        attachment_check.set_child(Some(&gtk4::Label::builder().label("Has attachments").margin_start(6).build()));
+
+        popover_content.append(&unread_check);
+        popover_content.append(&starred_check);
+        popover_content.append(&attachment_check);
+
+        popover_content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
+        // --- From filter ---
+        let from_entry = gtk4::Entry::builder()
+            .placeholder_text("From...")
+            .build();
+        popover_content.append(&from_entry);
+
+        popover_content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
+        // --- Date filters ---
+        let after_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(8)
+            .build();
+        let after_label = gtk4::Label::new(Some("After:"));
+        after_label.set_width_request(50);
+        after_label.set_xalign(0.0);
+        let after_entry = gtk4::Entry::builder()
+            .placeholder_text("YYYY-MM-DD")
+            .build();
+        after_box.append(&after_label);
+        after_box.append(&after_entry);
+        popover_content.append(&after_box);
+
+        let before_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(8)
+            .build();
+        let before_label = gtk4::Label::new(Some("Before:"));
+        before_label.set_width_request(50);
+        before_label.set_xalign(0.0);
+        let before_entry = gtk4::Entry::builder()
+            .placeholder_text("YYYY-MM-DD")
+            .build();
+        before_box.append(&before_label);
+        before_box.append(&before_entry);
+        popover_content.append(&before_box);
+
+        popover_content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
+        // --- Clear Filters button ---
+        let clear_button = gtk4::Button::builder()
+            .label("Clear Filters")
+            .build();
+        popover_content.append(&clear_button);
+
+        let popover = gtk4::Popover::builder()
+            .child(&popover_content)
+            .build();
+
+        let filter_button = gtk4::MenuButton::builder()
+            .icon_name("funnel-symbolic")
+            .tooltip_text("Filter messages")
+            .popover(&popover)
+            .build();
+        filter_button.add_css_class("flat");
+
+        // --- Connect checkbox signals ---
+        let widget = self.clone();
+        let btn_ref = filter_button.clone();
+        unread_check.connect_toggled(move |check| {
+            widget.imp().filter_state.borrow_mut().unread_only = check.is_active();
+            widget.update_filter_indicator(&btn_ref);
+            widget.apply_filter();
+        });
+
+        let widget = self.clone();
+        let btn_ref = filter_button.clone();
+        starred_check.connect_toggled(move |check| {
+            widget.imp().filter_state.borrow_mut().starred_only = check.is_active();
+            widget.update_filter_indicator(&btn_ref);
+            widget.apply_filter();
+        });
+
+        let widget = self.clone();
+        let btn_ref = filter_button.clone();
+        attachment_check.connect_toggled(move |check| {
+            widget.imp().filter_state.borrow_mut().has_attachments = check.is_active();
+            widget.update_filter_indicator(&btn_ref);
+            widget.apply_filter();
+        });
+
+        // --- From entry ---
+        let widget = self.clone();
+        let btn_ref = filter_button.clone();
+        from_entry.connect_changed(move |entry| {
+            widget.imp().filter_state.borrow_mut().from_contains = entry.text().to_string();
+            widget.update_filter_indicator(&btn_ref);
+            widget.apply_filter();
+        });
+
+        // --- Date entries ---
+        let widget = self.clone();
+        let btn_ref = filter_button.clone();
+        after_entry.connect_changed(move |entry| {
+            widget.imp().filter_state.borrow_mut().date_after = parse_date_to_epoch(&entry.text());
+            widget.update_filter_indicator(&btn_ref);
+            widget.apply_filter();
+        });
+
+        let widget = self.clone();
+        let btn_ref = filter_button.clone();
+        before_entry.connect_changed(move |entry| {
+            widget.imp().filter_state.borrow_mut().date_before = parse_date_to_epoch(&entry.text());
+            widget.update_filter_indicator(&btn_ref);
+            widget.apply_filter();
+        });
+
+        // --- Clear button ---
+        let widget = self.clone();
+        let btn_ref = filter_button.clone();
+        let unread_c = unread_check.clone();
+        let starred_c = starred_check.clone();
+        let attachment_c = attachment_check.clone();
+        let from_c = from_entry.clone();
+        let after_c = after_entry.clone();
+        let before_c = before_entry.clone();
+        clear_button.connect_clicked(move |_| {
+            // Reset UI controls (will trigger their signals -> apply_filter)
+            unread_c.set_active(false);
+            starred_c.set_active(false);
+            attachment_c.set_active(false);
+            from_c.set_text("");
+            after_c.set_text("");
+            before_c.set_text("");
+            // Ensure state is clean
+            *widget.imp().filter_state.borrow_mut() = imp::FilterState::default();
+            widget.update_filter_indicator(&btn_ref);
+            widget.apply_filter();
+        });
+
+        filter_button
+    }
+
+    /// Update the filter button visual indicator
+    fn update_filter_indicator(&self, button: &gtk4::MenuButton) {
+        let state = self.imp().filter_state.borrow();
+        if state.is_active() {
+            button.add_css_class("suggested-action");
+        } else {
+            button.remove_css_class("suggested-action");
+        }
+    }
+
     /// Set total message count in folder (for progress display)
     pub fn set_total_count(&self, count: u32) {
         self.imp().total_count.set(count);
@@ -228,9 +464,41 @@ impl MessageList {
         )
     }
 
+    /// Connect to the search-requested signal (fired on Enter in search bar)
+    pub fn connect_search_requested<F>(&self, f: F) -> glib::SignalHandlerId
+    where
+        F: Fn(&Self, String) + 'static,
+    {
+        self.connect_closure(
+            "search-requested",
+            false,
+            glib::closure_local!(move |list: &MessageList, query: String| {
+                f(list, query);
+            }),
+        )
+    }
+
     /// Connect callback for when user wants to load more messages
     pub fn connect_load_more<F: Fn() + 'static>(&self, callback: F) {
         self.imp().on_load_more.replace(Some(Box::new(callback)));
+    }
+
+    /// Connect callback for when filter state changes (triggers DB-level query)
+    pub fn connect_filter_changed<F: Fn() + 'static>(&self, callback: F) {
+        self.imp().on_filter_changed.replace(Some(Box::new(callback)));
+    }
+
+    /// Get the current filter state as a MessageFilter for DB queries
+    pub fn get_message_filter(&self) -> northmail_core::models::MessageFilter {
+        let state = self.imp().filter_state.borrow();
+        northmail_core::models::MessageFilter {
+            unread_only: state.unread_only,
+            starred_only: state.starred_only,
+            has_attachments: state.has_attachments,
+            from_contains: state.from_contains.clone(),
+            date_after: state.date_after,
+            date_before: state.date_before,
+        }
     }
 
     /// Show or hide load more capability (with infinite scroll)
@@ -358,6 +626,64 @@ impl MessageList {
         }
     }
 
+    /// Check if a message passes all active filters and search query
+    fn message_matches(&self, msg: &MessageInfo) -> bool {
+        let state = self.imp().filter_state.borrow();
+        let query = self.imp().search_query.borrow();
+
+        // Checkbox filters
+        if state.unread_only && msg.is_read {
+            return false;
+        }
+        if state.starred_only && !msg.is_starred {
+            return false;
+        }
+        if state.has_attachments && !msg.has_attachments {
+            return false;
+        }
+
+        // From substring filter
+        if !state.from_contains.is_empty() {
+            let from_lower = msg.from.to_lowercase();
+            if !from_lower.contains(&state.from_contains.to_lowercase()) {
+                return false;
+            }
+        }
+
+        // Date range filters (use date_epoch if available)
+        if let Some(after) = state.date_after {
+            match msg.date_epoch {
+                Some(epoch) if epoch >= after => {}
+                Some(_) => return false,
+                None => return false,
+            }
+        }
+        if let Some(before) = state.date_before {
+            match msg.date_epoch {
+                Some(epoch) if epoch <= before => {}
+                Some(_) => return false,
+                None => return false,
+            }
+        }
+
+        // Text search (subject + from substring)
+        if !query.is_empty() {
+            let q = query.to_lowercase();
+            let in_subject = msg.subject.to_lowercase().contains(&q);
+            let in_from = msg.from.to_lowercase().contains(&q);
+            let in_snippet = msg
+                .snippet
+                .as_deref()
+                .map(|s| s.to_lowercase().contains(&q))
+                .unwrap_or(false);
+            if !in_subject && !in_from && !in_snippet {
+                return false;
+            }
+        }
+
+        true
+    }
+
     /// Clear and set initial messages
     pub fn set_messages(&self, messages: Vec<MessageInfo>) {
         let imp = self.imp();
@@ -376,17 +702,30 @@ impl MessageList {
             }
             imp.load_more_row.replace(None);
 
-            if messages.is_empty() {
-                // Show empty state for an empty folder
+            // Apply all filters + search to decide which messages to show
+            let visible: Vec<&MessageInfo> = messages.iter()
+                .filter(|m| self.message_matches(m))
+                .collect();
+
+            if visible.is_empty() {
+                let filter_state = imp.filter_state.borrow();
+                let search_query = imp.search_query.borrow();
+                let (title, desc) = if !search_query.is_empty() && !messages.is_empty() {
+                    ("No Results", "No messages match your search")
+                } else if filter_state.is_active() && !messages.is_empty() {
+                    ("No Matching Messages", "Try adjusting your filters")
+                } else {
+                    ("Empty Folder", "There are no messages in this folder")
+                };
                 let placeholder = adw::StatusPage::builder()
                     .icon_name("mail-inbox-symbolic")
-                    .title("Empty Folder")
-                    .description("There are no messages in this folder")
+                    .title(title)
+                    .description(desc)
                     .build();
                 scrolled.set_child(Some(&placeholder));
             } else {
-                // Add new messages and show the list
-                for msg in &messages {
+                // Add visible messages
+                for msg in &visible {
                     self.add_message_row(list_box, msg);
                 }
 
@@ -395,8 +734,13 @@ impl MessageList {
                     let widget = self.clone();
                     list_box.connect_row_activated(move |_, row| {
                         let index = row.index() as usize;
-                        let messages = widget.imp().messages.borrow();
-                        if let Some(msg) = messages.get(index) {
+                        // Map display index to actual message via filtered list
+                        let imp = widget.imp();
+                        let messages = imp.messages.borrow();
+                        let filtered: Vec<&MessageInfo> = messages.iter()
+                            .filter(|m| widget.message_matches(m))
+                            .collect();
+                        if let Some(msg) = filtered.get(index) {
                             tracing::debug!("Row activated: index={}, uid={}", index, msg.uid);
                             widget.emit_by_name::<()>("message-selected", &[&msg.uid]);
                         } else {
@@ -412,6 +756,18 @@ impl MessageList {
         }
     }
 
+    /// Re-filter the displayed messages based on current filter state.
+    /// If a filter-changed callback is wired up, delegate to DB-level filtering;
+    /// otherwise fall back to client-side filtering of loaded messages.
+    fn apply_filter(&self) {
+        if let Some(callback) = self.imp().on_filter_changed.borrow().as_ref() {
+            callback();
+        } else {
+            let messages = self.imp().messages.borrow().clone();
+            self.set_messages(messages);
+        }
+    }
+
     /// Append more messages to the existing list
     pub fn append_messages(&self, messages: Vec<MessageInfo>) {
         let imp = self.imp();
@@ -423,9 +779,11 @@ impl MessageList {
                 list_box.remove(row);
             }
 
-            // Add new messages
+            // Add new messages (filtered)
             for msg in &messages {
-                self.add_message_row(list_box, msg);
+                if self.message_matches(msg) {
+                    self.add_message_row(list_box, msg);
+                }
             }
 
             // Update count and stored messages
@@ -593,14 +951,43 @@ impl Default for MessageList {
     }
 }
 
+/// Parse a "YYYY-MM-DD" string to a Unix epoch timestamp (start of day UTC)
+/// Parse a date string to epoch, accepting partial formats:
+/// "2025" → 2025-01-01, "2025-03" → 2025-03-01, "2025-03-15" → 2025-03-15
+fn parse_date_to_epoch(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // Strip trailing dashes (user may type "2026-" mid-entry)
+    let s = s.trim_end_matches('-');
+    let parts: Vec<&str> = s.split('-').collect();
+    let year: i32 = parts.first()?.parse().ok()?;
+    if !(1970..=2100).contains(&year) {
+        return None;
+    }
+    let month: i32 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(1);
+    let day: i32 = parts.get(2).and_then(|p| p.parse().ok()).unwrap_or(1);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let dt = glib::DateTime::from_utc(year, month, day, 0, 0, 0.0).ok()?;
+    tracing::debug!("parse_date_to_epoch({:?}) → {}", s, dt.to_unix());
+    Some(dt.to_unix())
+}
+
+
 /// Information about a message for display
 #[derive(Clone)]
 pub struct MessageInfo {
     pub id: i64,
     pub uid: u32,
+    pub folder_id: i64,
     pub subject: String,
     pub from: String,
+    pub to: String,
     pub date: String,
+    pub date_epoch: Option<i64>,
     pub snippet: Option<String>,
     pub is_read: bool,
     pub is_starred: bool,
@@ -612,13 +999,16 @@ impl From<&northmail_core::models::DbMessage> for MessageInfo {
         MessageInfo {
             id: db_msg.id,
             uid: db_msg.uid as u32,
+            folder_id: db_msg.folder_id,
             subject: db_msg.subject.clone().unwrap_or_default(),
             from: db_msg
                 .from_name
                 .clone()
                 .or_else(|| db_msg.from_address.clone())
                 .unwrap_or_else(|| "Unknown".to_string()),
+            to: db_msg.to_addresses.clone().unwrap_or_default(),
             date: db_msg.date_sent.clone().unwrap_or_default(),
+            date_epoch: db_msg.date_epoch,
             snippet: db_msg.snippet.clone(),
             is_read: db_msg.is_read,
             is_starred: db_msg.is_starred,

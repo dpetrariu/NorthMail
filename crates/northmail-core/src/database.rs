@@ -45,6 +45,52 @@ pub struct DbMessage {
     pub body_html: Option<String>,
 }
 
+/// Filter parameters for message queries
+#[derive(Debug, Clone, Default)]
+pub struct MessageFilter {
+    pub unread_only: bool,
+    pub starred_only: bool,
+    pub has_attachments: bool,
+    pub from_contains: String,
+    pub date_after: Option<i64>,
+    pub date_before: Option<i64>,
+}
+
+impl MessageFilter {
+    pub fn is_active(&self) -> bool {
+        self.unread_only
+            || self.starred_only
+            || self.has_attachments
+            || !self.from_contains.is_empty()
+            || self.date_after.is_some()
+            || self.date_before.is_some()
+    }
+
+    /// Build WHERE clause fragments and return the conditions + a closure to bind params
+    fn build_conditions(&self) -> Vec<String> {
+        let mut conditions = Vec::new();
+        if self.unread_only {
+            conditions.push("m.is_read = 0".to_string());
+        }
+        if self.starred_only {
+            conditions.push("m.is_starred = 1".to_string());
+        }
+        if self.has_attachments {
+            conditions.push("m.has_attachments = 1".to_string());
+        }
+        if !self.from_contains.is_empty() {
+            conditions.push("(m.from_name LIKE ? OR m.from_address LIKE ?)".to_string());
+        }
+        if self.date_after.is_some() {
+            conditions.push("m.date_epoch >= ?".to_string());
+        }
+        if self.date_before.is_some() {
+            conditions.push("m.date_epoch <= ?".to_string());
+        }
+        conditions
+    }
+}
+
 /// Database connection pool
 pub struct Database {
     pool: Pool<Sqlite>,
@@ -321,13 +367,29 @@ impl Database {
         full_path: &str,
         folder_type: &str,
     ) -> CoreResult<i64> {
+        self.upsert_folder_with_counts(account_id, name, full_path, folder_type, None, None)
+            .await
+    }
+
+    /// Insert or update a folder with message/unread counts
+    pub async fn upsert_folder_with_counts(
+        &self,
+        account_id: &str,
+        name: &str,
+        full_path: &str,
+        folder_type: &str,
+        message_count: Option<i64>,
+        unread_count: Option<i64>,
+    ) -> CoreResult<i64> {
         let result = sqlx::query(
             r#"
-            INSERT INTO folders (account_id, name, full_path, folder_type)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO folders (account_id, name, full_path, folder_type, message_count, unread_count)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(account_id, full_path) DO UPDATE SET
                 name = excluded.name,
                 folder_type = excluded.folder_type,
+                message_count = COALESCE(excluded.message_count, folders.message_count),
+                unread_count = COALESCE(excluded.unread_count, folders.unread_count),
                 updated_at = datetime('now')
             RETURNING id
             "#,
@@ -336,6 +398,8 @@ impl Database {
         .bind(name)
         .bind(full_path)
         .bind(folder_type)
+        .bind(message_count)
+        .bind(unread_count)
         .fetch_one(&self.pool)
         .await?;
 
@@ -596,6 +660,35 @@ impl Database {
         Ok(messages)
     }
 
+    /// Search messages using FTS within a specific folder
+    pub async fn search_messages_in_folder(
+        &self,
+        folder_id: i64,
+        query: &str,
+        limit: i64,
+    ) -> CoreResult<Vec<DbMessage>> {
+        let messages = sqlx::query_as::<_, DbMessage>(
+            r#"
+            SELECT m.id, m.folder_id, m.uid, m.message_id, m.subject, m.from_address,
+                   m.from_name, m.to_addresses, m.date_sent, m.date_epoch, m.snippet,
+                   m.is_read, m.is_starred, m.has_attachments, m.size, m.maildir_path,
+                   m.body_text, m.body_html
+            FROM messages m
+            JOIN messages_fts fts ON m.id = fts.rowid
+            WHERE messages_fts MATCH ? AND m.folder_id = ?
+            ORDER BY m.date_epoch DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(query)
+        .bind(folder_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(messages)
+    }
+
     /// Update message read status
     pub async fn set_message_read(&self, message_id: i64, is_read: bool) -> CoreResult<()> {
         sqlx::query("UPDATE messages SET is_read = ?, updated_at = datetime('now') WHERE id = ?")
@@ -782,6 +875,224 @@ impl Database {
 
         info!("Cleared cache for account {}", account_id);
         Ok(())
+    }
+
+    /// Get messages across all inbox folders (for unified inbox)
+    pub async fn get_inbox_messages(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> CoreResult<Vec<DbMessage>> {
+        let messages = sqlx::query_as::<_, DbMessage>(
+            r#"
+            SELECT m.id, m.folder_id, m.uid, m.message_id, m.subject, m.from_address,
+                   m.from_name, m.to_addresses, m.date_sent, m.date_epoch, m.snippet,
+                   m.is_read, m.is_starred, m.has_attachments, m.size, m.maildir_path,
+                   m.body_text, m.body_html
+            FROM messages m
+            JOIN folders f ON m.folder_id = f.id
+            WHERE f.folder_type = 'inbox'
+            ORDER BY m.date_epoch DESC, m.uid DESC
+            LIMIT ? OFFSET ?
+            "#,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(messages)
+    }
+
+    /// Get total message count across all inbox folders
+    pub async fn get_inbox_message_count(&self) -> CoreResult<i64> {
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*) as count FROM messages m
+            JOIN folders f ON m.folder_id = f.id
+            WHERE f.folder_type = 'inbox'
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row.get::<i64, _>("count"))
+    }
+
+    /// Search messages using FTS scoped to inbox folders (for unified inbox)
+    pub async fn search_inbox_messages(
+        &self,
+        query: &str,
+        limit: i64,
+    ) -> CoreResult<Vec<DbMessage>> {
+        let messages = sqlx::query_as::<_, DbMessage>(
+            r#"
+            SELECT m.id, m.folder_id, m.uid, m.message_id, m.subject, m.from_address,
+                   m.from_name, m.to_addresses, m.date_sent, m.date_epoch, m.snippet,
+                   m.is_read, m.is_starred, m.has_attachments, m.size, m.maildir_path,
+                   m.body_text, m.body_html
+            FROM messages m
+            JOIN messages_fts fts ON m.id = fts.rowid
+            JOIN folders f ON m.folder_id = f.id
+            WHERE messages_fts MATCH ? AND f.folder_type = 'inbox'
+            ORDER BY m.date_epoch DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(query)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(messages)
+    }
+
+    /// Get a folder by its ID (for resolving folder→account mapping in unified inbox)
+    pub async fn get_folder_by_id(&self, folder_id: i64) -> CoreResult<Option<DbFolder>> {
+        let folder = sqlx::query_as::<_, DbFolder>(
+            r#"
+            SELECT id, account_id, name, full_path, folder_type, uidvalidity,
+                   uid_next, message_count, unread_count
+            FROM folders
+            WHERE id = ?
+            "#,
+        )
+        .bind(folder_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(folder)
+    }
+
+    /// Get messages for a folder with filters applied
+    pub async fn get_messages_filtered(
+        &self,
+        folder_id: i64,
+        limit: i64,
+        offset: i64,
+        filter: &MessageFilter,
+    ) -> CoreResult<Vec<DbMessage>> {
+        let mut conditions = vec!["m.folder_id = ?".to_string()];
+        conditions.extend(filter.build_conditions());
+        let where_clause = conditions.join(" AND ");
+        let query_str = format!(
+            r#"SELECT m.id, m.folder_id, m.uid, m.message_id, m.subject, m.from_address,
+                   m.from_name, m.to_addresses, m.date_sent, m.date_epoch, m.snippet,
+                   m.is_read, m.is_starred, m.has_attachments, m.size, m.maildir_path,
+                   m.body_text, m.body_html
+            FROM messages m
+            WHERE {}
+            ORDER BY m.date_epoch DESC, m.uid DESC
+            LIMIT ? OFFSET ?"#,
+            where_clause
+        );
+        let mut query = sqlx::query_as::<_, DbMessage>(&query_str).bind(folder_id);
+        if !filter.from_contains.is_empty() {
+            let pattern = format!("%{}%", filter.from_contains);
+            query = query.bind(pattern.clone()).bind(pattern);
+        }
+        if let Some(after) = filter.date_after {
+            query = query.bind(after);
+        }
+        if let Some(before) = filter.date_before {
+            query = query.bind(before);
+        }
+        let messages = query.bind(limit).bind(offset).fetch_all(&self.pool).await?;
+        Ok(messages)
+    }
+
+    /// Get message count for a folder with filters applied
+    pub async fn get_messages_filtered_count(
+        &self,
+        folder_id: i64,
+        filter: &MessageFilter,
+    ) -> CoreResult<i64> {
+        let mut conditions = vec!["m.folder_id = ?".to_string()];
+        conditions.extend(filter.build_conditions());
+        let where_clause = conditions.join(" AND ");
+        let query_str = format!(
+            "SELECT COUNT(*) as count FROM messages m WHERE {}",
+            where_clause
+        );
+        let mut query = sqlx::query(&query_str).bind(folder_id);
+        if !filter.from_contains.is_empty() {
+            let pattern = format!("%{}%", filter.from_contains);
+            query = query.bind(pattern.clone()).bind(pattern);
+        }
+        if let Some(after) = filter.date_after {
+            query = query.bind(after);
+        }
+        if let Some(before) = filter.date_before {
+            query = query.bind(before);
+        }
+        let row = query.fetch_one(&self.pool).await?;
+        Ok(row.get::<i64, _>("count"))
+    }
+
+    /// Get messages across all inbox folders with filters applied
+    pub async fn get_inbox_messages_filtered(
+        &self,
+        limit: i64,
+        offset: i64,
+        filter: &MessageFilter,
+    ) -> CoreResult<Vec<DbMessage>> {
+        let mut conditions = vec!["f.folder_type = 'inbox'".to_string()];
+        conditions.extend(filter.build_conditions());
+        let where_clause = conditions.join(" AND ");
+        let query_str = format!(
+            r#"SELECT m.id, m.folder_id, m.uid, m.message_id, m.subject, m.from_address,
+                   m.from_name, m.to_addresses, m.date_sent, m.date_epoch, m.snippet,
+                   m.is_read, m.is_starred, m.has_attachments, m.size, m.maildir_path,
+                   m.body_text, m.body_html
+            FROM messages m
+            JOIN folders f ON m.folder_id = f.id
+            WHERE {}
+            ORDER BY m.date_epoch DESC, m.uid DESC
+            LIMIT ? OFFSET ?"#,
+            where_clause
+        );
+        let mut query = sqlx::query_as::<_, DbMessage>(&query_str);
+        if !filter.from_contains.is_empty() {
+            let pattern = format!("%{}%", filter.from_contains);
+            query = query.bind(pattern.clone()).bind(pattern);
+        }
+        if let Some(after) = filter.date_after {
+            query = query.bind(after);
+        }
+        if let Some(before) = filter.date_before {
+            query = query.bind(before);
+        }
+        let messages = query.bind(limit).bind(offset).fetch_all(&self.pool).await?;
+        Ok(messages)
+    }
+
+    /// Get message count across all inbox folders with filters applied
+    pub async fn get_inbox_messages_filtered_count(
+        &self,
+        filter: &MessageFilter,
+    ) -> CoreResult<i64> {
+        let mut conditions = vec!["f.folder_type = 'inbox'".to_string()];
+        conditions.extend(filter.build_conditions());
+        let where_clause = conditions.join(" AND ");
+        let query_str = format!(
+            r#"SELECT COUNT(*) as count FROM messages m
+            JOIN folders f ON m.folder_id = f.id
+            WHERE {}"#,
+            where_clause
+        );
+        let mut query = sqlx::query(&query_str);
+        if !filter.from_contains.is_empty() {
+            let pattern = format!("%{}%", filter.from_contains);
+            query = query.bind(pattern.clone()).bind(pattern);
+        }
+        if let Some(after) = filter.date_after {
+            query = query.bind(after);
+        }
+        if let Some(before) = filter.date_before {
+            query = query.bind(before);
+        }
+        let row = query.fetch_one(&self.pool).await?;
+        Ok(row.get::<i64, _>("count"))
     }
 
     /// Clear all cached data

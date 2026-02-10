@@ -291,8 +291,8 @@ impl SimpleImapClient {
     /// Fetch message headers
     pub async fn fetch_headers(&mut self, range: &str) -> ImapResult<Vec<MessageHeader>> {
         let tag = self.next_tag();
-        // Fetch UID, FLAGS, and ENVELOPE
-        let cmd = format!("{} FETCH {} (UID FLAGS ENVELOPE)\r\n", tag, range);
+        // Fetch UID, FLAGS, ENVELOPE, and BODYSTRUCTURE (for attachment detection)
+        let cmd = format!("{} FETCH {} (UID FLAGS ENVELOPE BODYSTRUCTURE)\r\n", tag, range);
 
         // Collect raw response lines first
         let mut raw_lines = Vec::new();
@@ -344,15 +344,24 @@ impl SimpleImapClient {
         let flag_refs: Vec<&str> = flag_strs.iter().map(|s| s.as_str()).collect();
         let flags = MessageFlags::from_imap_flags(&flag_refs);
         let envelope = Self::extract_envelope(line);
+        let has_attachments = Self::detect_attachments(line);
 
         Some(MessageHeader {
             uid,
             seq: 0, // Not available in simple parser
             envelope,
             flags,
-            has_attachments: false,
+            has_attachments,
             size: 0,
         })
+    }
+
+    /// Detect attachments from BODYSTRUCTURE in the raw FETCH response.
+    /// Scans for "attachment" disposition (case-insensitive) which servers emit
+    /// as ("attachment" ...) or ("ATTACHMENT" ...) in the BODYSTRUCTURE portion.
+    fn detect_attachments(line: &str) -> bool {
+        let lower = line.to_ascii_lowercase();
+        lower.contains("\"attachment\"")
     }
 
     fn extract_uid(line: &str) -> Option<u32> {
@@ -758,10 +767,11 @@ impl SimpleImapClient {
     }
 
     fn parse_list_response(line: &str) -> Option<Folder> {
-        // Format: * LIST (\attr1 \attr2) "/" "folder name"
+        // Format: * LIST (\attr1 \attr2) "delimiter" "folder name"
+        //     or: * LIST (\attr1 \attr2) NIL "folder name"
         let rest = line.strip_prefix("* LIST ")?;
 
-        // Extract attributes
+        // Extract attributes between ( and )
         let attr_start = rest.find('(')?;
         let attr_end = rest.find(')')?;
         let attrs_str = &rest[attr_start + 1..attr_end];
@@ -770,34 +780,70 @@ impl SimpleImapClient {
             .map(|s| s.to_string())
             .collect();
 
-        // Find delimiter and folder name
-        let after_attrs = &rest[attr_end + 1..].trim();
+        // Everything after the closing paren: e.g. ` "/" "INBOX"` or ` NIL "INBOX"`
+        let after_attrs = rest[attr_end + 1..].trim();
 
-        // Parse delimiter (could be "/" or NIL)
-        let delimiter = if after_attrs.starts_with("NIL") {
-            None
+        // Parse delimiter and find where folder name starts
+        let (delimiter, folder_part) = if after_attrs.starts_with("NIL") {
+            (None, after_attrs[3..].trim())
         } else if after_attrs.starts_with('"') {
-            after_attrs.chars().nth(1)
+            // Delimiter is a quoted single character like "/"
+            let delim_char = after_attrs.chars().nth(1);
+            // Skip past the delimiter string (e.g. `"/"`) to get to the folder name
+            if let Some(close) = after_attrs[1..].find('"') {
+                (delim_char, after_attrs[close + 2..].trim())
+            } else {
+                (None, after_attrs)
+            }
         } else {
-            None
+            (None, after_attrs)
         };
 
-        // Find folder name (last quoted string)
-        let name_start = after_attrs.rfind('"')?;
-        let name_end = after_attrs[..name_start].rfind('"')?;
-        let name = &after_attrs[name_end + 1..name_start];
+        // Extract folder name from the remaining part — should be a quoted string
+        let folder_name = if folder_part.starts_with('"') {
+            // Find the closing quote (handle escaped quotes)
+            let inner = &folder_part[1..];
+            let mut end = 0;
+            let mut chars = inner.chars();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    // Skip escaped character
+                    chars.next();
+                    end += 2;
+                } else if c == '"' {
+                    break;
+                } else {
+                    end += c.len_utf8();
+                }
+            }
+            &inner[..end]
+        } else {
+            // Unquoted folder name (some servers do this)
+            folder_part.trim()
+        };
 
         // Check for \Noselect attribute
         let is_noselect = attributes.iter().any(|a| a.eq_ignore_ascii_case("\\Noselect"));
-
         if is_noselect {
-            return None; // Skip non-selectable folders
+            return None;
+        }
+
+        // Skip empty or root-delimiter-only folder names
+        if folder_name.is_empty()
+            || (folder_name.len() == 1 && delimiter == Some(folder_name.chars().next().unwrap_or('/')))
+        {
+            debug!("Skipping root/empty folder: {:?}", folder_name);
+            return None;
         }
 
         Some(Folder {
-            name: name.split(delimiter.unwrap_or('/')).last().unwrap_or(name).to_string(),
-            full_path: name.to_string(),
-            folder_type: FolderType::from_attributes_and_name(&attributes, name),
+            name: folder_name
+                .split(delimiter.unwrap_or('/'))
+                .last()
+                .unwrap_or(folder_name)
+                .to_string(),
+            full_path: folder_name.to_string(),
+            folder_type: FolderType::from_attributes_and_name(&attributes, folder_name),
             delimiter,
             attributes,
             uidvalidity: None,
@@ -805,6 +851,180 @@ impl SimpleImapClient {
             unread_count: None,
             uid_next: None,
         })
+    }
+
+    /// Get STATUS for a folder (MESSAGES and UNSEEN counts)
+    /// Returns (message_count, unseen_count)
+    pub async fn folder_status(&mut self, folder: &str) -> ImapResult<(u32, u32)> {
+        let tag = self.next_tag();
+        let cmd = format!("{} STATUS \"{}\" (MESSAGES UNSEEN)\r\n", tag, folder);
+
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or(ImapError::NotConnected)?;
+
+        stream
+            .get_mut()
+            .write_all(cmd.as_bytes())
+            .await
+            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+        let mut messages = 0u32;
+        let mut unseen = 0u32;
+
+        loop {
+            let mut line = String::new();
+            stream
+                .read_line(&mut line)
+                .await
+                .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+            debug!("STATUS response: {}", line.trim());
+
+            // Parse: * STATUS "folder" (MESSAGES 42 UNSEEN 5)
+            if line.starts_with("* STATUS ") {
+                if let Some(paren_start) = line.rfind('(') {
+                    let status_data = &line[paren_start + 1..];
+                    let parts: Vec<&str> = status_data.split_whitespace().collect();
+                    for i in (0..parts.len()).step_by(2) {
+                        if i + 1 < parts.len() {
+                            let val = parts[i + 1].trim_end_matches(')').parse().unwrap_or(0);
+                            match parts[i] {
+                                "MESSAGES" => messages = val,
+                                "UNSEEN" => unseen = val,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+
+            if line.starts_with(&tag) {
+                break;
+            }
+        }
+
+        Ok((messages, unseen))
+    }
+
+    /// Pipelined batch STATUS for multiple folders.
+    /// Sends ALL STATUS commands before reading any responses.
+    /// For N folders: N sequential round trips → 1 pipelined batch.
+    /// Returns Vec<(folder_path, message_count, unseen_count)>.
+    pub async fn batch_folder_status(&mut self, folders: &[&str]) -> ImapResult<Vec<(String, u32, u32)>> {
+        if folders.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or(ImapError::NotConnected)?;
+
+        // Phase 1: Send all STATUS commands without waiting for responses
+        let mut tags: Vec<(String, String)> = Vec::with_capacity(folders.len()); // (tag, folder_path)
+        for folder in folders {
+            self.tag_counter += 1;
+            let tag = format!("A{:04}", self.tag_counter);
+            let cmd = format!("{} STATUS \"{}\" (MESSAGES UNSEEN)\r\n", tag, folder);
+            stream
+                .get_mut()
+                .write_all(cmd.as_bytes())
+                .await
+                .map_err(|e| ImapError::ServerError(e.to_string()))?;
+            tags.push((tag, folder.to_string()));
+        }
+
+        // Flush all commands at once
+        stream
+            .get_mut()
+            .flush()
+            .await
+            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+        // Phase 2: Read all responses in tag order.
+        // IMAP processes pipelined commands sequentially (RFC 3501 §3),
+        // so the * STATUS response before each tagged OK belongs to that command.
+        // This avoids case-sensitivity issues (e.g. Outlook returns "Inbox" not "INBOX").
+        let mut results: Vec<(String, u32, u32)> = Vec::with_capacity(folders.len());
+        let mut completed_tags = 0;
+        // Accumulate the most recent STATUS data seen before each tagged response
+        let mut pending_messages = 0u32;
+        let mut pending_unseen = 0u32;
+        let mut got_status = false;
+
+        while completed_tags < tags.len() {
+            let mut line = String::new();
+            stream
+                .read_line(&mut line)
+                .await
+                .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+            debug!("Batch STATUS response: {}", line.trim());
+
+            // Parse: * STATUS "folder" (MESSAGES 42 UNSEEN 5)
+            if line.starts_with("* STATUS ") {
+                if let Some((_, messages, unseen)) = Self::parse_status_line(&line) {
+                    pending_messages = messages;
+                    pending_unseen = unseen;
+                    got_status = true;
+                }
+            }
+
+            // Check if this is a tagged response (OK or BAD)
+            let (tag, folder_path) = &tags[completed_tags];
+            if line.starts_with(tag.as_str()) {
+                if got_status {
+                    results.push((folder_path.clone(), pending_messages, pending_unseen));
+                } else {
+                    // BAD or no STATUS line — use (0, 0)
+                    results.push((folder_path.clone(), 0, 0));
+                }
+                completed_tags += 1;
+                got_status = false;
+                pending_messages = 0;
+                pending_unseen = 0;
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Parse a STATUS response line: * STATUS "folder" (MESSAGES 42 UNSEEN 5)
+    fn parse_status_line(line: &str) -> Option<(String, u32, u32)> {
+        // Extract folder name (quoted)
+        let after_status = line.strip_prefix("* STATUS ")?;
+
+        // Folder name can be quoted or unquoted
+        let (folder_name, rest) = if after_status.starts_with('"') {
+            let inner = &after_status[1..];
+            let end = inner.find('"')?;
+            (&inner[..end], &inner[end + 1..])
+        } else {
+            let end = after_status.find(' ')?;
+            (&after_status[..end], &after_status[end..])
+        };
+
+        // Parse counts from (MESSAGES N UNSEEN M)
+        let mut messages = 0u32;
+        let mut unseen = 0u32;
+        if let Some(paren_start) = rest.rfind('(') {
+            let data = &rest[paren_start + 1..];
+            let parts: Vec<&str> = data.split_whitespace().collect();
+            for i in (0..parts.len()).step_by(2) {
+                if i + 1 < parts.len() {
+                    let val = parts[i + 1].trim_end_matches(')').parse().unwrap_or(0);
+                    match parts[i] {
+                        "MESSAGES" => messages = val,
+                        "UNSEEN" => unseen = val,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        Some((folder_name.to_string(), messages, unseen))
     }
 
     /// Check if connection is alive with NOOP
@@ -864,5 +1084,85 @@ impl SimpleImapClient {
 impl Default for SimpleImapClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_list_gmail_inbox() {
+        let line = r#"* LIST (\HasNoChildren) "/" "INBOX""#;
+        let folder = SimpleImapClient::parse_list_response(line).unwrap();
+        assert_eq!(folder.full_path, "INBOX");
+        assert_eq!(folder.name, "INBOX");
+        assert_eq!(folder.delimiter, Some('/'));
+        assert_eq!(folder.folder_type, FolderType::Inbox);
+    }
+
+    #[test]
+    fn test_parse_list_gmail_nested() {
+        let line = r#"* LIST (\HasNoChildren) "/" "[Gmail]/Sent Mail""#;
+        let folder = SimpleImapClient::parse_list_response(line).unwrap();
+        assert_eq!(folder.full_path, "[Gmail]/Sent Mail");
+        assert_eq!(folder.name, "Sent Mail");
+        assert_eq!(folder.folder_type, FolderType::Sent);
+    }
+
+    #[test]
+    fn test_parse_list_outlook_sent_items() {
+        let line = r#"* LIST (\HasNoChildren \Sent) "/" "Sent Items""#;
+        let folder = SimpleImapClient::parse_list_response(line).unwrap();
+        assert_eq!(folder.full_path, "Sent Items");
+        assert_eq!(folder.name, "Sent Items");
+        assert_eq!(folder.folder_type, FolderType::Sent);
+    }
+
+    #[test]
+    fn test_parse_list_outlook_junk() {
+        let line = r#"* LIST (\HasNoChildren \Junk) "/" "Junk Email""#;
+        let folder = SimpleImapClient::parse_list_response(line).unwrap();
+        assert_eq!(folder.full_path, "Junk Email");
+        assert_eq!(folder.name, "Junk Email");
+        assert_eq!(folder.folder_type, FolderType::Spam);
+    }
+
+    #[test]
+    fn test_parse_list_noselect_skipped() {
+        let line = r#"* LIST (\Noselect \HasChildren) "/" "[Gmail]""#;
+        assert!(SimpleImapClient::parse_list_response(line).is_none());
+    }
+
+    #[test]
+    fn test_parse_list_root_slash_skipped() {
+        // Outlook can return the root delimiter as a folder
+        let line = r#"* LIST (\HasNoChildren) "/" "/""#;
+        assert!(SimpleImapClient::parse_list_response(line).is_none());
+    }
+
+    #[test]
+    fn test_parse_list_empty_name_skipped() {
+        let line = r#"* LIST (\Noselect) "/" """#;
+        // \Noselect should be filtered
+        assert!(SimpleImapClient::parse_list_response(line).is_none());
+    }
+
+    #[test]
+    fn test_parse_list_nil_delimiter() {
+        let line = r#"* LIST (\HasNoChildren) NIL "INBOX""#;
+        let folder = SimpleImapClient::parse_list_response(line).unwrap();
+        assert_eq!(folder.full_path, "INBOX");
+        assert_eq!(folder.delimiter, None);
+    }
+
+    #[test]
+    fn test_parse_list_dot_delimiter() {
+        // Some servers use "." as delimiter
+        let line = r#"* LIST (\HasNoChildren) "." "INBOX.Sent""#;
+        let folder = SimpleImapClient::parse_list_response(line).unwrap();
+        assert_eq!(folder.full_path, "INBOX.Sent");
+        assert_eq!(folder.name, "Sent");
+        assert_eq!(folder.delimiter, Some('.'));
     }
 }

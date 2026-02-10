@@ -13,6 +13,32 @@ use tracing::{debug, error, info, warn};
 
 const APP_ID: &str = "org.northmail.NorthMail";
 
+/// Map a DB folder_type string to a GTK icon name
+fn folder_type_to_icon(folder_type: &str) -> &'static str {
+    match folder_type {
+        "inbox" => "mail-inbox-symbolic",
+        "sent" => "mail-send-symbolic",
+        "drafts" => "document-edit-symbolic",
+        "trash" => "user-trash-symbolic",
+        "spam" => "mail-mark-junk-symbolic",
+        "archive" => "mail-read-symbolic",
+        _ => "folder-symbolic",
+    }
+}
+
+/// Sort priority for known folder types (lower = higher in sidebar)
+fn folder_type_sort_key(folder_type: &str) -> u8 {
+    match folder_type {
+        "inbox" => 0,
+        "sent" => 1,
+        "drafts" => 2,
+        "trash" => 3,
+        "spam" => 4,
+        "archive" => 5,
+        _ => 10,
+    }
+}
+
 /// Decode MIME encoded-word headers (RFC 2047)
 /// Handles =?charset?encoding?text?= format
 fn decode_mime_header(input: &str) -> String {
@@ -237,6 +263,36 @@ enum FetchEvent {
     Error(String),
 }
 
+/// Convert IMAP FolderType to the DB string representation
+fn folder_type_to_db_string(ft: &northmail_imap::FolderType) -> String {
+    match ft {
+        northmail_imap::FolderType::Inbox => "inbox",
+        northmail_imap::FolderType::Sent => "sent",
+        northmail_imap::FolderType::Drafts => "drafts",
+        northmail_imap::FolderType::Trash => "trash",
+        northmail_imap::FolderType::Spam => "spam",
+        northmail_imap::FolderType::Archive => "archive",
+        northmail_imap::FolderType::Other => "other",
+    }
+    .to_string()
+}
+
+/// Result of an account sync (folder list + inbox message count)
+struct SyncResult {
+    inbox_count: usize,
+    /// (name, full_path, folder_type_str, message_count, unseen_count) for each folder
+    folders: Vec<SyncedFolder>,
+}
+
+/// Folder info from IMAP LIST + STATUS
+struct SyncedFolder {
+    name: String,
+    full_path: String,
+    folder_type: String,
+    message_count: u32,
+    unseen_count: u32,
+}
+
 /// Parsed email body
 #[derive(Debug, Clone, Default)]
 pub struct ParsedEmailBody {
@@ -374,6 +430,21 @@ impl NorthMailApplication {
     /// Get the database if available
     fn database(&self) -> Option<&std::sync::Arc<northmail_core::Database>> {
         self.imp().database.get()
+    }
+
+    /// Get the database (public, for use from window.rs)
+    pub fn database_ref(&self) -> Option<&std::sync::Arc<northmail_core::Database>> {
+        self.imp().database.get()
+    }
+
+    /// Get the current cache folder ID
+    pub fn cache_folder_id(&self) -> i64 {
+        self.imp().cache_folder_id.get()
+    }
+
+    /// Set the cache offset
+    pub fn set_cache_offset(&self, offset: i64) {
+        self.imp().cache_offset.set(offset);
     }
 
     /// Save GOA accounts to database for foreign key relationships
@@ -529,11 +600,14 @@ impl NorthMailApplication {
         }
 
         if state.unified_inbox {
-            // Select unified inbox (not yet implemented, select first account's inbox)
             info!("Restoring unified inbox view");
-            if let Some(account) = accounts.first() {
-                if Self::is_supported_account(account) {
-                    self.fetch_folder(&account.id, "INBOX");
+            self.fetch_unified_inbox();
+            // Highlight the unified inbox row in the sidebar
+            if let Some(window) = self.active_window() {
+                if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                    if let Some(sidebar) = win.folder_sidebar() {
+                        sidebar.select_unified_inbox();
+                    }
                 }
             }
         } else if let Some((account_id, folder_path)) = state.last_folder {
@@ -590,6 +664,9 @@ impl NorthMailApplication {
 
                 // Sync this account's inbox
                 app.sync_account_inbox(&account.id).await;
+
+                // Refresh sidebar after each account so counts appear progressively
+                app.refresh_sidebar_folders();
             }
 
             // Show completion briefly
@@ -672,78 +749,162 @@ impl NorthMailApplication {
 
         info!("Syncing inbox for {}", account.email);
 
-        match AuthManager::new().await {
+        // Load cached folders from DB to skip list_folders() when possible
+        let cached_folders: Option<Vec<(String, String, String)>> = if let Some(db) = self.database() {
+            let db = db.clone();
+            let acct_id = account_id.to_string();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result = rt.block_on(async {
+                    db.get_folders(&acct_id).await
+                });
+                let _ = sender.send(result);
+            });
+            match receiver.recv_timeout(std::time::Duration::from_secs(2)) {
+                Ok(Ok(folders)) if !folders.is_empty() => {
+                    let cached: Vec<(String, String, String)> = folders
+                        .iter()
+                        .map(|f| (f.full_path.clone(), f.name.clone(), f.folder_type.clone()))
+                        .collect();
+                    info!("Using {} cached folders for {}, skipping list_folders()", cached.len(), account.email);
+                    Some(cached)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let sync_result: Option<SyncResult> = match AuthManager::new().await {
             Ok(auth_manager) => {
                 if Self::is_google_account(&account) {
-                    // Google OAuth2 auth
                     match auth_manager.get_xoauth2_token_for_goa(&account.id).await {
                         Ok((email, access_token)) => {
                             debug!("Got OAuth2 token for {}", email);
-                            let result = Self::fetch_inbox_google_async(email, access_token).await;
-                            match result {
-                                Ok(count) => {
-                                    info!("Synced {} messages for {}", count, account.email);
+                            match Self::fetch_inbox_google_async(email, access_token, cached_folders.clone()).await {
+                                Ok(sr) => {
+                                    info!("Synced {} messages for {}", sr.inbox_count, account.email);
+                                    Some(sr)
                                 }
                                 Err(e) => {
                                     warn!("Failed to sync {}: {}", account.email, e);
+                                    None
                                 }
                             }
                         }
                         Err(e) => {
                             warn!("Failed to get OAuth2 token for {}: {}", account.email, e);
+                            None
                         }
                     }
                 } else if Self::is_microsoft_account(&account) {
-                    // Microsoft OAuth2 auth
                     match auth_manager.get_xoauth2_token_for_goa(&account.id).await {
                         Ok((email, access_token)) => {
                             debug!("Got OAuth2 token for {}", email);
-                            let result = Self::fetch_inbox_microsoft_async(email, access_token).await;
-                            match result {
-                                Ok(count) => {
-                                    info!("Synced {} messages for {}", count, account.email);
+                            match Self::fetch_inbox_microsoft_async(email, access_token, cached_folders.clone()).await {
+                                Ok(sr) => {
+                                    info!("Synced {} messages for {}", sr.inbox_count, account.email);
+                                    Some(sr)
                                 }
                                 Err(e) => {
                                     warn!("Failed to sync {}: {}", account.email, e);
+                                    None
                                 }
                             }
                         }
                         Err(e) => {
                             warn!("Failed to get OAuth2 token for {}: {}", account.email, e);
+                            None
                         }
                     }
                 } else if Self::is_password_account(&account) {
-                    // Password auth (iCloud, generic IMAP)
                     let username = account.imap_username.clone().unwrap_or(account.email.clone());
                     let host = account.imap_host.clone().unwrap_or_else(|| "imap.mail.me.com".to_string());
 
                     match auth_manager.get_goa_password(&account.id).await {
                         Ok(password) => {
                             debug!("Got password for {}", username);
-                            let result = Self::fetch_inbox_password_async(host, username, password).await;
-                            match result {
-                                Ok(count) => {
-                                    info!("Synced {} messages for {}", count, account.email);
+                            match Self::fetch_inbox_password_async(host, username, password, cached_folders.clone()).await {
+                                Ok(sr) => {
+                                    info!("Synced {} messages for {}", sr.inbox_count, account.email);
+                                    Some(sr)
                                 }
                                 Err(e) => {
                                     warn!("Failed to sync {}: {}", account.email, e);
+                                    None
                                 }
                             }
                         }
                         Err(e) => {
                             warn!("Failed to get password for {}: {}", account.email, e);
+                            None
                         }
                     }
+                } else {
+                    None
                 }
             }
             Err(e) => {
                 warn!("Failed to create auth manager: {}", e);
+                None
+            }
+        };
+
+        // Save synced folders to database
+        if let Some(sr) = sync_result {
+            if !sr.folders.is_empty() {
+                if let Some(db) = self.database() {
+                    let db = db.clone();
+                    let acct_id = account_id.to_string();
+                    let folder_count = sr.folders.len();
+                    let folders = sr.folders;
+
+                    let (sender, receiver) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        let result = rt.block_on(async {
+                            for f in &folders {
+                                if let Err(e) = db
+                                    .upsert_folder_with_counts(
+                                        &acct_id,
+                                        &f.name,
+                                        &f.full_path,
+                                        &f.folder_type,
+                                        Some(f.message_count as i64),
+                                        Some(f.unseen_count as i64),
+                                    )
+                                    .await
+                                {
+                                    warn!("Failed to upsert folder {}: {}", f.full_path, e);
+                                }
+                            }
+                        });
+                        let _ = sender.send(result);
+                    });
+
+                    // Wait for DB writes (short timeout)
+                    let timeout = std::time::Duration::from_secs(3);
+                    match receiver.recv_timeout(timeout) {
+                        Ok(_) => {
+                            info!("Saved {} folders for {}", folder_count, account.email);
+                        }
+                        Err(_) => {
+                            warn!("Timed out saving folders for {}", account.email);
+                        }
+                    }
+                }
             }
         }
     }
 
     /// Fetch inbox messages asynchronously for Google (Gmail)
-    async fn fetch_inbox_google_async(email: String, access_token: String) -> Result<usize, String> {
+    /// If cached_folders is Some, skip list_folders() and use cached folder paths for STATUS.
+    async fn fetch_inbox_google_async(
+        email: String,
+        access_token: String,
+        cached_folders: Option<Vec<(String, String, String)>>,
+    ) -> Result<SyncResult, String> {
         let (sender, receiver) = std::sync::mpsc::channel();
 
         std::thread::spawn(move || {
@@ -754,17 +915,53 @@ impl NorthMailApplication {
                     Ok(_) => {
                         debug!("IMAP connected for {}", email);
 
-                        match client.select("INBOX").await {
-                            Ok(folder_info) => {
-                                let count = folder_info.message_count.unwrap_or(0) as usize;
-                                let _ = client.logout().await;
-                                Ok(count)
+                        // Get folder list: use cache or fetch from IMAP
+                        let folder_entries: Vec<(String, String, String)> = if let Some(cached) = cached_folders {
+                            debug!("Using {} cached folders, skipping LIST", cached.len());
+                            cached
+                        } else {
+                            match client.list_folders().await {
+                                Ok(folder_list) => {
+                                    folder_list.into_iter().map(|f| {
+                                        (f.full_path, f.name, folder_type_to_db_string(&f.folder_type))
+                                    }).collect()
+                                }
+                                Err(e) => {
+                                    warn!("Failed to list folders: {}", e);
+                                    Vec::new()
+                                }
                             }
-                            Err(e) => {
-                                let _ = client.logout().await;
-                                Err(format!("Failed to select INBOX: {}", e))
+                        };
+
+                        // Batch STATUS for all folders (pipelined)
+                        let folder_paths: Vec<&str> = folder_entries.iter().map(|(p, _, _)| p.as_str()).collect();
+                        let status_results = client
+                            .batch_folder_status(&folder_paths)
+                            .await
+                            .unwrap_or_default();
+
+                        // Build SyncedFolder list and extract inbox count
+                        let mut folders = Vec::new();
+                        let mut inbox_count: usize = 0;
+                        for (path, msg_count, unseen) in &status_results {
+                            let (_, name, ft) = folder_entries.iter()
+                                .find(|(p, _, _)| p == path)
+                                .cloned()
+                                .unwrap_or_else(|| (path.clone(), path.clone(), "other".to_string()));
+                            if path.eq_ignore_ascii_case("INBOX") {
+                                inbox_count = *msg_count as usize;
                             }
+                            folders.push(SyncedFolder {
+                                name,
+                                full_path: path.clone(),
+                                folder_type: ft,
+                                message_count: *msg_count,
+                                unseen_count: *unseen,
+                            });
                         }
+
+                        let _ = client.logout().await;
+                        Ok(SyncResult { inbox_count, folders })
                     }
                     Err(e) => Err(format!("Auth failed: {}", e)),
                 }
@@ -777,7 +974,12 @@ impl NorthMailApplication {
     }
 
     /// Fetch inbox messages asynchronously for Microsoft (Outlook/Hotmail)
-    async fn fetch_inbox_microsoft_async(email: String, access_token: String) -> Result<usize, String> {
+    /// If cached_folders is Some, skip list_folders() and use cached folder paths for STATUS.
+    async fn fetch_inbox_microsoft_async(
+        email: String,
+        access_token: String,
+        cached_folders: Option<Vec<(String, String, String)>>,
+    ) -> Result<SyncResult, String> {
         let (sender, receiver) = std::sync::mpsc::channel();
 
         std::thread::spawn(move || {
@@ -788,17 +990,53 @@ impl NorthMailApplication {
                     Ok(_) => {
                         debug!("IMAP connected for {}", email);
 
-                        match client.select("INBOX").await {
-                            Ok(folder_info) => {
-                                let count = folder_info.message_count.unwrap_or(0) as usize;
-                                let _ = client.logout().await;
-                                Ok(count)
+                        // Get folder list: use cache or fetch from IMAP
+                        let folder_entries: Vec<(String, String, String)> = if let Some(cached) = cached_folders {
+                            debug!("Using {} cached folders, skipping LIST", cached.len());
+                            cached
+                        } else {
+                            match client.list_folders().await {
+                                Ok(folder_list) => {
+                                    folder_list.into_iter().map(|f| {
+                                        (f.full_path, f.name, folder_type_to_db_string(&f.folder_type))
+                                    }).collect()
+                                }
+                                Err(e) => {
+                                    warn!("Failed to list folders: {}", e);
+                                    Vec::new()
+                                }
                             }
-                            Err(e) => {
-                                let _ = client.logout().await;
-                                Err(format!("Failed to select INBOX: {}", e))
+                        };
+
+                        // Batch STATUS for all folders (pipelined)
+                        let folder_paths: Vec<&str> = folder_entries.iter().map(|(p, _, _)| p.as_str()).collect();
+                        let status_results = client
+                            .batch_folder_status(&folder_paths)
+                            .await
+                            .unwrap_or_default();
+
+                        // Build SyncedFolder list and extract inbox count
+                        let mut folders = Vec::new();
+                        let mut inbox_count: usize = 0;
+                        for (path, msg_count, unseen) in &status_results {
+                            let (_, name, ft) = folder_entries.iter()
+                                .find(|(p, _, _)| p == path)
+                                .cloned()
+                                .unwrap_or_else(|| (path.clone(), path.clone(), "other".to_string()));
+                            if path.eq_ignore_ascii_case("INBOX") {
+                                inbox_count = *msg_count as usize;
                             }
+                            folders.push(SyncedFolder {
+                                name,
+                                full_path: path.clone(),
+                                folder_type: ft,
+                                message_count: *msg_count,
+                                unseen_count: *unseen,
+                            });
                         }
+
+                        let _ = client.logout().await;
+                        Ok(SyncResult { inbox_count, folders })
                     }
                     Err(e) => Err(format!("Auth failed: {}", e)),
                 }
@@ -826,7 +1064,15 @@ impl NorthMailApplication {
     }
 
     /// Fetch inbox messages asynchronously using password auth (for iCloud, generic IMAP)
-    async fn fetch_inbox_password_async(host: String, username: String, password: String) -> Result<usize, String> {
+    /// If cached_folders is Some, skip list_folders() and use cached folder paths for STATUS.
+    /// No pipelining available (async-imap doesn't expose raw stream), but we skip list_folders()
+    /// when cached and get inbox count from STATUS instead of select_folder().
+    async fn fetch_inbox_password_async(
+        host: String,
+        username: String,
+        password: String,
+        cached_folders: Option<Vec<(String, String, String)>>,
+    ) -> Result<SyncResult, String> {
         let (sender, receiver) = std::sync::mpsc::channel();
 
         std::thread::spawn(move || {
@@ -837,17 +1083,46 @@ impl NorthMailApplication {
                     Ok(_) => {
                         debug!("IMAP connected for {}", username);
 
-                        match client.select_folder("INBOX").await {
-                            Ok(folder_info) => {
-                                let count = folder_info.message_count.unwrap_or(0) as usize;
-                                let _ = client.logout().await;
-                                Ok(count)
+                        // Get folder list: use cache or fetch from IMAP
+                        let folder_entries: Vec<(String, String, String)> = if let Some(cached) = cached_folders {
+                            debug!("Using {} cached folders, skipping LIST", cached.len());
+                            cached
+                        } else {
+                            match client.list_folders().await {
+                                Ok(folder_list) => {
+                                    folder_list.into_iter().map(|f| {
+                                        (f.full_path, f.name, folder_type_to_db_string(&f.folder_type))
+                                    }).collect()
+                                }
+                                Err(e) => {
+                                    warn!("Failed to list folders: {}", e);
+                                    Vec::new()
+                                }
                             }
-                            Err(e) => {
-                                let _ = client.logout().await;
-                                Err(format!("Failed to select INBOX: {}", e))
+                        };
+
+                        // Get STATUS for each folder (no pipelining with async-imap)
+                        let mut folders = Vec::new();
+                        let mut inbox_count: usize = 0;
+                        for (full_path, name, ft) in &folder_entries {
+                            let (msg_count, unseen) = client
+                                .folder_status(full_path)
+                                .await
+                                .unwrap_or((0, 0));
+                            if full_path.eq_ignore_ascii_case("INBOX") {
+                                inbox_count = msg_count as usize;
                             }
+                            folders.push(SyncedFolder {
+                                name: name.clone(),
+                                full_path: full_path.clone(),
+                                folder_type: ft.clone(),
+                                message_count: msg_count,
+                                unseen_count: unseen,
+                            });
                         }
+
+                        let _ = client.logout().await;
+                        Ok(SyncResult { inbox_count, folders })
                     }
                     Err(e) => Err(format!("Auth failed: {}", e)),
                 }
@@ -856,18 +1131,91 @@ impl NorthMailApplication {
             let _ = sender.send(result);
         });
 
-        // Use glib timeout to poll the channel without blocking the main thread
-        loop {
-            match receiver.try_recv() {
-                Ok(result) => return result,
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    glib::timeout_future(std::time::Duration::from_millis(50)).await;
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return Err("Thread panicked".to_string());
-                }
-            }
+        Self::poll_result_channel(receiver).await
+    }
+
+    /// Build sidebar folder list for an account from the database cache.
+    /// Returns a Vec<FolderInfo> from cached folders, or a fallback with just INBOX.
+    fn build_sidebar_folders(
+        db_folders: &[northmail_core::models::DbFolder],
+    ) -> Vec<crate::widgets::FolderInfo> {
+        if db_folders.is_empty() {
+            // Fallback: show just INBOX until real folders are synced
+            return vec![crate::widgets::FolderInfo {
+                name: "Inbox".to_string(),
+                full_path: "INBOX".to_string(),
+                icon_name: "mail-inbox-symbolic".to_string(),
+                unread_count: Some(0),
+                is_header: false,
+            }];
         }
+
+        let mut folders: Vec<crate::widgets::FolderInfo> = db_folders
+            .iter()
+            // Skip INBOX since it's shown as the top-level account row
+            .filter(|f| f.folder_type != "inbox")
+            .map(|f| crate::widgets::FolderInfo {
+                name: f.name.clone(),
+                full_path: f.full_path.clone(),
+                icon_name: folder_type_to_icon(&f.folder_type).to_string(),
+                unread_count: f.unread_count.map(|c| c as u32),
+                is_header: false,
+            })
+            .collect();
+
+        // Sort: known types first by priority, then alphabetical for "other" folders
+        folders.sort_by(|a, b| {
+            let type_a = db_folders
+                .iter()
+                .find(|f| f.full_path == a.full_path)
+                .map(|f| f.folder_type.as_str())
+                .unwrap_or("other");
+            let type_b = db_folders
+                .iter()
+                .find(|f| f.full_path == b.full_path)
+                .map(|f| f.folder_type.as_str())
+                .unwrap_or("other");
+
+            let key_a = folder_type_sort_key(type_a);
+            let key_b = folder_type_sort_key(type_b);
+
+            key_a.cmp(&key_b).then_with(|| a.name.cmp(&b.name))
+        });
+
+        folders
+    }
+
+    /// Load cached folders for all accounts from the database (blocking, runs tokio in thread)
+    fn load_cached_folders_for_accounts(
+        db: &std::sync::Arc<northmail_core::Database>,
+        accounts: &[northmail_auth::GoaAccount],
+    ) -> std::collections::HashMap<String, Vec<northmail_core::models::DbFolder>> {
+        let db = db.clone();
+        let account_ids: Vec<String> = accounts.iter().map(|a| a.id.clone()).collect();
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async {
+                let mut map = std::collections::HashMap::new();
+                for account_id in &account_ids {
+                    match db.get_folders(account_id).await {
+                        Ok(folders) => {
+                            map.insert(account_id.clone(), folders);
+                        }
+                        Err(e) => {
+                            warn!("Failed to load cached folders for {}: {}", account_id, e);
+                        }
+                    }
+                }
+                map
+            });
+            let _ = sender.send(result);
+        });
+
+        let timeout = std::time::Duration::from_secs(2);
+        receiver.recv_timeout(timeout).unwrap_or_default()
     }
 
     /// Update sidebar with accounts from GOA
@@ -900,18 +1248,21 @@ impl NorthMailApplication {
                             }
 
                             if is_unified {
-                                // TODO: Implement unified inbox fetching from all accounts
-                                app.show_toast("Unified inbox not yet implemented");
+                                app.fetch_unified_inbox();
                             } else {
                                 app.fetch_folder(account_id, folder_path);
                             }
                         },
                     );
 
+                    // Load cached folders from database
+                    let cached_folders_map = self.database()
+                        .map(|db| Self::load_cached_folders_for_accounts(db, accounts))
+                        .unwrap_or_default();
+
                     let account_folders: Vec<crate::widgets::AccountFolders> = accounts
                         .iter()
                         .map(|account| {
-                            // Check if this is a supported account
                             let is_supported = Self::is_supported_account(account);
                             let email_display = if is_supported {
                                 account.email.clone()
@@ -919,65 +1270,77 @@ impl NorthMailApplication {
                                 format!("{} (unsupported)", account.email)
                             };
 
+                            let db_folders = cached_folders_map
+                                .get(&account.id)
+                                .map(|v: &Vec<northmail_core::models::DbFolder>| v.as_slice())
+                                .unwrap_or(&[]);
+
+                            let inbox_unread = db_folders
+                                .iter()
+                                .find(|f| f.folder_type == "inbox")
+                                .and_then(|f| f.unread_count)
+                                .map(|c| c as u32);
+
                             crate::widgets::AccountFolders {
                                 id: account.id.clone(),
                                 email: email_display,
-                                inbox_unread: Some(0), // TODO: Get from sync
-                                folders: vec![
-                                    crate::widgets::FolderInfo {
-                                        name: "Inbox".to_string(),
-                                        full_path: "INBOX".to_string(),
-                                        icon_name: "mail-inbox-symbolic".to_string(),
-                                        unread_count: Some(0),
-                                        is_header: false,
-                                    },
-                                    crate::widgets::FolderInfo {
-                                        name: "Sent".to_string(),
-                                        full_path: "[Gmail]/Sent Mail".to_string(),
-                                        icon_name: "mail-send-symbolic".to_string(),
-                                        unread_count: None,
-                                        is_header: false,
-                                    },
-                                    crate::widgets::FolderInfo {
-                                        name: "Drafts".to_string(),
-                                        full_path: "[Gmail]/Drafts".to_string(),
-                                        icon_name: "document-edit-symbolic".to_string(),
-                                        unread_count: None,
-                                        is_header: false,
-                                    },
-                                    crate::widgets::FolderInfo {
-                                        name: "Starred".to_string(),
-                                        full_path: "[Gmail]/Starred".to_string(),
-                                        icon_name: "starred-symbolic".to_string(),
-                                        unread_count: None,
-                                        is_header: false,
-                                    },
-                                    crate::widgets::FolderInfo {
-                                        name: "Spam".to_string(),
-                                        full_path: "[Gmail]/Spam".to_string(),
-                                        icon_name: "mail-mark-junk-symbolic".to_string(),
-                                        unread_count: None,
-                                        is_header: false,
-                                    },
-                                    crate::widgets::FolderInfo {
-                                        name: "Trash".to_string(),
-                                        full_path: "[Gmail]/Trash".to_string(),
-                                        icon_name: "user-trash-symbolic".to_string(),
-                                        unread_count: None,
-                                        is_header: false,
-                                    },
-                                    crate::widgets::FolderInfo {
-                                        name: "All Mail".to_string(),
-                                        full_path: "[Gmail]/All Mail".to_string(),
-                                        icon_name: "mail-read-symbolic".to_string(),
-                                        unread_count: None,
-                                        is_header: false,
-                                    },
-                                ],
+                                inbox_unread,
+                                folders: Self::build_sidebar_folders(db_folders),
                             }
                         })
                         .collect();
 
+                    sidebar.set_accounts(account_folders);
+                }
+            }
+        }
+    }
+
+    /// Refresh sidebar folder list from database (without re-connecting signal handlers)
+    fn refresh_sidebar_folders(&self) {
+        let accounts = self.imp().accounts.borrow().clone();
+        if accounts.is_empty() {
+            return;
+        }
+
+        let cached_folders_map = self
+            .database()
+            .map(|db| Self::load_cached_folders_for_accounts(db, &accounts))
+            .unwrap_or_default();
+
+        let account_folders: Vec<crate::widgets::AccountFolders> = accounts
+            .iter()
+            .map(|account| {
+                let is_supported = Self::is_supported_account(account);
+                let email_display = if is_supported {
+                    account.email.clone()
+                } else {
+                    format!("{} (unsupported)", account.email)
+                };
+
+                let db_folders = cached_folders_map
+                    .get(&account.id)
+                    .map(|v: &Vec<northmail_core::models::DbFolder>| v.as_slice())
+                    .unwrap_or(&[]);
+
+                let inbox_unread = db_folders
+                    .iter()
+                    .find(|f| f.folder_type == "inbox")
+                    .and_then(|f| f.unread_count)
+                    .map(|c| c as u32);
+
+                crate::widgets::AccountFolders {
+                    id: account.id.clone(),
+                    email: email_display,
+                    inbox_unread,
+                    folders: Self::build_sidebar_folders(db_folders),
+                }
+            })
+            .collect();
+
+        if let Some(window) = self.active_window() {
+            if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                if let Some(sidebar) = win.folder_sidebar() {
                     sidebar.set_accounts(account_folders);
                 }
             }
@@ -1053,7 +1416,11 @@ impl NorthMailApplication {
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(db.get_message_count(folder_id));
+            let result = if folder_id == -1 {
+                rt.block_on(db.get_inbox_message_count())
+            } else {
+                rt.block_on(db.get_message_count(folder_id))
+            };
             let _ = sender.send(result);
         });
 
@@ -1085,16 +1452,52 @@ impl NorthMailApplication {
             }
         };
 
+        // Read current filter state from the message list
+        let filter = if let Some(window) = self.active_window() {
+            if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                win.message_list().map(|ml| ml.get_message_filter())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let filter = filter.unwrap_or_default();
+
         let app = self.clone();
 
         glib::spawn_future_local(async move {
             let (sender, receiver) = std::sync::mpsc::channel();
+            let f = filter.clone();
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 let result = rt.block_on(async {
-                    let messages = db.get_messages(folder_id, batch_size, offset).await?;
-                    let total = db.get_message_count(folder_id).await?;
+                    let (messages, total) = if f.is_active() {
+                        let msgs = if folder_id == -1 {
+                            db.get_inbox_messages_filtered(batch_size, offset, &f).await?
+                        } else {
+                            db.get_messages_filtered(folder_id, batch_size, offset, &f).await?
+                        };
+                        let count = if folder_id == -1 {
+                            db.get_inbox_messages_filtered_count(&f).await?
+                        } else {
+                            db.get_messages_filtered_count(folder_id, &f).await?
+                        };
+                        (msgs, count)
+                    } else {
+                        let msgs = if folder_id == -1 {
+                            db.get_inbox_messages(batch_size, offset).await?
+                        } else {
+                            db.get_messages(folder_id, batch_size, offset).await?
+                        };
+                        let count = if folder_id == -1 {
+                            db.get_inbox_message_count().await?
+                        } else {
+                            db.get_message_count(folder_id).await?
+                        };
+                        (msgs, count)
+                    };
                     Ok::<_, northmail_core::CoreError>((messages, total))
                 });
                 let _ = sender.send(result);
@@ -1182,20 +1585,6 @@ impl NorthMailApplication {
                 let db_messages: Vec<northmail_core::models::DbMessage> = messages
                     .iter()
                     .map(|msg| {
-                        let date_epoch = {
-                            let mut date_str = msg.date.clone();
-                            if let Some(paren) = date_str.rfind('(') {
-                                date_str = date_str[..paren].trim().to_string();
-                            }
-                            while date_str.contains("  ") {
-                                date_str = date_str.replace("  ", " ");
-                            }
-                            date_str = date_str.replace(" ,", ",");
-                            chrono::DateTime::parse_from_rfc2822(&date_str)
-                                .map(|dt| dt.timestamp())
-                                .ok()
-                        };
-
                         northmail_core::models::DbMessage {
                             id: 0,
                             folder_id,
@@ -1206,7 +1595,7 @@ impl NorthMailApplication {
                             from_name: None,
                             to_addresses: None,
                             date_sent: Some(msg.date.clone()),
-                            date_epoch,
+                            date_epoch: msg.date_epoch,
                             snippet: msg.snippet.clone(),
                             is_read: msg.is_read,
                             is_starred: msg.is_starred,
@@ -1607,11 +1996,11 @@ impl NorthMailApplication {
 
         std::thread::spawn(move || {
             async_std::task::block_on(async {
-                let mut client = ImapClient::new(&host, 993);
+                let mut client = SimpleImapClient::new();
 
-                match client.authenticate_login(&username, &password).await {
+                match client.connect_login(&host, 993, &username, &password).await {
                     Ok(_) => {
-                        Self::fetch_streaming_imap(&mut client, &folder_path_clone, &sender).await;
+                        Self::fetch_streaming(&mut client, &folder_path_clone, &sender, true).await;
                     }
                     Err(e) => {
                         let _ = sender.send(FetchEvent::Error(format!("Authentication failed: {}", e)));
@@ -1730,80 +2119,6 @@ impl NorthMailApplication {
                     }
 
                     tracing::info!("Background sync complete: {} messages synced", synced);
-                    let _ = sender.send(FetchEvent::FullSyncDone { total_synced: synced });
-                } else {
-                    let _ = sender.send(FetchEvent::FullSyncDone { total_synced: count });
-                }
-
-                let _ = client.logout().await;
-            }
-            Err(e) => {
-                let _ = client.logout().await;
-                let _ = sender.send(FetchEvent::Error(format!("Failed to select folder: {}", e)));
-            }
-        }
-    }
-
-    /// Common streaming fetch using ImapClient (password auth)
-    /// Also does full background sync like fetch_streaming
-    async fn fetch_streaming_imap(
-        client: &mut ImapClient,
-        folder_path: &str,
-        sender: &std::sync::mpsc::Sender<FetchEvent>,
-    ) {
-        match client.select_folder(folder_path).await {
-            Ok(folder_info) => {
-                let count = folder_info.message_count.unwrap_or(0);
-                let _ = sender.send(FetchEvent::FolderInfo { total_count: count });
-
-                if count == 0 {
-                    let _ = sender.send(FetchEvent::InitialBatchDone { lowest_seq: 0 });
-                    let _ = sender.send(FetchEvent::FullSyncDone { total_synced: 0 });
-                    let _ = client.logout().await;
-                    return;
-                }
-
-                // Phase 1: Initial batch for display
-                const INITIAL_BATCH: u32 = 50;
-                let initial_start = if count > INITIAL_BATCH { count - INITIAL_BATCH + 1 } else { 1 };
-                let range = format!("{}:{}", initial_start, count);
-
-                match client.fetch_headers(&range).await {
-                    Ok(headers) => {
-                        let messages = Self::headers_to_message_info(&headers);
-                        let _ = sender.send(FetchEvent::Messages(messages));
-                        let _ = sender.send(FetchEvent::InitialBatchDone { lowest_seq: initial_start });
-                    }
-                    Err(e) => {
-                        let _ = sender.send(FetchEvent::Error(format!("Fetch failed: {}", e)));
-                        let _ = client.logout().await;
-                        return;
-                    }
-                }
-
-                // Phase 2: Background sync remaining messages
-                if initial_start > 1 {
-                    let mut synced = INITIAL_BATCH.min(count);
-                    let mut current_end = initial_start - 1;
-                    const BACKGROUND_BATCH: u32 = 500;
-
-                    while current_end > 0 {
-                        let batch_start = if current_end > BACKGROUND_BATCH {
-                            current_end - BACKGROUND_BATCH + 1
-                        } else {
-                            1
-                        };
-
-                        let range = format!("{}:{}", batch_start, current_end);
-                        if let Ok(headers) = client.fetch_headers(&range).await {
-                            let messages = Self::headers_to_message_info(&headers);
-                            synced += messages.len() as u32;
-                            let _ = sender.send(FetchEvent::BackgroundMessages(messages));
-                            let _ = sender.send(FetchEvent::SyncProgress { synced, total: count });
-                        }
-                        current_end = batch_start - 1;
-                    }
-
                     let _ = sender.send(FetchEvent::FullSyncDone { total_synced: synced });
                 } else {
                     let _ = sender.send(FetchEvent::FullSyncDone { total_synced: count });
@@ -2212,11 +2527,11 @@ impl NorthMailApplication {
 
         std::thread::spawn(move || {
             async_std::task::block_on(async {
-                let mut client = ImapClient::new(&host, 993);
+                let mut client = SimpleImapClient::new();
 
-                match client.authenticate_login(&username, &password).await {
+                match client.connect_login(&host, 993, &username, &password).await {
                     Ok(_) => {
-                        Self::fetch_more_imap(&mut client, &state_for_thread, &sender).await;
+                        Self::fetch_more(&mut client, &state_for_thread, &sender).await;
                     }
                     Err(e) => {
                         let _ = sender.send(FetchEvent::Error(format!("Auth failed: {}", e)));
@@ -2235,42 +2550,6 @@ impl NorthMailApplication {
         sender: &std::sync::mpsc::Sender<FetchEvent>,
     ) {
         match client.select(&state.folder_path).await {
-            Ok(_) => {
-                if state.lowest_seq > 1 {
-                    let end = state.lowest_seq - 1;
-                    let start = if end > state.batch_size { end - state.batch_size + 1 } else { 1 };
-                    let range = format!("{}:{}", start, end);
-
-                    match client.fetch_headers(&range).await {
-                        Ok(headers) => {
-                            let messages = Self::headers_to_message_info(&headers);
-                            let _ = sender.send(FetchEvent::Messages(messages));
-                            let _ = sender.send(FetchEvent::InitialBatchDone { lowest_seq: start });
-                        }
-                        Err(e) => {
-                            let _ = sender.send(FetchEvent::Error(format!("Fetch failed: {}", e)));
-                        }
-                    }
-                } else {
-                    let _ = sender.send(FetchEvent::InitialBatchDone { lowest_seq: 0 });
-                }
-
-                let _ = client.logout().await;
-            }
-            Err(e) => {
-                let _ = client.logout().await;
-                let _ = sender.send(FetchEvent::Error(format!("Select failed: {}", e)));
-            }
-        }
-    }
-
-    /// Fetch more older messages using ImapClient
-    async fn fetch_more_imap(
-        client: &mut ImapClient,
-        state: &FolderLoadState,
-        sender: &std::sync::mpsc::Sender<FetchEvent>,
-    ) {
-        match client.select_folder(&state.folder_path).await {
             Ok(_) => {
                 if state.lowest_seq > 1 {
                     let end = state.lowest_seq - 1;
@@ -2369,55 +2648,329 @@ impl NorthMailApplication {
         headers
             .iter()
             .rev()
-            .map(|h| MessageInfo {
-                id: h.uid as i64,
-                uid: h.uid,
-                subject: decode_mime_header(&h.envelope.subject.clone().unwrap_or_default()),
-                from: h
-                    .envelope
-                    .from
-                    .first()
-                    .map(|a| {
-                        if let Some(name) = &a.name {
-                            decode_mime_header(name)
-                        } else {
-                            a.address.clone()
-                        }
-                    })
-                    .unwrap_or_default(),
-                date: h.envelope.date.clone().unwrap_or_default(),
-                snippet: None,
-                is_read: h.is_read(),
-                is_starred: h.is_starred(),
-                has_attachments: h.has_attachments,
+            .map(|h| {
+                let date = h.envelope.date.clone().unwrap_or_default();
+                let date_epoch = Self::parse_date_epoch(&date);
+                MessageInfo {
+                    id: h.uid as i64,
+                    uid: h.uid,
+                    folder_id: 0,
+                    subject: decode_mime_header(&h.envelope.subject.clone().unwrap_or_default()),
+                    from: h
+                        .envelope
+                        .from
+                        .first()
+                        .map(|a| {
+                            if let Some(name) = &a.name {
+                                decode_mime_header(name)
+                            } else {
+                                a.address.clone()
+                            }
+                        })
+                        .unwrap_or_default(),
+                    to: h.envelope.to.iter()
+                        .map(|a| {
+                            if let Some(name) = &a.name {
+                                decode_mime_header(name)
+                            } else {
+                                a.address.clone()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    date,
+                    date_epoch,
+                    snippet: None,
+                    is_read: h.is_read(),
+                    is_starred: h.is_starred(),
+                    has_attachments: h.has_attachments,
+                }
             })
             .collect()
     }
 
+    /// Whether we are currently in unified inbox mode
+    pub fn is_unified_mode(&self) -> bool {
+        self.imp().cache_folder_id.get() == -1
+    }
+
+    /// Resolve a folder_id to (account_id, folder_path) via DB lookup
+    /// Used in unified inbox mode to find which account/folder a message belongs to
+    pub fn resolve_folder_info(&self, folder_id: i64) -> Option<(String, String)> {
+        let db = self.database()?.clone();
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(db.get_folder_by_id(folder_id));
+            let _ = sender.send(result);
+        });
+
+        match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(Ok(Some(folder))) => Some((folder.account_id, folder.full_path)),
+            _ => None,
+        }
+    }
+
+    /// Fetch and display unified inbox (all inbox folders across all accounts)
+    pub fn fetch_unified_inbox(&self) {
+        let app = self.clone();
+
+        // Set state
+        {
+            let mut state = self.imp().state.borrow_mut();
+            state.unified_inbox = true;
+            state.last_folder = None;
+            state.save();
+        }
+
+        // Clear previous load state and set unified sentinel
+        self.imp().folder_load_state.replace(None);
+        self.imp().cache_offset.set(0);
+        self.imp().cache_folder_id.set(-1);
+
+        // Increment fetch generation
+        let generation = self.imp().fetch_generation.get() + 1;
+        self.imp().fetch_generation.set(generation);
+
+        let db = match self.database() {
+            Some(db) => db.clone(),
+            None => {
+                self.show_error("Database not available");
+                return;
+            }
+        };
+
+        glib::spawn_future_local(async move {
+            info!("Fetching unified inbox (all accounts)");
+
+            let (sender, receiver) = std::sync::mpsc::channel();
+
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result = rt.block_on(async {
+                    let messages = db.get_inbox_messages(100, 0).await?;
+                    let total = db.get_inbox_message_count().await?;
+                    Ok::<_, northmail_core::CoreError>((messages, total))
+                });
+                let _ = sender.send(result);
+            });
+
+            // Poll for result
+            let result = loop {
+                match receiver.try_recv() {
+                    Ok(result) => break Some(result),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        glib::timeout_future(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break None,
+                }
+            };
+
+            match result {
+                Some(Ok((messages, total))) => {
+                    let loaded_count = messages.len() as i64;
+                    info!(
+                        "Unified inbox: loaded {} of {} messages",
+                        loaded_count, total
+                    );
+
+                    app.imp().cache_offset.set(loaded_count);
+
+                    let message_infos: Vec<MessageInfo> =
+                        messages.iter().map(MessageInfo::from).collect();
+
+                    if let Some(window) = app.active_window() {
+                        if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                            win.restore_message_list();
+                            if let Some(message_list) = win.message_list() {
+                                message_list.set_messages(message_infos);
+
+                                // Wire up "load more" from cache
+                                let app_clone = app.clone();
+                                message_list.connect_load_more(move || {
+                                    app_clone.load_more_from_cache();
+                                });
+
+                                // Check if there are more messages in cache
+                                let has_more = loaded_count < total;
+                                message_list.set_can_load_more(has_more);
+                            }
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    error!("Failed to load unified inbox: {}", e);
+                    app.show_error(&format!("Failed to load inbox: {}", e));
+                }
+                None => {
+                    warn!("Unified inbox load channel disconnected");
+                }
+            }
+        });
+    }
+
+    /// Handle filter-changed: re-query DB with current filter state
+    pub fn handle_filter_changed(&self) {
+        let folder_id = self.imp().cache_folder_id.get();
+        if folder_id == 0 {
+            return;
+        }
+
+        let db = match self.database() {
+            Some(db) => db.clone(),
+            None => return,
+        };
+
+        // Read filter state from the message list widget
+        let filter = if let Some(window) = self.active_window() {
+            if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                if let Some(message_list) = win.message_list() {
+                    message_list.get_message_filter()
+                } else {
+                    return;
+                }
+            } else {
+                return;
+            }
+        } else {
+            return;
+        };
+
+        let batch_size: i64 = 100;
+        let app = self.clone();
+
+        glib::spawn_future_local(async move {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let fid = folder_id;
+            let f = filter.clone();
+
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result = rt.block_on(async {
+                    let (messages, total) = if f.is_active() {
+                        let msgs = if fid == -1 {
+                            db.get_inbox_messages_filtered(batch_size, 0, &f).await?
+                        } else {
+                            db.get_messages_filtered(fid, batch_size, 0, &f).await?
+                        };
+                        let count = if fid == -1 {
+                            db.get_inbox_messages_filtered_count(&f).await?
+                        } else {
+                            db.get_messages_filtered_count(fid, &f).await?
+                        };
+                        (msgs, count)
+                    } else {
+                        // No filter active: reload default page
+                        let msgs = if fid == -1 {
+                            db.get_inbox_messages(batch_size, 0).await?
+                        } else {
+                            db.get_messages(fid, batch_size, 0).await?
+                        };
+                        let count = if fid == -1 {
+                            db.get_inbox_message_count().await?
+                        } else {
+                            db.get_message_count(fid).await?
+                        };
+                        (msgs, count)
+                    };
+                    Ok::<_, northmail_core::CoreError>((messages, total))
+                });
+                let _ = sender.send(result);
+            });
+
+            let result = loop {
+                match receiver.try_recv() {
+                    Ok(result) => break Some(result),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        glib::timeout_future(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break None,
+                }
+            };
+
+            match result {
+                Some(Ok((messages, total))) => {
+                    let loaded = messages.len() as i64;
+                    debug!("Filter query: {} results of {} total (filter_active={})",
+                        loaded, total, filter.is_active());
+
+                    app.imp().cache_offset.set(loaded);
+
+                    let infos: Vec<MessageInfo> =
+                        messages.iter().map(MessageInfo::from).collect();
+
+                    if let Some(window) = app.active_window() {
+                        if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                            if let Some(message_list) = win.message_list() {
+                                message_list.set_messages(infos);
+                                message_list.set_can_load_more(loaded < total);
+                            }
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    error!("Filter query failed: {}", e);
+                }
+                None => {
+                    warn!("Filter query channel disconnected");
+                }
+            }
+        });
+    }
+
+    /// Parse an RFC 2822 date string into a Unix timestamp
+    fn parse_date_epoch(date_str: &str) -> Option<i64> {
+        let mut s = date_str.to_string();
+        if let Some(paren) = s.rfind('(') {
+            s = s[..paren].trim().to_string();
+        }
+        while s.contains("  ") {
+            s = s.replace("  ", " ");
+        }
+        s = s.replace(" ,", ",");
+        chrono::DateTime::parse_from_rfc2822(&s)
+            .map(|dt| dt.timestamp())
+            .ok()
+    }
+
     /// Fetch a message body by UID
-    pub fn fetch_message_body(&self, uid: u32, callback: impl FnOnce(Result<ParsedEmailBody, String>) + 'static) {
+    pub fn fetch_message_body(&self, uid: u32, msg_folder_id: Option<i64>, callback: impl FnOnce(Result<ParsedEmailBody, String>) + 'static) {
+        // Resolve account_id and folder_path: use folder_load_state if available,
+        // otherwise resolve from msg_folder_id (unified inbox mode)
         let load_state = self.imp().folder_load_state.borrow().clone();
-        let Some(state) = load_state else {
-            error!("fetch_message_body: No folder_load_state set!");
+        let (resolved_account_id, resolved_folder_path) = if let Some(ref state) = load_state {
+            (state.account_id.clone(), state.folder_path.clone())
+        } else if let Some(fid) = msg_folder_id {
+            match self.resolve_folder_info(fid) {
+                Some((aid, fp)) => (aid, fp),
+                None => {
+                    error!("fetch_message_body: Could not resolve folder_id {}", fid);
+                    callback(Err("Could not resolve folder".to_string()));
+                    return;
+                }
+            }
+        } else {
+            error!("fetch_message_body: No folder_load_state and no msg_folder_id!");
             callback(Err("No folder selected".to_string()));
             return;
         };
 
-        info!("fetch_message_body: uid={}, account={}, folder={}", uid, state.account_id, state.folder_path);
+        info!("fetch_message_body: uid={}, account={}, folder={}", uid, resolved_account_id, resolved_folder_path);
 
         let accounts = self.imp().accounts.borrow().clone();
-        let account = match accounts.iter().find(|a| a.id == state.account_id) {
+        let account = match accounts.iter().find(|a| a.id == resolved_account_id) {
             Some(a) => a.clone(),
             None => {
                 error!("fetch_message_body: Account not found! Looking for '{}', have: {:?}",
-                    state.account_id,
+                    resolved_account_id,
                     accounts.iter().map(|a| &a.id).collect::<Vec<_>>());
                 callback(Err("Account not found".to_string()));
                 return;
             }
         };
 
-        let folder_path = state.folder_path.clone();
+        let folder_path = resolved_folder_path;
         let is_google = Self::is_google_account(&account);
         let is_microsoft = Self::is_microsoft_account(&account);
         let imap_host = account.imap_host.clone();
@@ -2865,9 +3418,10 @@ impl NorthMailApplication {
 
         if let Some(boundary) = boundary {
             // Multipart message - find text/plain and text/html parts
+            // Skip first element (preamble before first boundary marker)
             let parts: Vec<&str> = raw.split(&format!("--{}", boundary)).collect();
 
-            for part in parts {
+            for part in parts.iter().skip(1) {
                 let part = part.trim();
                 if part.is_empty() || part == "--" || part.starts_with("--") {
                     continue;
@@ -2879,22 +3433,21 @@ impl NorthMailApplication {
 
                 // Split headers from body - headers end at first blank line
                 let body = Self::extract_body_after_headers(part);
-                if body.is_empty() {
-                    continue;
-                }
-
-                let decoded = Self::decode_body_content(&body, transfer_encoding.as_deref());
 
                 if let Some(ct) = &content_type {
                     let ct_lower = ct.to_lowercase();
                     if ct_lower.contains("text/plain") && result.text.is_none() {
-                        result.text = Some(decoded);
+                        if !body.is_empty() {
+                            result.text = Some(Self::decode_body_content(&body, transfer_encoding.as_deref()));
+                        }
                     } else if ct_lower.contains("text/html") && result.html.is_none() {
-                        result.html = Some(decoded);
-                    } else if ct_lower.contains("multipart/alternative") {
-                        // Nested multipart - parse recursively
-                        if let Some(nested_boundary) = Self::find_boundary_in_header(&ct) {
-                            let nested = Self::parse_multipart_alternative(part, &nested_boundary);
+                        if !body.is_empty() {
+                            result.html = Some(Self::decode_body_content(&body, transfer_encoding.as_deref()));
+                        }
+                    } else if ct_lower.contains("multipart/") {
+                        // Any nested multipart (alternative, related, mixed) - parse recursively
+                        if let Some(nested_boundary) = Self::find_boundary_in_header(ct) {
+                            let nested = Self::parse_multipart_recursive(part, &nested_boundary);
                             if result.text.is_none() && nested.text.is_some() {
                                 result.text = nested.text;
                             }
@@ -2903,7 +3456,15 @@ impl NorthMailApplication {
                             }
                         }
                     }
+                } else if body.is_empty() {
+                    continue;
                 }
+            }
+
+            // Log when parsing yields no content for debugging
+            if result.text.is_none() && result.html.is_none() {
+                let top_ct = Self::find_part_header(raw, "Content-Type").unwrap_or_default();
+                warn!("parse_email_body: No text/html found! Top Content-Type: {}", top_ct);
             }
         } else {
             // Single part message
@@ -2931,12 +3492,13 @@ impl NorthMailApplication {
         result
     }
 
-    /// Parse a multipart/alternative section
-    fn parse_multipart_alternative(content: &str, boundary: &str) -> ParsedEmailBody {
+    /// Parse a nested multipart section (alternative, related, mixed, etc.)
+    fn parse_multipart_recursive(content: &str, boundary: &str) -> ParsedEmailBody {
         let mut result = ParsedEmailBody::default();
+        // Skip first element (preamble before first boundary marker)
         let parts: Vec<&str> = content.split(&format!("--{}", boundary)).collect();
 
-        for part in parts {
+        for part in parts.iter().skip(1) {
             let part = part.trim();
             if part.is_empty() || part == "--" || part.starts_with("--") {
                 continue;
@@ -2946,18 +3508,28 @@ impl NorthMailApplication {
             let transfer_encoding = Self::find_part_header(part, "Content-Transfer-Encoding");
 
             let body = Self::extract_body_after_headers(part);
-            if body.is_empty() {
-                continue;
-            }
-
-            let decoded = Self::decode_body_content(&body, transfer_encoding.as_deref());
 
             if let Some(ct) = &content_type {
                 let ct_lower = ct.to_lowercase();
                 if ct_lower.contains("text/plain") && result.text.is_none() {
-                    result.text = Some(decoded);
+                    if !body.is_empty() {
+                        result.text = Some(Self::decode_body_content(&body, transfer_encoding.as_deref()));
+                    }
                 } else if ct_lower.contains("text/html") && result.html.is_none() {
-                    result.html = Some(decoded);
+                    if !body.is_empty() {
+                        result.html = Some(Self::decode_body_content(&body, transfer_encoding.as_deref()));
+                    }
+                } else if ct_lower.contains("multipart/") {
+                    // Recursively parse nested multipart
+                    if let Some(nested_boundary) = Self::find_boundary_in_header(ct) {
+                        let nested = Self::parse_multipart_recursive(part, &nested_boundary);
+                        if result.text.is_none() && nested.text.is_some() {
+                            result.text = nested.text;
+                        }
+                        if result.html.is_none() && nested.html.is_some() {
+                            result.html = nested.html;
+                        }
+                    }
                 }
             }
         }
@@ -3530,6 +4102,25 @@ impl NorthMailApplication {
         let themes = gtk4::StringList::new(&["System", "Light", "Dark"]);
         theme_row.set_model(Some(&themes));
 
+        // Set initial selection to match current color scheme
+        let style_manager = adw::StyleManager::default();
+        let current = match style_manager.color_scheme() {
+            adw::ColorScheme::ForceLight => 1u32,
+            adw::ColorScheme::ForceDark => 2u32,
+            _ => 0u32, // Default/System
+        };
+        theme_row.set_selected(current);
+
+        // Wire up theme changes to AdwStyleManager
+        theme_row.connect_selected_notify(move |row| {
+            let scheme = match row.selected() {
+                1 => adw::ColorScheme::ForceLight,
+                2 => adw::ColorScheme::ForceDark,
+                _ => adw::ColorScheme::Default,
+            };
+            adw::StyleManager::default().set_color_scheme(scheme);
+        });
+
         appearance_group.add(&theme_row);
         general_page.add(&appearance_group);
 
@@ -3757,6 +4348,417 @@ impl NorthMailApplication {
         if let Some(window) = self.active_window() {
             dialog.present(Some(&window));
         }
+    }
+
+    /// Send a message via SMTP using the selected account
+    pub fn send_message(
+        &self,
+        account_index: u32,
+        to: Vec<String>,
+        cc: Vec<String>,
+        subject: String,
+        body: String,
+        callback: impl FnOnce(Result<(), String>) + 'static,
+    ) {
+        let accounts = self.imp().accounts.borrow().clone();
+        let account = match accounts.get(account_index as usize) {
+            Some(a) => a.clone(),
+            None => {
+                callback(Err("Invalid account selection".to_string()));
+                return;
+            }
+        };
+
+        let smtp_host = account.smtp_host.clone().unwrap_or_else(|| {
+            match account.provider_type.as_str() {
+                "google" => "smtp.gmail.com".to_string(),
+                "windows_live" | "microsoft" => "smtp.office365.com".to_string(),
+                _ => "smtp.mail.me.com".to_string(),
+            }
+        });
+
+        let account_id = account.id.clone();
+        let email = account.email.clone();
+        let auth_type = account.auth_type.clone();
+
+        // Get user's display name from the system for From header
+        let real_name = glib::real_name().to_string_lossy().to_string();
+        let from_name = if real_name.is_empty() || real_name == "Unknown" {
+            None
+        } else {
+            Some(real_name)
+        };
+
+        eprintln!("[send] account: {} ({}) smtp: {} auth: {:?}", email, account.provider_type, smtp_host, auth_type);
+        eprintln!("[send] to: {:?}, cc: {:?}, subject: {:?}", to, cc, subject);
+        if let Some(ref name) = from_name {
+            eprintln!("[send] from_name: {:?}", name);
+        }
+
+        // Build OutgoingMessage
+        let mut msg = northmail_smtp::OutgoingMessage::new(&email, &subject);
+        if let Some(name) = from_name {
+            msg = msg.from_name(name);
+        }
+        for addr in &to {
+            msg = msg.to(addr);
+        }
+        for addr in &cc {
+            msg = msg.cc(addr);
+        }
+        msg = msg.text(&body);
+
+        // Spawn async task for sending
+        glib::spawn_future_local(async move {
+            let (sender, receiver) = std::sync::mpsc::channel();
+
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let result = async {
+                        let auth_manager = AuthManager::new().await
+                            .map_err(|e| format!("Auth init failed: {}", e))?;
+
+                        let smtp_client = northmail_smtp::SmtpClient::new(&smtp_host, 587);
+
+                        match auth_type {
+                            northmail_auth::GoaAuthType::OAuth2 => {
+                                let (email, token) = auth_manager
+                                    .get_xoauth2_token_for_goa(&account_id)
+                                    .await
+                                    .map_err(|e| format!("Failed to get token: {}", e))?;
+                                smtp_client
+                                    .send_xoauth2(&email, &token, msg)
+                                    .await
+                                    .map_err(|e| format!("Send failed: {}", e))
+                            }
+                            northmail_auth::GoaAuthType::Password => {
+                                let password = auth_manager
+                                    .get_goa_password(&account_id)
+                                    .await
+                                    .map_err(|e| format!("Failed to get password: {}", e))?;
+                                smtp_client
+                                    .send_password(&email, &password, msg)
+                                    .await
+                                    .map_err(|e| format!("Send failed: {}", e))
+                            }
+                            northmail_auth::GoaAuthType::Unknown => {
+                                Err("Unsupported auth type".to_string())
+                            }
+                        }
+                    }.await;
+                    match &result {
+                        Ok(()) => eprintln!("[send] success!"),
+                        Err(e) => eprintln!("[send] error: {}", e),
+                    }
+                    let _ = sender.send(result);
+                });
+            });
+
+            // Poll for result
+            let result = loop {
+                match receiver.try_recv() {
+                    Ok(result) => break result,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        break Err("Send thread crashed".to_string());
+                    }
+                }
+            };
+
+            callback(result);
+        });
+    }
+
+    /// Query EDS (Evolution Data Server) contacts matching a prefix
+    pub fn query_contacts(
+        &self,
+        prefix: String,
+        callback: impl FnOnce(Vec<(String, String)>) + 'static,
+    ) {
+        glib::spawn_future_local(async move {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let prefix_clone = prefix.clone();
+
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let results = Self::eds_query_contacts(&prefix_clone).await;
+                    let _ = sender.send(results);
+                });
+            });
+
+            let results = loop {
+                match receiver.try_recv() {
+                    Ok(results) => break results,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        glib::timeout_future(std::time::Duration::from_millis(20)).await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        break Vec::new();
+                    }
+                }
+            };
+
+            callback(results);
+        });
+    }
+
+    /// Query EDS address books via D-Bus for contacts matching a prefix
+    async fn eds_query_contacts(prefix: &str) -> Vec<(String, String)> {
+        let mut results = Vec::new();
+
+        let conn = match zbus::Connection::session().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[eds] session bus error: {}", e);
+                return results;
+            }
+        };
+
+        // Discover versioned EDS service names dynamically
+        let (sources_bus, addressbook_bus) = match Self::eds_discover_services(&conn).await {
+            Some(pair) => {
+                eprintln!("[eds] services: {} / {}", pair.0, pair.1);
+                pair
+            }
+            None => {
+                eprintln!("[eds] EDS services not found");
+                return results;
+            }
+        };
+
+        // Get address book source UIDs via ObjectManager
+        let source_uids = match Self::eds_get_address_book_uids(&conn, &sources_bus).await {
+            Ok(uids) => {
+                eprintln!("[eds] {} address books found", uids.len());
+                uids
+            }
+            Err(e) => {
+                eprintln!("[eds] get UIDs error: {}", e);
+                return results;
+            }
+        };
+
+        // Query each address book
+        let escaped = prefix.replace('\\', "\\\\").replace('\"', "\\\"");
+        let sexp = format!(
+            "(or (contains \"full_name\" \"{}\") (contains \"email\" \"{}\"))",
+            escaped, escaped
+        );
+
+        for uid in &source_uids {
+            match Self::eds_query_address_book(&conn, &addressbook_bus, uid, &sexp).await {
+                Ok(contacts) => {
+                    eprintln!("[eds] {} contacts from {}", contacts.len(), uid);
+                    results.extend(contacts);
+                }
+                Err(e) => {
+                    eprintln!("[eds] query error for {}: {}", uid, e);
+                }
+            }
+        }
+
+        // Deduplicate by email
+        results.sort_by(|a, b| a.1.cmp(&b.1));
+        results.dedup_by(|a, b| a.1 == b.1);
+        results
+    }
+
+    /// Discover versioned EDS D-Bus service names (e.g. Sources5, AddressBook10)
+    /// Returns (sources_bus_name, addressbook_bus_name) or None if unavailable
+    async fn eds_discover_services(conn: &zbus::Connection) -> Option<(String, String)> {
+        let dbus = zbus::fdo::DBusProxy::new(conn).await.ok()?;
+        let names = dbus.list_activatable_names().await.ok()?;
+
+        let mut sources_name = None;
+        let mut addressbook_name = None;
+
+        for name in &names {
+            let s = name.as_str();
+            if s.starts_with("org.gnome.evolution.dataserver.Sources") && sources_name.is_none() {
+                sources_name = Some(s.to_string());
+            }
+            if s.starts_with("org.gnome.evolution.dataserver.AddressBook") && !s.contains("Factory") && addressbook_name.is_none() {
+                addressbook_name = Some(s.to_string());
+            }
+        }
+
+        match (sources_name, addressbook_name) {
+            (Some(s), Some(a)) => {
+                debug!("Discovered EDS services: Sources={}, AddressBook={}", s, a);
+                Some((s, a))
+            }
+            _ => {
+                debug!("EDS services not found in activatable names");
+                None
+            }
+        }
+    }
+
+    /// Build a zbus Proxy with the given destination, path, and interface
+    async fn eds_build_proxy<'a>(
+        conn: &zbus::Connection,
+        destination: &'a str,
+        path: &'a str,
+        interface: &'a str,
+    ) -> Result<zbus::Proxy<'a>, String> {
+        zbus::proxy::Builder::<'a, zbus::Proxy<'a>>::new(conn)
+            .destination(destination)
+            .map_err(|e| e.to_string())?
+            .path(path)
+            .map_err(|e| e.to_string())?
+            .interface(interface)
+            .map_err(|e| e.to_string())?
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Get UIDs of EDS address books using ObjectManager.GetManagedObjects
+    async fn eds_get_address_book_uids(
+        conn: &zbus::Connection,
+        sources_bus: &str,
+    ) -> Result<Vec<String>, String> {
+        // Use ObjectManager to enumerate all sources
+        let obj_mgr = zbus::fdo::ObjectManagerProxy::builder(conn)
+            .destination(sources_bus)
+            .map_err(|e| e.to_string())?
+            .path("/org/gnome/evolution/dataserver/SourceManager")
+            .map_err(|e| e.to_string())?
+            .build()
+            .await
+            .map_err(|e| format!("Failed to build ObjectManager proxy: {}", e))?;
+
+        let objects = obj_mgr
+            .get_managed_objects()
+            .await
+            .map_err(|e| format!("GetManagedObjects failed: {}", e))?;
+
+        debug!("EDS ObjectManager returned {} objects", objects.len());
+
+        let mut uids = Vec::new();
+
+        for (path, interfaces) in &objects {
+            let source_iface = interfaces.get("org.gnome.evolution.dataserver.Source");
+            let source_props = match source_iface {
+                Some(props) => props,
+                None => continue,
+            };
+
+            let uid = source_props
+                .get("UID")
+                .and_then(|v| <String as TryFrom<zbus::zvariant::OwnedValue>>::try_from(v.clone()).ok())
+                .unwrap_or_default();
+
+            // Check if the Data property contains "[Address Book]" ini section header
+            let data_str = source_props
+                .get("Data")
+                .and_then(|v| <String as TryFrom<zbus::zvariant::OwnedValue>>::try_from(v.clone()).ok())
+                .unwrap_or_default();
+
+            let has_addressbook = data_str.contains("[Address Book]");
+
+            if has_addressbook {
+                debug!("EDS address book found: UID={} path={}", uid, path);
+                if !uid.is_empty() {
+                    uids.push(uid);
+                }
+            }
+        }
+
+        debug!("Found {} EDS address book sources", uids.len());
+        Ok(uids)
+    }
+
+    /// Query a specific EDS address book for contacts
+    async fn eds_query_address_book(
+        conn: &zbus::Connection,
+        addressbook_bus: &str,
+        uid: &str,
+        sexp: &str,
+    ) -> Result<Vec<(String, String)>, String> {
+        // Open the address book via the factory
+        let factory_proxy = Self::eds_build_proxy(
+            conn,
+            addressbook_bus,
+            "/org/gnome/evolution/dataserver/AddressBookFactory",
+            "org.gnome.evolution.dataserver.AddressBookFactory",
+        )
+        .await
+        .map_err(|e| format!("Failed to build factory proxy: {}", e))?;
+
+        // OpenAddressBook(uid) returns (object_path_str, bus_name) — both as strings
+        let (book_path, bus_name): (String, String) = factory_proxy
+            .call("OpenAddressBook", &(uid,))
+            .await
+            .map_err(|e| format!("Failed to open address book '{}': {}", uid, e))?;
+
+        // Create proxy to the address book
+        let book_path_str = &book_path;
+        let book_proxy = Self::eds_build_proxy(
+            conn,
+            &bus_name,
+            book_path_str,
+            "org.gnome.evolution.dataserver.AddressBook",
+        )
+        .await
+        .map_err(|e| format!("Failed to build address book proxy: {}", e))?;
+
+        // Open the backend before querying (returns `as` — array of strings)
+        let _: Vec<String> = book_proxy
+            .call("Open", &())
+            .await
+            .map_err(|e| format!("Open failed: {}", e))?;
+
+        // GetContactList returns Vec<vcard_string>
+        let vcards: Vec<String> = book_proxy
+            .call("GetContactList", &(sexp,))
+            .await
+            .map_err(|e| format!("GetContactList failed: {}", e))?;
+
+        let mut contacts = Vec::new();
+        for vcard in &vcards {
+            let parsed = Self::parse_vcard_contacts(vcard);
+            contacts.extend(parsed);
+        }
+        Ok(contacts)
+    }
+
+    /// Parse a vCard string to extract name and email pairs
+    fn parse_vcard_contacts(vcard: &str) -> Vec<(String, String)> {
+        let mut name = String::new();
+        let mut emails = Vec::new();
+
+        for line in vcard.lines() {
+            let line = line.trim();
+            if line.starts_with("FN:") || line.starts_with("FN;") {
+                // Full name - handle FN;CHARSET=...: or plain FN:
+                if let Some(val) = line.splitn(2, ':').nth(1) {
+                    name = val.trim().to_string();
+                }
+            } else if line.starts_with("EMAIL") {
+                // EMAIL;TYPE=...: or EMAIL:
+                if let Some(val) = line.splitn(2, ':').nth(1) {
+                    let email = val.trim().to_string();
+                    if !email.is_empty() {
+                        emails.push(email);
+                    }
+                }
+            }
+        }
+
+        if name.is_empty() {
+            name = "Unknown".to_string();
+        }
+
+        emails
+            .into_iter()
+            .map(|email| (name.clone(), email))
+            .collect()
     }
 }
 

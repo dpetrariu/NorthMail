@@ -165,6 +165,22 @@ impl ImapClient {
         Ok(folders)
     }
 
+    /// Get STATUS for a folder (MESSAGES and UNSEEN counts)
+    /// Returns (message_count, unseen_count)
+    pub async fn folder_status(&mut self, folder: &str) -> ImapResult<(u32, u32)> {
+        let session = self.session_mut()?;
+
+        let mailbox = session
+            .status(folder, "(MESSAGES UNSEEN)")
+            .await
+            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+        // For STATUS response: exists = MESSAGES count, unseen = UNSEEN count
+        let messages = mailbox.exists;
+        let unseen = mailbox.unseen.unwrap_or(0);
+        Ok((messages, unseen))
+    }
+
     /// Select a folder and get its status
     pub async fn select_folder(&mut self, folder_path: &str) -> ImapResult<Folder> {
         let session = self.session_mut()?;
@@ -204,7 +220,7 @@ impl ImapClient {
         let session = self.session_mut()?;
 
         let fetch_stream = session
-            .uid_fetch(uids, "(UID FLAGS ENVELOPE RFC822.SIZE)")
+            .uid_fetch(uids, "(UID FLAGS ENVELOPE RFC822.SIZE BODYSTRUCTURE)")
             .await
             .map_err(|e| ImapError::ServerError(e.to_string()))?;
 
@@ -280,13 +296,18 @@ impl ImapClient {
             let flag_refs: Vec<&str> = flag_strs.iter().map(|s| s.as_str()).collect();
             let flags = MessageFlags::from_imap_flags(&flag_refs);
 
+            // Detect attachments from BODYSTRUCTURE
+            let has_attachments = fetch.bodystructure()
+                .map(|bs| Self::bodystructure_has_attachments(bs))
+                .unwrap_or(false);
+
             messages.push(MessageHeader {
                 uid,
                 seq: fetch.message,
                 envelope: envelope.unwrap_or_default(),
                 flags,
                 size: fetch.size.unwrap_or(0),
-                has_attachments: false,
+                has_attachments,
             });
         }
 
@@ -398,6 +419,34 @@ impl ImapClient {
     /// Restore a session after IDLE
     pub fn restore_session(&mut self, session: Session<ImapStream>) {
         self.session = Some(session);
+    }
+
+    /// Recursively check if a BODYSTRUCTURE contains any attachment parts
+    fn bodystructure_has_attachments(bs: &imap_proto::BodyStructure<'_>) -> bool {
+        match bs {
+            imap_proto::BodyStructure::Basic { common, .. }
+            | imap_proto::BodyStructure::Text { common, .. }
+            | imap_proto::BodyStructure::Message { common, .. } => {
+                if let Some(disp) = &common.disposition {
+                    if disp.ty.eq_ignore_ascii_case("attachment") {
+                        return true;
+                    }
+                }
+                // For Message type, also check the nested body
+                if let imap_proto::BodyStructure::Message { body, .. } = bs {
+                    return Self::bodystructure_has_attachments(body);
+                }
+                false
+            }
+            imap_proto::BodyStructure::Multipart { common, bodies, .. } => {
+                if let Some(disp) = &common.disposition {
+                    if disp.ty.eq_ignore_ascii_case("attachment") {
+                        return true;
+                    }
+                }
+                bodies.iter().any(|b| Self::bodystructure_has_attachments(b))
+            }
+        }
     }
 
     /// Close the connection

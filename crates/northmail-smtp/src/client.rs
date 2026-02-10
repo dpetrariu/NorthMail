@@ -119,6 +119,11 @@ impl SmtpClient {
         Self::new("smtp.gmail.com", 587)
     }
 
+    /// Create an Outlook SMTP client
+    pub fn outlook() -> Self {
+        Self::new("smtp.office365.com", 587)
+    }
+
     /// Send a message using XOAUTH2 authentication
     pub async fn send_xoauth2(
         &self,
@@ -144,6 +149,33 @@ impl SmtpClient {
             .build();
 
         // Send the message
+        transport
+            .send(lettre_message)
+            .await
+            .map_err(|e| SmtpError::SendFailed(e.to_string()))?;
+
+        info!("Email sent successfully");
+        Ok(())
+    }
+
+    /// Send a message using password authentication (PLAIN mechanism)
+    pub async fn send_password(
+        &self,
+        email: &str,
+        password: &str,
+        message: OutgoingMessage,
+    ) -> SmtpResult<()> {
+        info!("Sending email via SMTP with password auth");
+
+        let lettre_message = self.build_message(&message)?;
+
+        let transport = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&self.host)
+            .map_err(|e| SmtpError::ConnectionFailed(e.to_string()))?
+            .port(self.port)
+            .credentials(Credentials::new(email.to_string(), password.to_string()))
+            .authentication(vec![Mechanism::Plain])
+            .build();
+
         transport
             .send(lettre_message)
             .await

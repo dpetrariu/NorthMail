@@ -14,5 +14,5 @@ pub use sync::{SyncCommand, SyncEngine, SyncEvent};
 
 /// Re-export models for convenience
 pub mod models {
-    pub use crate::database::{DbFolder, DbMessage};
+    pub use crate::database::{DbFolder, DbMessage, MessageFilter};
 }

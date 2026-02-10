@@ -1,8 +1,36 @@
-//! Folder sidebar widget
+//! Folder sidebar widget — single ListBox with header_func separators
+//! and collapsible per-account folder sections.
 
 use gtk4::{glib, prelude::*, subclass::prelude::*};
 use std::cell::RefCell;
 use std::collections::HashMap;
+
+/// Row widget name encoding: "section:kind:account_id:folder_path"
+/// Parsed with splitn(4, ':') so folder_path can contain ':'.
+///
+/// Sections:
+///   0 — unified inbox
+///   1 — per-account inboxes
+///   2+ — per-account folder groups (2 = first account, 3 = second, …)
+///
+/// Kinds: unified, inbox, header, folder
+
+fn encode_row_name(section: usize, kind: &str, account_id: &str, folder_path: &str) -> String {
+    format!("{}:{}:{}:{}", section, kind, account_id, folder_path)
+}
+
+/// Returns (section, kind, account_id, folder_path)
+fn decode_row_name(name: &str) -> (usize, &str, &str, &str) {
+    let mut parts = name.splitn(4, ':');
+    let section = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let kind = parts.next().unwrap_or("");
+    let account_id = parts.next().unwrap_or("");
+    let folder_path = parts.next().unwrap_or("");
+    (section, kind, account_id, folder_path)
+}
 
 mod imp {
     use super::*;
@@ -11,16 +39,17 @@ mod imp {
 
     #[derive(Default)]
     pub struct FolderSidebar {
-        pub main_box: RefCell<Option<gtk4::Box>>,
-        pub expanders: RefCell<HashMap<String, gtk4::Expander>>,
+        /// The single ListBox that contains every row.
+        pub list_box: RefCell<Option<gtk4::ListBox>>,
         pub accounts: RefCell<Vec<super::AccountFolders>>,
+        /// Persisted expand/collapse state per account id.
+        pub expanded_states: RefCell<HashMap<String, bool>>,
+        // -- sync-status widgets (unchanged) --
         pub sync_status_box: RefCell<Option<gtk4::Box>>,
         pub sync_spinner: RefCell<Option<gtk4::Spinner>>,
         pub sync_label: RefCell<Option<gtk4::Label>>,
         pub sync_progress: RefCell<Option<gtk4::ProgressBar>>,
         pub sync_detail_label: RefCell<Option<gtk4::Label>>,
-        /// All inbox ListBoxes (unified + per-account) for coordinated selection
-        pub inbox_listboxes: RefCell<Vec<gtk4::ListBox>>,
     }
 
     #[glib::object_subclass]
@@ -50,6 +79,7 @@ mod imp {
             let obj = self.obj();
             obj.set_orientation(gtk4::Orientation::Vertical);
             obj.set_vexpand(true);
+            obj.add_css_class("sidebar-pane");
 
             obj.setup_ui();
         }
@@ -87,38 +117,98 @@ impl FolderSidebar {
         )
     }
 
+    // ── UI setup ─────────────────────────────────────────────────────
+
     fn setup_ui(&self) {
         let imp = self.imp();
 
-        // Main scrolled area
+        // Scrolled area
         let scrolled = gtk4::ScrolledWindow::builder()
             .vexpand(true)
             .hscrollbar_policy(gtk4::PolicyType::Never)
             .build();
 
-        let main_box = gtk4::Box::builder()
-            .orientation(gtk4::Orientation::Vertical)
-            .spacing(0)
+        // Single flat ListBox
+        let list_box = gtk4::ListBox::builder()
+            .selection_mode(gtk4::SelectionMode::Single)
+            .css_classes(["navigation-sidebar"])
             .build();
 
-        // Placeholder - will be populated when accounts load
+        // Header func: auto-insert separators between sections
+        list_box.set_header_func(|row, before| {
+            let row_section = decode_row_name(&row.widget_name()).0;
+            if let Some(before) = before {
+                let before_section = decode_row_name(&before.widget_name()).0;
+                if row_section != before_section {
+                    let sep = gtk4::Separator::builder()
+                        .margin_top(6)
+                        .margin_bottom(6)
+                        .build();
+                    row.set_header(Some(&sep));
+                } else {
+                    row.set_header(None::<&gtk4::Widget>);
+                }
+            } else {
+                row.set_header(None::<&gtk4::Widget>);
+            }
+        });
+
+        // Row activation handler (connected once, persists across rebuilds)
+        let sidebar = self.clone();
+        list_box.connect_row_activated(move |list_box, row| {
+            let name = row.widget_name();
+            let (_section, kind, account_id, folder_path) = decode_row_name(&name);
+
+            match kind {
+                "unified" => {
+                    sidebar.emit_by_name::<()>(
+                        "folder-selected",
+                        &[&"", &"INBOX", &true],
+                    );
+                }
+                "inbox" => {
+                    sidebar.emit_by_name::<()>(
+                        "folder-selected",
+                        &[&account_id, &"INBOX", &false],
+                    );
+                }
+                "header" => {
+                    // Toggle expansion — don't select header rows
+                    list_box.unselect_row(row);
+                    sidebar.toggle_account_expansion(account_id);
+                }
+                "folder" => {
+                    sidebar.emit_by_name::<()>(
+                        "folder-selected",
+                        &[&account_id, &folder_path, &false],
+                    );
+                }
+                _ => {}
+            }
+        });
+
+        // Placeholder
         let placeholder = gtk4::Label::builder()
             .label("Loading accounts...")
             .css_classes(["dim-label"])
             .margin_top(24)
             .margin_bottom(24)
             .build();
-        main_box.append(&placeholder);
+        list_box.append(&gtk4::ListBoxRow::builder()
+            .child(&placeholder)
+            .selectable(false)
+            .activatable(false)
+            .build());
 
-        scrolled.set_child(Some(&main_box));
+        scrolled.set_child(Some(&list_box));
         self.append(&scrolled);
 
-        // Bottom section with sync status and settings
+        // ── Bottom section (sync status + settings) ──
         let bottom_box = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
             .build();
 
-        // Sync status area (hidden by default) - ABOVE the separator
+        // Sync status area (hidden by default)
         let sync_status_box = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
             .spacing(4)
@@ -129,7 +219,6 @@ impl FolderSidebar {
             .visible(false)
             .build();
 
-        // Top row: spinner + status text
         let sync_top_row = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
             .spacing(6)
@@ -153,14 +242,12 @@ impl FolderSidebar {
         sync_top_row.append(&sync_label);
         sync_status_box.append(&sync_top_row);
 
-        // Progress bar
         let sync_progress = gtk4::ProgressBar::builder()
             .show_text(false)
             .build();
         sync_progress.add_css_class("osd");
         sync_status_box.append(&sync_progress);
 
-        // Detail label (e.g., "Loading messages...")
         let sync_detail_label = gtk4::Label::builder()
             .label("")
             .css_classes(["dim-label", "caption"])
@@ -172,7 +259,6 @@ impl FolderSidebar {
 
         bottom_box.append(&sync_status_box);
 
-        // Separator below sync status
         let separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
         bottom_box.append(&separator);
 
@@ -206,7 +292,6 @@ impl FolderSidebar {
         );
 
         settings_button.connect_clicked(|_| {
-            // Activate the settings action
             if let Some(app) = gtk4::gio::Application::default() {
                 app.activate_action("show-settings", None);
             }
@@ -215,7 +300,8 @@ impl FolderSidebar {
         bottom_box.append(&settings_button);
         self.append(&bottom_box);
 
-        imp.main_box.replace(Some(main_box));
+        // Store references
+        imp.list_box.replace(Some(list_box));
         imp.sync_status_box.replace(Some(sync_status_box));
         imp.sync_spinner.replace(Some(sync_spinner));
         imp.sync_label.replace(Some(sync_label));
@@ -223,205 +309,83 @@ impl FolderSidebar {
         imp.sync_detail_label.replace(Some(sync_detail_label));
     }
 
-    /// Show sync status with a message
-    /// Show sync status with optional progress bar
-    /// For background sync, use show_simple = true to hide progress bar
-    pub fn show_sync_status(&self, message: &str) {
-        self.show_sync_status_internal(message, true);
-    }
+    // ── Building the row list ────────────────────────────────────────
 
-    /// Show simple sync status (just spinner + message, no progress bar)
-    /// Used for background sync operations
-    pub fn show_simple_sync_status(&self, message: &str) {
-        self.show_sync_status_internal(message, false);
-    }
-
-    fn show_sync_status_internal(&self, message: &str, show_progress: bool) {
-        let imp = self.imp();
-        if let Some(sync_box) = imp.sync_status_box.borrow().as_ref() {
-            sync_box.set_visible(true);
-        }
-        if let Some(spinner) = imp.sync_spinner.borrow().as_ref() {
-            spinner.set_spinning(true);
-        }
-        if let Some(label) = imp.sync_label.borrow().as_ref() {
-            label.set_label(message);
-        }
-        // Show/hide progress bar based on mode
-        if let Some(progress) = imp.sync_progress.borrow().as_ref() {
-            progress.set_visible(show_progress);
-            if show_progress {
-                progress.set_fraction(0.0);
-            }
-        }
-        // Hide detail label initially
-        if let Some(detail) = imp.sync_detail_label.borrow().as_ref() {
-            detail.set_visible(false);
-        }
-    }
-
-    /// Update sync progress (0.0 to 1.0)
-    pub fn set_sync_progress(&self, fraction: f64) {
-        let imp = self.imp();
-        if let Some(progress) = imp.sync_progress.borrow().as_ref() {
-            progress.set_fraction(fraction.clamp(0.0, 1.0));
-        }
-    }
-
-    /// Pulse the progress bar (for indeterminate progress)
-    pub fn pulse_sync_progress(&self) {
-        let imp = self.imp();
-        if let Some(progress) = imp.sync_progress.borrow().as_ref() {
-            progress.pulse();
-        }
-    }
-
-    /// Set detail text below progress bar
-    pub fn set_sync_detail(&self, detail: &str) {
-        let imp = self.imp();
-        if let Some(label) = imp.sync_detail_label.borrow().as_ref() {
-            if detail.is_empty() {
-                label.set_visible(false);
-            } else {
-                label.set_label(detail);
-                label.set_visible(true);
-            }
-        }
-    }
-
-    /// Hide sync status
-    pub fn hide_sync_status(&self) {
-        let imp = self.imp();
-        if let Some(sync_box) = imp.sync_status_box.borrow().as_ref() {
-            sync_box.set_visible(false);
-        }
-        if let Some(spinner) = imp.sync_spinner.borrow().as_ref() {
-            spinner.set_spinning(false);
-        }
-        if let Some(detail) = imp.sync_detail_label.borrow().as_ref() {
-            detail.set_visible(false);
-        }
-    }
-
-    /// Update folder list with accounts and their folders
+    /// Rebuild the sidebar content from account data.
     pub fn set_accounts(&self, accounts: Vec<AccountFolders>) {
         let imp = self.imp();
-
-        // Store accounts for later reference
         imp.accounts.replace(accounts.clone());
 
-        if let Some(main_box) = imp.main_box.borrow().as_ref() {
-            // Clear existing content
-            while let Some(child) = main_box.first_child() {
-                main_box.remove(&child);
-            }
+        let list_box = match imp.list_box.borrow().as_ref() {
+            Some(lb) => lb.clone(),
+            None => return,
+        };
 
-            // Load saved expander states
-            let saved_states = self.load_expander_states();
-
-            // Collect all inbox listboxes for coordinated selection
-            let mut inbox_listboxes: Vec<gtk4::ListBox> = Vec::new();
-
-            // Unified Inbox at top (if any accounts)
-            if !accounts.is_empty() {
-                let unified_list = gtk4::ListBox::builder()
-                    .selection_mode(gtk4::SelectionMode::Single)
-                    .css_classes(["navigation-sidebar"])
-                    .build();
-
-                let unified_row = self.create_folder_row(
-                    "mail-inbox-symbolic",
-                    "All Inboxes",
-                    Some(0), // TODO: sum of all unread
-                    false,
-                );
-                unified_row.add_css_class("unified-inbox");
-                unified_list.append(&unified_row);
-
-                inbox_listboxes.push(unified_list.clone());
-                main_box.append(&unified_list);
-
-                // Add small separator
-                let sep = gtk4::Separator::builder()
-                    .margin_top(6)
-                    .margin_bottom(6)
-                    .build();
-                main_box.append(&sep);
-            }
-
-            // Account inboxes section - each in its own ListBox for selection
-            for account in &accounts {
-                let inbox_list = gtk4::ListBox::builder()
-                    .selection_mode(gtk4::SelectionMode::Single)
-                    .css_classes(["navigation-sidebar"])
-                    .build();
-
-                let inbox_row = self.create_folder_row(
-                    "mail-inbox-symbolic",
-                    &account.email,
-                    account.inbox_unread,
-                    false,
-                );
-                inbox_list.append(&inbox_row);
-
-                inbox_listboxes.push(inbox_list.clone());
-                main_box.append(&inbox_list);
-            }
-
-            // Store all inbox listboxes for coordinated selection
-            imp.inbox_listboxes.replace(inbox_listboxes.clone());
-
-            // Now connect selection handlers that can clear other selections
-            for (idx, listbox) in inbox_listboxes.iter().enumerate() {
-                let sidebar = self.clone();
-                let all_listboxes = inbox_listboxes.clone();
-                let current_idx = idx;
-
-                // Determine if this is the unified inbox (index 0) or an account inbox
-                let is_unified = idx == 0;
-                let account_id = if is_unified {
-                    String::new()
-                } else {
-                    // Account index is idx - 1 (since unified is at 0)
-                    accounts.get(idx - 1).map(|a| a.id.clone()).unwrap_or_default()
-                };
-
-                listbox.connect_row_activated(move |activated_list, row| {
-                    // Clear selection in all OTHER inbox listboxes
-                    for (i, lb) in all_listboxes.iter().enumerate() {
-                        if i != current_idx {
-                            lb.unselect_all();
-                        }
-                    }
-
-                    // Keep this row selected
-                    activated_list.select_row(Some(row));
-
-                    // Emit the folder-selected signal
-                    sidebar.emit_by_name::<()>("folder-selected", &[&account_id, &"INBOX", &is_unified]);
-                });
-            }
-
-            // Separator before collapsible sections
-            if !accounts.is_empty() {
-                let sep = gtk4::Separator::builder()
-                    .margin_top(12)
-                    .margin_bottom(6)
-                    .build();
-                main_box.append(&sep);
-            }
-
-            // Collapsible sections for each account
-            let mut expanders = HashMap::new();
-            for account in &accounts {
-                let expander = self.create_account_expander(account, &saved_states);
-                expanders.insert(account.id.clone(), expander.clone());
-                main_box.append(&expander);
-            }
-
-            imp.expanders.replace(expanders);
+        // Clear all rows
+        while let Some(row) = list_box.row_at_index(0) {
+            list_box.remove(&row);
         }
+
+        if accounts.is_empty() {
+            return;
+        }
+
+        // Load persisted expansion states
+        let saved = self.load_expander_states();
+        let mut expanded_states = HashMap::new();
+
+        // ── Section 0: Unified Inbox ──
+        let total_unread: u32 = accounts.iter().filter_map(|a| a.inbox_unread).sum();
+        let row = self.create_folder_row("mail-inbox-symbolic", "All Inboxes", Some(total_unread), false);
+        row.set_widget_name(&encode_row_name(0, "unified", "", ""));
+        list_box.append(&row);
+
+        // ── Section 1: Per-account inboxes ──
+        for account in &accounts {
+            let row = self.create_folder_row(
+                "mail-inbox-symbolic",
+                &account.email,
+                account.inbox_unread,
+                false,
+            );
+            row.set_widget_name(&encode_row_name(1, "inbox", &account.id, ""));
+            list_box.append(&row);
+        }
+
+        // ── Section 2+: Per-account folder groups ──
+        for (i, account) in accounts.iter().enumerate() {
+            let section = i + 2;
+            let expanded = saved.get(&account.id).copied().unwrap_or(false);
+            expanded_states.insert(account.id.clone(), expanded);
+
+            // Section header row (not selectable, just toggles expansion)
+            let header = self.create_section_header_row(&account.email, expanded);
+            header.set_widget_name(&encode_row_name(section, "header", &account.id, ""));
+            list_box.append(&header);
+
+            // Folder rows (hidden when collapsed)
+            for folder in &account.folders {
+                let row = self.create_folder_row(
+                    &folder.icon_name,
+                    &folder.name,
+                    folder.unread_count,
+                    true,
+                );
+                row.set_widget_name(&encode_row_name(
+                    section,
+                    "folder",
+                    &account.id,
+                    &folder.full_path,
+                ));
+                row.set_visible(expanded);
+                list_box.append(&row);
+            }
+        }
+
+        imp.expanded_states.replace(expanded_states);
     }
+
+    // ── Row factories ────────────────────────────────────────────────
 
     fn create_folder_row(
         &self,
@@ -444,24 +408,25 @@ impl FolderSidebar {
             .margin_bottom(6)
             .build();
 
-        let icon = gtk4::Image::from_icon_name(icon_name);
-        content.append(&icon);
+        content.append(&gtk4::Image::from_icon_name(icon_name));
 
-        let label_widget = gtk4::Label::builder()
-            .label(label)
-            .xalign(0.0)
-            .hexpand(true)
-            .ellipsize(gtk4::pango::EllipsizeMode::End)
-            .build();
-        content.append(&label_widget);
+        content.append(
+            &gtk4::Label::builder()
+                .label(label)
+                .xalign(0.0)
+                .hexpand(true)
+                .ellipsize(gtk4::pango::EllipsizeMode::End)
+                .build(),
+        );
 
         if let Some(count) = unread_count {
             if count > 0 {
-                let badge = gtk4::Label::builder()
-                    .label(&count.to_string())
-                    .css_classes(["dim-label"])
-                    .build();
-                content.append(&badge);
+                content.append(
+                    &gtk4::Label::builder()
+                        .label(&count.to_string())
+                        .css_classes(["dim-label"])
+                        .build(),
+                );
             }
         }
 
@@ -469,85 +434,157 @@ impl FolderSidebar {
         row
     }
 
-    fn create_account_expander(
-        &self,
-        account: &AccountFolders,
-        saved_states: &HashMap<String, bool>,
-    ) -> gtk4::Expander {
-        // Default to collapsed
-        let expanded = saved_states.get(&account.id).copied().unwrap_or(false);
-
-        let expander = gtk4::Expander::builder()
-            .expanded(expanded)
-            .margin_start(4)
-            .margin_end(4)
-            .margin_top(8)  // Added top margin for spacing between sections
-            .margin_bottom(8) // Added bottom margin for spacing between sections
+    fn create_section_header_row(&self, email: &str, expanded: bool) -> gtk4::ListBoxRow {
+        let row = gtk4::ListBoxRow::builder()
+            .selectable(false)
+            .activatable(true)
             .build();
 
-        // Header with account name
-        let header = gtk4::Box::builder()
+        let content = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
             .spacing(8)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(4)
+            .margin_bottom(4)
             .build();
 
-        let icon = gtk4::Image::from_icon_name("avatar-default-symbolic");
-        header.append(&icon);
-
-        let label = gtk4::Label::builder()
-            .label(&account.email)
-            .xalign(0.0)
-            .ellipsize(gtk4::pango::EllipsizeMode::End)
-            .css_classes(["heading"])
+        // Disclosure indicator
+        let arrow_icon = if expanded {
+            "pan-down-symbolic"
+        } else {
+            "pan-end-symbolic"
+        };
+        let arrow = gtk4::Image::builder()
+            .icon_name(arrow_icon)
+            .pixel_size(12)
             .build();
-        header.append(&label);
+        arrow.set_widget_name("disclosure-arrow");
+        content.append(&arrow);
 
-        expander.set_label_widget(Some(&header));
+        content.append(&gtk4::Image::from_icon_name("avatar-default-symbolic"));
 
-        // Content - folder list
-        let folder_list = gtk4::ListBox::builder()
-            .selection_mode(gtk4::SelectionMode::Single)
-            .css_classes(["navigation-sidebar"])
-            .margin_start(8)
-            .build();
+        content.append(
+            &gtk4::Label::builder()
+                .label(email)
+                .xalign(0.0)
+                .hexpand(true)
+                .ellipsize(gtk4::pango::EllipsizeMode::End)
+                .css_classes(["heading"])
+                .build(),
+        );
 
-        // Store folder paths for lookup
-        let folder_paths: Vec<String> = account.folders.iter().map(|f| f.full_path.clone()).collect();
-
-        for folder in &account.folders {
-            let row = self.create_folder_row(&folder.icon_name, &folder.name, folder.unread_count, true);
-            folder_list.append(&row);
-        }
-
-        // Connect folder selection
-        let sidebar = self.clone();
-        let account_id = account.id.clone();
-        folder_list.connect_row_activated(move |list_box, row| {
-            // Clear all inbox selections when selecting a folder
-            sidebar.clear_inbox_selections();
-
-            let index = row.index() as usize;
-            if let Some(folder_path) = folder_paths.get(index) {
-                sidebar.emit_by_name::<()>(
-                    "folder-selected",
-                    &[&account_id, &folder_path.as_str(), &false],
-                );
-            }
-            // Deselect so it can be clicked again
-            list_box.unselect_row(row);
-        });
-
-        expander.set_child(Some(&folder_list));
-
-        // Save state when toggled
-        let account_id = account.id.clone();
-        let sidebar_ref = self.clone();
-        expander.connect_expanded_notify(move |exp| {
-            sidebar_ref.save_expander_state(&account_id, exp.is_expanded());
-        });
-
-        expander
+        row.set_child(Some(&content));
+        row
     }
+
+    // ── Expand / collapse ────────────────────────────────────────────
+
+    fn toggle_account_expansion(&self, account_id: &str) {
+        let imp = self.imp();
+        let mut states = imp.expanded_states.borrow_mut();
+        let expanded = states.get(account_id).copied().unwrap_or(false);
+        let new_state = !expanded;
+        states.insert(account_id.to_string(), new_state);
+
+        // Persist
+        drop(states);
+        self.save_expander_state(account_id, new_state);
+
+        // Update row visibility + disclosure arrow
+        let list_box = match imp.list_box.borrow().as_ref() {
+            Some(lb) => lb.clone(),
+            None => return,
+        };
+
+        let mut idx = 0;
+        while let Some(row) = list_box.row_at_index(idx) {
+            let name = row.widget_name();
+            let (_section, kind, aid, _path) = decode_row_name(&name);
+            if aid == account_id {
+                match kind {
+                    "header" => {
+                        // Update disclosure arrow
+                        if let Some(content) = row.child().and_then(|c| c.downcast::<gtk4::Box>().ok()) {
+                            if let Some(arrow) = content.first_child().and_then(|c| c.downcast::<gtk4::Image>().ok()) {
+                                if arrow.widget_name() == "disclosure-arrow" {
+                                    arrow.set_icon_name(Some(if new_state {
+                                        "pan-down-symbolic"
+                                    } else {
+                                        "pan-end-symbolic"
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                    "folder" => {
+                        row.set_visible(new_state);
+                    }
+                    _ => {}
+                }
+            }
+            idx += 1;
+        }
+    }
+
+    // ── Programmatic selection ───────────────────────────────────────
+
+    /// Programmatically select the unified inbox row
+    pub fn select_unified_inbox(&self) {
+        let imp = self.imp();
+        let list_box = match imp.list_box.borrow().as_ref() {
+            Some(lb) => lb.clone(),
+            None => return,
+        };
+
+        list_box.unselect_all();
+
+        let mut idx = 0;
+        while let Some(row) = list_box.row_at_index(idx) {
+            let name = row.widget_name();
+            let (_section, kind, _aid, _path) = decode_row_name(&name);
+            if kind == "unified" {
+                list_box.select_row(Some(&row));
+                break;
+            }
+            idx += 1;
+        }
+    }
+
+    /// Programmatically select a folder (used on startup to highlight restored folder)
+    pub fn select_folder(&self, account_id: &str, folder_path: &str) {
+        let imp = self.imp();
+        let list_box = match imp.list_box.borrow().as_ref() {
+            Some(lb) => lb.clone(),
+            None => return,
+        };
+
+        list_box.unselect_all();
+
+        let mut idx = 0;
+        while let Some(row) = list_box.row_at_index(idx) {
+            let name = row.widget_name();
+            let (_section, kind, aid, path) = decode_row_name(&name);
+
+            let matches = match kind {
+                "inbox" if folder_path.eq_ignore_ascii_case("INBOX") => aid == account_id,
+                "folder" => aid == account_id && path == folder_path,
+                _ => false,
+            };
+
+            if matches {
+                // Ensure the row is visible (expand section if needed)
+                if kind == "folder" && !row.is_visible() {
+                    self.toggle_account_expansion(account_id);
+                }
+                list_box.select_row(Some(&row));
+                break;
+            }
+            idx += 1;
+        }
+    }
+
+    // ── Expansion state persistence ──────────────────────────────────
 
     fn get_state_file_path() -> std::path::PathBuf {
         let data_dir = glib::user_data_dir().join("northmail");
@@ -574,70 +611,74 @@ impl FolderSidebar {
         }
     }
 
-    /// Clear selection in all inbox listboxes
-    fn clear_inbox_selections(&self) {
+    // ── Sync status (unchanged) ──────────────────────────────────────
+
+    pub fn show_sync_status(&self, message: &str) {
+        self.show_sync_status_internal(message, true);
+    }
+
+    pub fn show_simple_sync_status(&self, message: &str) {
+        self.show_sync_status_internal(message, false);
+    }
+
+    fn show_sync_status_internal(&self, message: &str, show_progress: bool) {
         let imp = self.imp();
-        for listbox in imp.inbox_listboxes.borrow().iter() {
-            listbox.unselect_all();
+        if let Some(sync_box) = imp.sync_status_box.borrow().as_ref() {
+            sync_box.set_visible(true);
+        }
+        if let Some(spinner) = imp.sync_spinner.borrow().as_ref() {
+            spinner.set_spinning(true);
+        }
+        if let Some(label) = imp.sync_label.borrow().as_ref() {
+            label.set_label(message);
+        }
+        if let Some(progress) = imp.sync_progress.borrow().as_ref() {
+            progress.set_visible(show_progress);
+            if show_progress {
+                progress.set_fraction(0.0);
+            }
+        }
+        if let Some(detail) = imp.sync_detail_label.borrow().as_ref() {
+            detail.set_visible(false);
         }
     }
 
-    /// Clear selection in all folder expanders
-    fn clear_folder_selections(&self) {
+    pub fn set_sync_progress(&self, fraction: f64) {
         let imp = self.imp();
-        for expander in imp.expanders.borrow().values() {
-            if let Some(list_box) = expander.child().and_then(|c| c.downcast::<gtk4::ListBox>().ok()) {
-                list_box.unselect_all();
+        if let Some(progress) = imp.sync_progress.borrow().as_ref() {
+            progress.set_fraction(fraction.clamp(0.0, 1.0));
+        }
+    }
+
+    pub fn pulse_sync_progress(&self) {
+        let imp = self.imp();
+        if let Some(progress) = imp.sync_progress.borrow().as_ref() {
+            progress.pulse();
+        }
+    }
+
+    pub fn set_sync_detail(&self, detail: &str) {
+        let imp = self.imp();
+        if let Some(label) = imp.sync_detail_label.borrow().as_ref() {
+            if detail.is_empty() {
+                label.set_visible(false);
+            } else {
+                label.set_label(detail);
+                label.set_visible(true);
             }
         }
     }
 
-    /// Programmatically select a folder (used on startup to highlight restored folder)
-    pub fn select_folder(&self, account_id: &str, folder_path: &str) {
+    pub fn hide_sync_status(&self) {
         let imp = self.imp();
-
-        // Clear all selections first
-        self.clear_inbox_selections();
-        self.clear_folder_selections();
-
-        if folder_path.eq_ignore_ascii_case("INBOX") {
-            // Find the inbox ListBox for this account
-            let accounts = imp.accounts.borrow();
-            let inbox_listboxes = imp.inbox_listboxes.borrow();
-
-            // inbox_listboxes[0] = unified, inbox_listboxes[i+1] = accounts[i]
-            for (i, account) in accounts.iter().enumerate() {
-                if account.id == account_id {
-                    // Select the inbox row (index i+1, since 0 is unified)
-                    if let Some(listbox) = inbox_listboxes.get(i + 1) {
-                        if let Some(row) = listbox.row_at_index(0) {
-                            listbox.select_row(Some(&row));
-                        }
-                    }
-                    break;
-                }
-            }
-        } else {
-            // Find the expander for this account and expand it
-            let expanders = imp.expanders.borrow();
-            if let Some(expander) = expanders.get(account_id) {
-                expander.set_expanded(true);
-
-                // Find and select the folder row
-                if let Some(list_box) = expander.child().and_then(|c| c.downcast::<gtk4::ListBox>().ok()) {
-                    let accounts = imp.accounts.borrow();
-                    if let Some(account) = accounts.iter().find(|a| a.id == account_id) {
-                        for (i, folder) in account.folders.iter().enumerate() {
-                            if folder.full_path == folder_path {
-                                if let Some(row) = list_box.row_at_index(i as i32) {
-                                    list_box.select_row(Some(&row));
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+        if let Some(sync_box) = imp.sync_status_box.borrow().as_ref() {
+            sync_box.set_visible(false);
+        }
+        if let Some(spinner) = imp.sync_spinner.borrow().as_ref() {
+            spinner.set_spinning(false);
+        }
+        if let Some(detail) = imp.sync_detail_label.borrow().as_ref() {
+            detail.set_visible(false);
         }
     }
 

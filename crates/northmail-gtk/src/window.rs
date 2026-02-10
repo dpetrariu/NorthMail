@@ -223,6 +223,23 @@ impl NorthMailWindow {
             window.show_message(list, uid);
         });
 
+        // Connect search-requested signal (Enter in search bar / Escape to clear)
+        let window = self.clone();
+        message_list.connect_search_requested(move |_list, query| {
+            debug!("Search requested: {:?}", query);
+            window.handle_search_requested(&query);
+        });
+
+        // Connect filter-changed callback (triggers DB-level filtering)
+        let window = self.clone();
+        message_list.connect_filter_changed(move || {
+            if let Some(app) = window.application() {
+                if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                    app.handle_filter_changed();
+                }
+            }
+        });
+
         imp.message_list.set(message_list).unwrap();
 
         // Create and add message view
@@ -343,6 +360,8 @@ impl NorthMailWindow {
             let from_label = gtk4::Label::builder()
                 .label("From:")
                 .css_classes(["dim-label"])
+                .xalign(1.0)
+                .width_request(38)
                 .build();
             from_box.append(&from_label);
 
@@ -356,7 +375,42 @@ impl NorthMailWindow {
 
             header_box.append(&from_box);
 
-            // Date
+            // To
+            if !msg.to.is_empty() {
+                let to_box = gtk4::Box::builder()
+                    .orientation(gtk4::Orientation::Horizontal)
+                    .spacing(8)
+                    .build();
+
+                let to_label = gtk4::Label::builder()
+                    .label("To:")
+                    .css_classes(["dim-label"])
+                    .xalign(1.0)
+                    .width_request(38)
+                    .build();
+                to_box.append(&to_label);
+
+                let to_value = gtk4::Label::builder()
+                    .label(&msg.to)
+                    .xalign(0.0)
+                    .hexpand(true)
+                    .wrap(true)
+                    .build();
+                to_box.append(&to_value);
+
+                header_box.append(&to_box);
+            }
+
+            // Date — format using system locale via GLib DateTime
+            let formatted_date = if let Some(epoch) = msg.date_epoch {
+                glib::DateTime::from_unix_local(epoch)
+                    .and_then(|dt| dt.format("%c"))
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|_| msg.date.clone())
+            } else {
+                msg.date.clone()
+            };
+
             let date_box = gtk4::Box::builder()
                 .orientation(gtk4::Orientation::Horizontal)
                 .spacing(8)
@@ -365,11 +419,13 @@ impl NorthMailWindow {
             let date_label = gtk4::Label::builder()
                 .label("Date:")
                 .css_classes(["dim-label"])
+                .xalign(1.0)
+                .width_request(38)
                 .build();
             date_box.append(&date_label);
 
             let date_value = gtk4::Label::builder()
-                .label(&msg.date)
+                .label(&formatted_date)
                 .xalign(0.0)
                 .build();
             date_box.append(&date_value);
@@ -429,7 +485,8 @@ impl NorthMailWindow {
             let body_box_ref = body_box.clone();
             if let Some(app) = self.application() {
                 if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
-                    app.fetch_message_body(uid, move |result| {
+                    let msg_folder_id = if msg.folder_id != 0 { Some(msg.folder_id) } else { None };
+                    app.fetch_message_body(uid, msg_folder_id, move |result| {
                         // Clear loading indicator
                         while let Some(child) = body_box_ref.first_child() {
                             body_box_ref.remove(&child);
@@ -612,68 +669,147 @@ impl NorthMailWindow {
     fn show_compose_dialog(&self) {
         debug!("Opening compose dialog");
 
+        // Compose-specific CSS
+        let css_provider = gtk4::CssProvider::new();
+        css_provider.load_from_string(
+            "
+            .compose-entry { background: transparent; border: none; outline: none; box-shadow: none; min-height: 28px; }
+            .compose-entry:focus { background: transparent; border: none; outline: none; box-shadow: none; }
+            .compose-entry > text { background: transparent; border: none; outline: none; box-shadow: none; }
+            .compose-chip { background: alpha(currentColor, 0.08); border-radius: 14px; padding: 2px 4px 2px 10px; margin: 1px 0; }
+            .compose-chip label { font-size: 0.9em; }
+            .compose-chip button { min-width: 20px; min-height: 20px; padding: 0; margin: 0; }
+            .compose-field-label { font-size: 0.9em; min-width: 52px; }
+            ",
+        );
+        gtk4::style_context_add_provider_for_display(
+            &gtk4::gdk::Display::default().unwrap(),
+            &css_provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+
         let dialog = adw::Dialog::builder()
             .title("New Message")
-            .content_width(600)
-            .content_height(500)
+            .content_width(640)
+            .content_height(560)
             .build();
 
         let toolbar_view = adw::ToolbarView::new();
 
-        // Header bar with actions
+        // Header bar — Send on right, close via dialog X
         let header = adw::HeaderBar::new();
 
         let send_button = gtk4::Button::builder()
             .label("Send")
-            .css_classes(["suggested-action"])
+            .css_classes(["suggested-action", "pill"])
             .build();
 
-        let discard_button = gtk4::Button::builder()
-            .label("Discard")
-            .css_classes(["destructive-action"])
-            .build();
-
-        header.pack_start(&discard_button);
         header.pack_end(&send_button);
-
         toolbar_view.add_top_bar(&header);
 
-        // Compose form
+        // Main content
         let content = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
-            .spacing(12)
+            .spacing(0)
+            .build();
+
+        // --- Header fields (From, To, Cc, Subject) ---
+        let fields_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .spacing(0)
             .margin_start(12)
             .margin_end(12)
-            .margin_top(12)
-            .margin_bottom(12)
             .build();
 
-        let to_entry = adw::EntryRow::builder()
-            .title("To")
+        // Label width for alignment
+        let label_width = 56;
+
+        // From selector
+        let from_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(6)
+            .margin_top(6)
+            .margin_bottom(6)
             .build();
 
-        let cc_entry = adw::EntryRow::builder()
-            .title("Cc")
+        let from_label = gtk4::Label::builder()
+            .label("From")
+            .xalign(1.0)
+            .width_request(label_width)
+            .css_classes(["dim-label", "compose-field-label"])
             .build();
 
-        let subject_entry = adw::EntryRow::builder()
-            .title("Subject")
+        let from_model = gtk4::StringList::new(&[]);
+        if let Some(app) = self.application() {
+            if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                let accs = app.imp().accounts.borrow();
+                for acc in accs.iter() {
+                    from_model.append(&acc.email);
+                }
+            }
+        }
+
+        let from_dropdown = gtk4::DropDown::builder()
+            .model(&from_model)
+            .hexpand(true)
+            .css_classes(["flat"])
             .build();
 
-        let recipients_group = adw::PreferencesGroup::new();
-        recipients_group.add(&to_entry);
-        recipients_group.add(&cc_entry);
-        recipients_group.add(&subject_entry);
+        from_box.append(&from_label);
+        from_box.append(&from_dropdown);
+        fields_box.append(&from_box);
+        fields_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
-        content.append(&recipients_group);
+        // To / Cc chip rows
+        let to_chips: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let cc_chips: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
 
-        // Text editor
+        let to_row = Self::build_chip_row("To", to_chips.clone(), self, label_width);
+        let cc_row = Self::build_chip_row("Cc", cc_chips.clone(), self, label_width);
+
+        fields_box.append(&to_row);
+        fields_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+        fields_box.append(&cc_row);
+        fields_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
+        // Subject
+        let subject_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(6)
+            .margin_top(6)
+            .margin_bottom(6)
+            .build();
+
+        let subject_label = gtk4::Label::builder()
+            .label("Subject")
+            .xalign(1.0)
+            .width_request(label_width)
+            .css_classes(["dim-label", "compose-field-label"])
+            .build();
+
+        let subject_entry = gtk4::Entry::builder()
+            .hexpand(true)
+            .has_frame(false)
+            .placeholder_text("Subject")
+            .css_classes(["compose-entry"])
+            .build();
+
+        subject_box.append(&subject_label);
+        subject_box.append(&subject_entry);
+        fields_box.append(&subject_box);
+        fields_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
+        content.append(&fields_box);
+
+        // Body text editor
         let text_view = gtk4::TextView::builder()
             .vexpand(true)
             .hexpand(true)
             .wrap_mode(gtk4::WrapMode::Word)
-            .left_margin(12)
-            .right_margin(12)
+            .left_margin(20)
+            .right_margin(20)
             .top_margin(12)
             .bottom_margin(12)
             .build();
@@ -683,30 +819,320 @@ impl NorthMailWindow {
             .vexpand(true)
             .build();
 
-        let frame = gtk4::Frame::builder()
-            .child(&scrolled)
-            .vexpand(true)
-            .build();
-
-        content.append(&frame);
+        content.append(&scrolled);
 
         toolbar_view.set_content(Some(&content));
         dialog.set_child(Some(&toolbar_view));
 
-        // Connect close on discard
+        // Send
+        let window = self.clone();
         let dialog_ref = dialog.clone();
-        discard_button.connect_clicked(move |_| {
-            dialog_ref.close();
-        });
-
-        // Connect send action
-        let dialog_ref = dialog.clone();
+        let send_btn_ref = send_button.clone();
         send_button.connect_clicked(move |_| {
-            // TODO: Actually send the message
-            dialog_ref.close();
+            let to_list = to_chips.borrow().clone();
+            let cc_list = cc_chips.borrow().clone();
+            let subject = subject_entry.text().to_string();
+            let body = {
+                let buf = text_view.buffer();
+                let (start, end) = buf.bounds();
+                buf.text(&start, &end, false).to_string()
+            };
+
+            if to_list.is_empty() {
+                if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                    win.add_toast(adw::Toast::new("Please add at least one recipient"));
+                }
+                return;
+            }
+
+            let account_index = from_dropdown.selected();
+
+            send_btn_ref.set_sensitive(false);
+            send_btn_ref.set_label("Sending…");
+
+            if let Some(app) = window.application() {
+                if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                    let dialog_close = dialog_ref.clone();
+                    let window_ref = window.clone();
+                    let send_btn_restore = send_btn_ref.clone();
+                    app.send_message(
+                        account_index,
+                        to_list,
+                        cc_list,
+                        subject,
+                        body,
+                        move |result| {
+                            match result {
+                                Ok(()) => {
+                                    if let Some(win) = window_ref.downcast_ref::<NorthMailWindow>() {
+                                        win.add_toast(adw::Toast::new("Message sent"));
+                                    }
+                                    dialog_close.close();
+                                }
+                                Err(e) => {
+                                    if let Some(win) = window_ref.downcast_ref::<NorthMailWindow>() {
+                                        win.add_toast(adw::Toast::new(&format!("Send failed: {}", e)));
+                                    }
+                                    send_btn_restore.set_sensitive(true);
+                                    send_btn_restore.set_label("Send");
+                                }
+                            }
+                        },
+                    );
+                }
+            }
         });
 
         dialog.present(Some(self));
+    }
+
+    /// Build an inline chip-based recipient row (label + chips + entry)
+    fn build_chip_row(
+        label_text: &str,
+        chips: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        window: &NorthMailWindow,
+        label_width: i32,
+    ) -> gtk4::Box {
+        let row = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(6)
+            .margin_top(4)
+            .margin_bottom(4)
+            .build();
+
+        let label = gtk4::Label::builder()
+            .label(label_text)
+            .xalign(1.0)
+            .width_request(label_width)
+            .valign(gtk4::Align::Center)
+            .css_classes(["dim-label", "compose-field-label"])
+            .build();
+
+        // Horizontal box for chips + entry
+        let chip_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(4)
+            .hexpand(true)
+            .valign(gtk4::Align::Center)
+            .build();
+
+        // Inline entry (no frame, blends into the row)
+        let entry = gtk4::Entry::builder()
+            .hexpand(true)
+            .has_frame(false)
+            .placeholder_text("Add recipient")
+            .css_classes(["compose-entry"])
+            .build();
+
+        chip_box.append(&entry);
+
+        row.append(&label);
+        row.append(&chip_box);
+
+        // Autocomplete popover — appears directly below the entry
+        let popover = gtk4::Popover::builder()
+            .has_arrow(false)
+            .autohide(false)
+            .position(gtk4::PositionType::Bottom)
+            .build();
+        popover.add_css_class("menu");
+
+        let suggestion_list = gtk4::ListBox::builder()
+            .selection_mode(gtk4::SelectionMode::Single)
+            .build();
+
+        let suggestion_scrolled = gtk4::ScrolledWindow::builder()
+            .child(&suggestion_list)
+            .max_content_height(240)
+            .propagate_natural_height(true)
+            .min_content_width(320)
+            .build();
+
+        popover.set_child(Some(&suggestion_scrolled));
+        popover.set_parent(&entry);
+
+        // --- Add chip helper ---
+        let add_chip = {
+            let chip_box = chip_box.clone();
+            let chips = chips.clone();
+            let entry = entry.clone();
+            move |display: &str, email: &str| {
+                // Show just the name in the chip (or email if no name)
+                let chip_text = if display.is_empty() || display == email {
+                    email.to_string()
+                } else {
+                    display.to_string()
+                };
+
+                chips.borrow_mut().push(email.to_string());
+
+                let chip = gtk4::Box::builder()
+                    .orientation(gtk4::Orientation::Horizontal)
+                    .spacing(2)
+                    .css_classes(["compose-chip"])
+                    .build();
+
+                let chip_label = gtk4::Label::builder()
+                    .label(&chip_text)
+                    .ellipsize(gtk4::pango::EllipsizeMode::End)
+                    .max_width_chars(24)
+                    .build();
+
+                let remove_btn = gtk4::Button::builder()
+                    .icon_name("window-close-symbolic")
+                    .css_classes(["flat", "circular"])
+                    .valign(gtk4::Align::Center)
+                    .build();
+
+                chip.append(&chip_label);
+                chip.append(&remove_btn);
+
+                // Insert chip before the entry
+                chip_box.insert_child_after(&chip, entry.prev_sibling().as_ref());
+                // Move entry to the end if needed — it should already be last
+                // but GTK keeps insertion order, so just reorder
+                chip_box.reorder_child_after(&entry, Some(&chip));
+
+                // Remove handler
+                let chip_box_ref = chip_box.clone();
+                let chips_ref = chips.clone();
+                let email_owned = email.to_string();
+                let chip_ref = chip.clone();
+                remove_btn.connect_clicked(move |_| {
+                    chip_box_ref.remove(&chip_ref);
+                    chips_ref.borrow_mut().retain(|e| e != &email_owned);
+                });
+
+                entry.set_text("");
+                entry.grab_focus();
+            }
+        };
+
+        // Enter key → add manual entry
+        let add_chip_enter = add_chip.clone();
+        let popover_enter = popover.clone();
+        entry.connect_activate(move |entry| {
+            let text = entry.text().trim().to_string();
+            if !text.is_empty() {
+                add_chip_enter(&text, &text);
+                popover_enter.popdown();
+            }
+        });
+
+        // Suggestion selection
+        let add_chip_suggest = add_chip.clone();
+        let popover_suggest = popover.clone();
+        let entry_suggest = entry.clone();
+        suggestion_list.connect_row_activated(move |_list, row| {
+            if let Some(tooltip) = row.tooltip_text() {
+                let parts: Vec<&str> = tooltip.splitn(2, '\t').collect();
+                if parts.len() == 2 {
+                    add_chip_suggest(parts[0], parts[1]);
+                } else {
+                    add_chip_suggest("", &tooltip);
+                }
+            }
+            popover_suggest.popdown();
+            entry_suggest.set_text("");
+            entry_suggest.grab_focus();
+        });
+
+        // Debounced autocomplete
+        let debounce_source: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+
+        let window_clone = window.clone();
+        let popover_change = popover.clone();
+        let suggestion_list_ref = suggestion_list;
+        entry.connect_changed(move |entry| {
+            let text = entry.text().to_string();
+            eprintln!("[autocomplete] changed: {:?}", text);
+
+            if let Some(source_id) = debounce_source.borrow_mut().take() {
+                source_id.remove();
+            }
+
+            if text.trim().is_empty() {
+                popover_change.popdown();
+                return;
+            }
+
+            let window_ref = window_clone.clone();
+            let popover_ref = popover_change.clone();
+            let suggestion_list_clone = suggestion_list_ref.clone();
+            let debounce_ref = debounce_source.clone();
+            let entry_ref = entry.clone();
+
+            let source_id = glib::timeout_add_local_once(
+                std::time::Duration::from_millis(300),
+                move || {
+                    debounce_ref.borrow_mut().take();
+                    eprintln!("[autocomplete] debounce fired for {:?}", text);
+
+                    if let Some(app) = window_ref.application() {
+                        if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                            let popover_cb = popover_ref.clone();
+                            let list_cb = suggestion_list_clone.clone();
+                            let entry_popup = entry_ref.clone();
+                            app.query_contacts(text, move |results| {
+                                eprintln!("[autocomplete] callback: {} results", results.len());
+                                while let Some(row) = list_cb.row_at_index(0) {
+                                    list_cb.remove(&row);
+                                }
+
+                                if results.is_empty() {
+                                    popover_cb.popdown();
+                                    return;
+                                }
+
+                                for (name, email) in &results {
+                                    let row_box = gtk4::Box::builder()
+                                        .orientation(gtk4::Orientation::Vertical)
+                                        .spacing(1)
+                                        .margin_start(12)
+                                        .margin_end(12)
+                                        .margin_top(6)
+                                        .margin_bottom(6)
+                                        .build();
+
+                                    if !name.is_empty() && name != "Unknown" {
+                                        let name_lbl = gtk4::Label::builder()
+                                            .label(name)
+                                            .xalign(0.0)
+                                            .build();
+                                        row_box.append(&name_lbl);
+                                    }
+
+                                    let email_lbl = gtk4::Label::builder()
+                                        .label(email)
+                                        .xalign(0.0)
+                                        .css_classes(["dim-label", "caption"])
+                                        .build();
+                                    row_box.append(&email_lbl);
+
+                                    let suggestion_row = gtk4::ListBoxRow::builder()
+                                        .child(&row_box)
+                                        .tooltip_text(format!("{}\t{}", name, email))
+                                        .build();
+
+                                    list_cb.append(&suggestion_row);
+                                }
+
+                                // Position popover below the entry text area
+                                let w = entry_popup.allocated_width();
+                                let h = entry_popup.allocated_height();
+                                popover_cb.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(0, 0, w, h)));
+                                popover_cb.popup();
+                            });
+                        }
+                    }
+                },
+            );
+
+            debounce_source.borrow_mut().replace(source_id);
+        });
+
+        row
     }
 
     fn refresh_messages(&self) {
@@ -718,6 +1144,110 @@ impl NorthMailWindow {
     fn toggle_search(&self) {
         debug!("Toggling search");
         // TODO: Show/hide search bar
+    }
+
+    /// Handle FTS search-requested signal from message list
+    fn handle_search_requested(&self, query: &str) {
+        let Some(app) = self.application() else { return };
+        let Some(app) = app.downcast_ref::<NorthMailApplication>() else { return };
+
+        let folder_id = app.cache_folder_id();
+        if folder_id == 0 {
+            return;
+        }
+
+        let is_unified = folder_id == -1;
+
+        if query.is_empty() {
+            // Empty query: reload normal folder messages from cache
+            let db = match app.database_ref() {
+                Some(db) => db.clone(),
+                None => return,
+            };
+            let app_clone = app.clone();
+            glib::spawn_future_local(async move {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let fid = folder_id;
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    let result = if fid == -1 {
+                        rt.block_on(db.get_inbox_messages(100, 0))
+                    } else {
+                        rt.block_on(db.get_messages(fid, 100, 0))
+                    };
+                    let _ = sender.send(result);
+                });
+
+                let result = loop {
+                    match receiver.try_recv() {
+                        Ok(result) => break Some(result),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            glib::timeout_future(std::time::Duration::from_millis(10)).await;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break None,
+                    }
+                };
+
+                if let Some(Ok(messages)) = result {
+                    let infos: Vec<crate::widgets::MessageInfo> =
+                        messages.iter().map(crate::widgets::MessageInfo::from).collect();
+                    app_clone.set_cache_offset(infos.len() as i64);
+                    if let Some(window) = app_clone.active_window() {
+                        if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                            if let Some(message_list) = win.message_list() {
+                                message_list.set_messages(infos);
+                            }
+                        }
+                    }
+                }
+            });
+        } else {
+            // Non-empty query: FTS search in current folder (or all inboxes)
+            let db = match app.database_ref() {
+                Some(db) => db.clone(),
+                None => return,
+            };
+            let query = query.to_string();
+            let app_clone = app.clone();
+            glib::spawn_future_local(async move {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let fid = folder_id;
+                let q = query.clone();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    let result = if fid == -1 {
+                        rt.block_on(db.search_inbox_messages(&q, 200))
+                    } else {
+                        rt.block_on(db.search_messages_in_folder(fid, &q, 200))
+                    };
+                    let _ = sender.send(result);
+                });
+
+                let result = loop {
+                    match receiver.try_recv() {
+                        Ok(result) => break Some(result),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            glib::timeout_future(std::time::Duration::from_millis(10)).await;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break None,
+                    }
+                };
+
+                if let Some(Ok(messages)) = result {
+                    let infos: Vec<crate::widgets::MessageInfo> =
+                        messages.iter().map(crate::widgets::MessageInfo::from).collect();
+                    debug!("FTS search '{}' returned {} results (unified={})", query, infos.len(), is_unified);
+                    if let Some(window) = app_clone.active_window() {
+                        if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                            if let Some(message_list) = win.message_list() {
+                                message_list.set_messages(infos);
+                                message_list.set_can_load_more(false);
+                            }
+                        }
+                    }
+                }
+            });
+        }
     }
 
     /// Show the main view (message list + message view) instead of welcome
