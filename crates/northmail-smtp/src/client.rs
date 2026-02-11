@@ -2,11 +2,22 @@
 
 use crate::{SmtpError, SmtpResult};
 use lettre::{
-    message::{header::ContentType, Mailbox, MultiPart, SinglePart},
+    message::{header::ContentType, Attachment, Mailbox, MultiPart, SinglePart},
     transport::smtp::authentication::{Credentials, Mechanism},
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
 };
 use tracing::info;
+
+/// An attachment to include in an outgoing message
+#[derive(Debug, Clone)]
+pub struct OutgoingAttachment {
+    /// Filename to display
+    pub filename: String,
+    /// MIME type (e.g., "application/pdf")
+    pub mime_type: String,
+    /// Raw file data
+    pub data: Vec<u8>,
+}
 
 /// Email message to send
 #[derive(Debug, Clone)]
@@ -31,6 +42,8 @@ pub struct OutgoingMessage {
     pub in_reply_to: Option<String>,
     /// References header
     pub references: Vec<String>,
+    /// File attachments
+    pub attachments: Vec<OutgoingAttachment>,
 }
 
 impl OutgoingMessage {
@@ -47,6 +60,7 @@ impl OutgoingMessage {
             html_body: None,
             in_reply_to: None,
             references: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 
@@ -97,6 +111,16 @@ impl OutgoingMessage {
         self.references.push(message_id.into());
         self
     }
+
+    /// Add an attachment
+    pub fn attachment(mut self, filename: impl Into<String>, mime_type: impl Into<String>, data: Vec<u8>) -> Self {
+        self.attachments.push(OutgoingAttachment {
+            filename: filename.into(),
+            mime_type: mime_type.into(),
+            data,
+        });
+        self
+    }
 }
 
 /// SMTP client for sending emails
@@ -136,15 +160,12 @@ impl SmtpClient {
         // Build the lettre message
         let lettre_message = self.build_message(&message)?;
 
-        // Create XOAUTH2 credentials
-        // lettre expects the XOAUTH2 string to be passed as the password
-        let xoauth2_string = format!("user={}\x01auth=Bearer {}\x01\x01", email, access_token);
-
-        // Build SMTP transport with XOAUTH2
+        // lettre's Xoauth2 mechanism expects the access token directly -
+        // it constructs and encodes the XOAUTH2 string internally
         let transport = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&self.host)
             .map_err(|e| SmtpError::ConnectionFailed(e.to_string()))?
             .port(self.port)
-            .credentials(Credentials::new(email.to_string(), xoauth2_string))
+            .credentials(Credentials::new(email.to_string(), access_token.to_string()))
             .authentication(vec![Mechanism::Xoauth2])
             .build();
 
@@ -252,36 +273,61 @@ pub fn build_lettre_message(msg: &OutgoingMessage) -> SmtpResult<Message> {
         builder = builder.references(msg.references.join(" "));
     }
 
-    // Build body
-    let message = match (&msg.text_body, &msg.html_body) {
+    // Build the body part (text/html or multipart/alternative)
+    let body_part = match (&msg.text_body, &msg.html_body) {
         (Some(text), Some(html)) => {
             // Multipart alternative for both text and HTML
-            builder
-                .multipart(
-                    MultiPart::alternative()
-                        .singlepart(
-                            SinglePart::builder()
-                                .header(ContentType::TEXT_PLAIN)
-                                .body(text.clone()),
-                        )
-                        .singlepart(
-                            SinglePart::builder()
-                                .header(ContentType::TEXT_HTML)
-                                .body(html.clone()),
-                        ),
+            MultiPart::alternative()
+                .singlepart(
+                    SinglePart::builder()
+                        .header(ContentType::TEXT_PLAIN)
+                        .body(text.clone()),
                 )
-                .map_err(|e| SmtpError::MessageBuildError(e.to_string()))?
+                .singlepart(
+                    SinglePart::builder()
+                        .header(ContentType::TEXT_HTML)
+                        .body(html.clone()),
+                )
         }
-        (Some(text), None) => builder
-            .body(text.clone())
-            .map_err(|e| SmtpError::MessageBuildError(e.to_string()))?,
-        (None, Some(html)) => builder
-            .header(ContentType::TEXT_HTML)
-            .body(html.clone())
-            .map_err(|e| SmtpError::MessageBuildError(e.to_string()))?,
-        (None, None) => builder
-            .body(String::new())
-            .map_err(|e| SmtpError::MessageBuildError(e.to_string()))?,
+        (Some(text), None) => MultiPart::alternative().singlepart(
+            SinglePart::builder()
+                .header(ContentType::TEXT_PLAIN)
+                .body(text.clone()),
+        ),
+        (None, Some(html)) => MultiPart::alternative().singlepart(
+            SinglePart::builder()
+                .header(ContentType::TEXT_HTML)
+                .body(html.clone()),
+        ),
+        (None, None) => MultiPart::alternative().singlepart(
+            SinglePart::builder()
+                .header(ContentType::TEXT_PLAIN)
+                .body(String::new()),
+        ),
+    };
+
+    // If there are attachments, wrap in multipart/mixed
+    let message = if msg.attachments.is_empty() {
+        builder
+            .multipart(body_part)
+            .map_err(|e| SmtpError::MessageBuildError(e.to_string()))?
+    } else {
+        let mut mixed = MultiPart::mixed().multipart(body_part);
+
+        for att in &msg.attachments {
+            // Parse MIME type or default to application/octet-stream
+            let content_type = att
+                .mime_type
+                .parse::<ContentType>()
+                .unwrap_or(ContentType::parse("application/octet-stream").unwrap());
+
+            let attachment = Attachment::new(att.filename.clone()).body(att.data.clone(), content_type);
+            mixed = mixed.singlepart(attachment);
+        }
+
+        builder
+            .multipart(mixed)
+            .map_err(|e| SmtpError::MessageBuildError(e.to_string()))?
     };
 
     Ok(message)

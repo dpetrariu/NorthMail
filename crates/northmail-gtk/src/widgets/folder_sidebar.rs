@@ -140,10 +140,7 @@ impl FolderSidebar {
             if let Some(before) = before {
                 let before_section = decode_row_name(&before.widget_name()).0;
                 if row_section != before_section {
-                    let sep = gtk4::Separator::builder()
-                        .margin_top(6)
-                        .margin_bottom(6)
-                        .build();
+                    let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
                     row.set_header(Some(&sep));
                 } else {
                     row.set_header(None::<&gtk4::Widget>);

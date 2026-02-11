@@ -38,6 +38,21 @@ install_data(
   install_dir: datadir / 'glib-2.0' / 'schemas',
 )
 
+# Install icons
+icon_sizes = ['16x16', '32x32', '48x48', '64x64', '128x128', '256x256', '512x512']
+foreach size : icon_sizes
+  install_data(
+    'data' / 'icons' / 'hicolor' / size / 'apps' / 'org.northmail.NorthMail.png',
+    install_dir: datadir / 'icons' / 'hicolor' / size / 'apps',
+  )
+endforeach
+
+# Install symbolic icons
+install_data(
+  'data' / 'icons' / 'hicolor' / 'symbolic' / 'actions' / 'dock-left-symbolic.svg',
+  install_dir: datadir / 'icons' / 'hicolor' / 'symbolic' / 'actions',
+)
+
 # Compile schemas for development
 gnome.compile_schemas(
   depend_files: files('data/org.northmail.NorthMail.gschema.xml'),

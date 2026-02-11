@@ -28,11 +28,26 @@ mod imp {
                             <object class="AdwToolbarView">
                                 <child type="top">
                                     <object class="AdwHeaderBar" id="header_bar">
+                                        <property name="show-title">false</property>
                                         <child type="start">
-                                            <object class="GtkToggleButton" id="sidebar_toggle">
-                                                <property name="icon-name">sidebar-show-symbolic</property>
-                                                <property name="tooltip-text">Toggle Sidebar</property>
-                                                <property name="active">true</property>
+                                            <object class="GtkBox">
+                                                <property name="orientation">horizontal</property>
+                                                <property name="spacing">2</property>
+                                                <property name="margin-start">4</property>
+                                                <child>
+                                                    <object class="GtkImage">
+                                                        <property name="icon-name">org.northmail.NorthMail</property>
+                                                        <property name="pixel-size">28</property>
+                                                    </object>
+                                                </child>
+                                                <child>
+                                                    <object class="GtkLabel">
+                                                        <property name="label">NorthMail</property>
+                                                        <attributes>
+                                                            <attribute name="weight" value="bold"/>
+                                                        </attributes>
+                                                    </object>
+                                                </child>
                                             </object>
                                         </child>
                                         <child type="end">
@@ -40,13 +55,6 @@ mod imp {
                                                 <property name="icon-name">open-menu-symbolic</property>
                                                 <property name="tooltip-text">Main Menu</property>
                                                 <property name="menu-model">primary_menu</property>
-                                            </object>
-                                        </child>
-                                        <child type="end">
-                                            <object class="GtkButton" id="compose_button">
-                                                <property name="icon-name">mail-message-new-symbolic</property>
-                                                <property name="tooltip-text">Compose</property>
-                                                <property name="action-name">win.compose</property>
                                             </object>
                                         </child>
                                         <child type="end">
@@ -134,9 +142,9 @@ mod imp {
         #[template_child]
         pub header_bar: TemplateChild<adw::HeaderBar>,
         #[template_child]
-        pub sidebar_toggle: TemplateChild<gtk4::ToggleButton>,
-        #[template_child]
         pub outer_split: TemplateChild<adw::OverlaySplitView>,
+        /// Sidebar toggle button (created in setup_widgets)
+        pub sidebar_toggle: std::cell::RefCell<Option<gtk4::ToggleButton>>,
         #[template_child]
         pub inner_split: TemplateChild<adw::NavigationSplitView>,
         #[template_child]
@@ -207,6 +215,73 @@ impl NorthMailWindow {
 
     fn setup_widgets(&self) {
         let imp = self.imp();
+
+        // Add custom CSS for flat sidebar toggle (no background in any state)
+        let css_provider = gtk4::CssProvider::new();
+        css_provider.load_from_string(
+            "button.sidebar-toggle-flat,
+             button.sidebar-toggle-flat:checked,
+             button.sidebar-toggle-flat:active {
+                 background: transparent;
+                 background-color: transparent;
+                 box-shadow: none;
+                 border: none;
+                 outline: none;
+                 transition: margin 200ms ease-out;
+             }
+             button.sidebar-toggle-flat:hover,
+             button.sidebar-toggle-flat:hover:checked {
+                 background: alpha(currentColor, 0.1);
+             }
+             .header-button-animated {
+                 transition: margin 200ms ease-out;
+             }"
+        );
+        gtk4::style_context_add_provider_for_display(
+            &gtk4::gdk::Display::default().unwrap(),
+            &css_provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_USER,
+        );
+
+        // Create sidebar toggle button and add to header bar
+        // Position: after the title, with margin to align with sidebar's right edge
+        let sidebar_toggle = gtk4::ToggleButton::builder()
+            .icon_name("dock-left-symbolic")
+            .tooltip_text("Toggle Sidebar")
+            .active(true)
+            .margin_start(126)  // Push to align with sidebar right edge (when visible)
+            .build();
+        sidebar_toggle.add_css_class("flat");
+        sidebar_toggle.add_css_class("sidebar-toggle-flat");
+        imp.header_bar.pack_start(&sidebar_toggle);
+        imp.sidebar_toggle.replace(Some(sidebar_toggle.clone()));
+
+        // Create compose button and add to header bar
+        // Position: after sidebar toggle, aligned with message list left edge
+        let compose_button = gtk4::Button::builder()
+            .icon_name("mail-message-new-symbolic")
+            .tooltip_text("Compose")
+            .margin_start(0)
+            .build();
+        compose_button.add_css_class("flat");
+        compose_button.add_css_class("header-button-animated");
+        compose_button.set_action_name(Some("win.compose"));
+        imp.header_bar.pack_start(&compose_button);
+
+        // Adjust button positions when sidebar visibility changes
+        let toggle_for_signal = sidebar_toggle.clone();
+        let compose_for_signal = compose_button.clone();
+        imp.outer_split.connect_notify_local(Some("show-sidebar"), move |split, _| {
+            if split.shows_sidebar() {
+                // Sidebar visible: push buttons to align with columns
+                toggle_for_signal.set_margin_start(126);
+                compose_for_signal.set_margin_start(0);
+            } else {
+                // Sidebar hidden: move buttons next to title
+                toggle_for_signal.set_margin_start(8);
+                compose_for_signal.set_margin_start(8);
+            }
+        });
 
         // Create and add folder sidebar
         let folder_sidebar = FolderSidebar::new();
@@ -701,11 +776,13 @@ impl NorthMailWindow {
         let imp = self.imp();
 
         // Bind sidebar toggle to split view
-        imp.sidebar_toggle
-            .bind_property("active", &*imp.outer_split, "show-sidebar")
-            .sync_create()
-            .bidirectional()
-            .build();
+        if let Some(ref toggle) = *imp.sidebar_toggle.borrow() {
+            toggle
+                .bind_property("active", &*imp.outer_split, "show-sidebar")
+                .sync_create()
+                .bidirectional()
+                .build();
+        }
     }
 
     fn show_welcome_state(&self) {
@@ -748,6 +825,12 @@ impl NorthMailWindow {
             .compose-chip label { font-size: 0.9em; }
             .compose-chip button { min-width: 18px; min-height: 18px; padding: 0; margin: 0; }
             .compose-field-label { font-size: 0.9em; min-width: 52px; }
+            .attachment-pill { background: alpha(currentColor, 0.08); border-radius: 12px; padding: 2px 4px 2px 8px; }
+            .attachment-pill:hover { background: alpha(currentColor, 0.12); }
+            .attachment-pill label { font-size: 0.85em; }
+            .attachment-pill image { margin-right: 2px; }
+            .attachment-pill button { min-width: 16px; min-height: 16px; padding: 0; margin: 0; }
+            .warning { color: @warning_color; }
             ",
         );
         gtk4::style_context_add_provider_for_display(
@@ -764,8 +847,16 @@ impl NorthMailWindow {
 
         let toolbar_view = adw::ToolbarView::new();
 
-        // Header bar — Send on right
+        // Header bar — Send on right, draft status on left
         let header = adw::HeaderBar::new();
+
+        // Draft status label (hidden by default)
+        let draft_label = gtk4::Label::builder()
+            .label("Saved as Draft")
+            .css_classes(["dim-label"])
+            .visible(false)
+            .build();
+        header.pack_start(&draft_label);
 
         let send_button = gtk4::Button::builder()
             .label("Send")
@@ -807,15 +898,21 @@ impl NorthMailWindow {
             .css_classes(["dim-label", "compose-field-label"])
             .build();
 
+        // Track which accounts can send (Microsoft consumer OAuth2 accounts cannot)
+        let mut sendable_accounts: Vec<bool> = Vec::new();
         let from_model = gtk4::StringList::new(&[]);
         if let Some(app) = self.application() {
             if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
                 let accs = app.imp().accounts.borrow();
                 for acc in accs.iter() {
+                    let is_microsoft_oauth2 = (acc.provider_type == "windows_live" || acc.provider_type == "microsoft")
+                        && acc.auth_type == northmail_auth::GoaAuthType::OAuth2;
+                    sendable_accounts.push(!is_microsoft_oauth2);
                     from_model.append(&acc.email);
                 }
             }
         }
+        let sendable_accounts = std::rc::Rc::new(sendable_accounts);
 
         let from_dropdown = gtk4::DropDown::builder()
             .model(&from_model)
@@ -823,8 +920,17 @@ impl NorthMailWindow {
             .css_classes(["flat"])
             .build();
 
+        // Warning icon button (hidden by default, shown for non-sendable accounts)
+        let warning_button = gtk4::Button::builder()
+            .icon_name("dialog-warning-symbolic")
+            .css_classes(["flat", "circular", "warning"])
+            .tooltip_text("This account cannot send emails")
+            .visible(false)
+            .build();
+
         from_box.append(&from_label);
         from_box.append(&from_dropdown);
+        from_box.append(&warning_button);
         fields_box.append(&from_box);
         fields_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
@@ -864,12 +970,24 @@ impl NorthMailWindow {
             .css_classes(["compose-entry"])
             .build();
 
+        // Attachment button (next to subject)
+        let attach_button = gtk4::Button::builder()
+            .icon_name("mail-attachment-symbolic")
+            .tooltip_text("Attach file")
+            .css_classes(["flat", "circular"])
+            .build();
+
         subject_box.append(&subject_label);
         subject_box.append(&subject_entry);
+        subject_box.append(&attach_button);
         fields_box.append(&subject_box);
         fields_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
         content.append(&fields_box);
+
+        // Attachments storage (UI added at bottom after body)
+        let attachments: std::rc::Rc<std::cell::RefCell<Vec<(String, String, Vec<u8>, Option<std::path::PathBuf>)>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
 
         // Body text editor
         let text_view = gtk4::TextView::builder()
@@ -889,8 +1007,190 @@ impl NorthMailWindow {
 
         content.append(&scrolled);
 
+        // Attachments area at bottom (hidden until files are added)
+        let attachments_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(6)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(6)
+            .margin_bottom(8)
+            .build();
+
+        let attachments_flow = gtk4::FlowBox::builder()
+            .selection_mode(gtk4::SelectionMode::None)
+            .homogeneous(false)
+            .row_spacing(4)
+            .column_spacing(6)
+            .max_children_per_line(20)
+            .build();
+
+        attachments_box.append(&attachments_flow);
+        attachments_box.set_visible(false);
+        content.append(&attachments_box);
+
         toolbar_view.set_content(Some(&content));
         compose_window.set_content(Some(&toolbar_view));
+
+        // --- Attachment button handler ---
+        let add_attachment_to_ui = {
+            let attachments = attachments.clone();
+            let attachments_flow = attachments_flow.clone();
+            let attachments_box = attachments_box.clone();
+
+            move |filename: String, mime_type: String, data: Vec<u8>, temp_path: Option<std::path::PathBuf>| {
+                attachments.borrow_mut().push((filename.clone(), mime_type, data, temp_path.clone()));
+                let filename_for_remove = filename.clone();
+
+                // Create pill widget - natural width based on filename
+                let pill = gtk4::Box::builder()
+                    .orientation(gtk4::Orientation::Horizontal)
+                    .spacing(4)
+                    .css_classes(["attachment-pill"])
+                    .build();
+
+                let icon = gtk4::Image::builder()
+                    .icon_name("mail-attachment-symbolic")
+                    .pixel_size(14)
+                    .build();
+
+                let label = gtk4::Label::builder()
+                    .label(&filename)
+                    .ellipsize(gtk4::pango::EllipsizeMode::Middle)
+                    .max_width_chars(25)
+                    .build();
+
+                let remove_btn = gtk4::Button::builder()
+                    .icon_name("window-close-symbolic")
+                    .css_classes(["flat", "circular"])
+                    .tooltip_text("Remove attachment")
+                    .build();
+
+                pill.append(&icon);
+                pill.append(&label);
+                pill.append(&remove_btn);
+
+                // Click on pill to open the file
+                let gesture = gtk4::GestureClick::new();
+                let temp_path_open = temp_path.clone();
+                let filename_open = filename.clone();
+                gesture.connect_released(move |_, _, _, _| {
+                    if let Some(ref path) = temp_path_open {
+                        let _ = std::process::Command::new("xdg-open")
+                            .arg(path)
+                            .spawn();
+                    } else {
+                        debug!("No temp path for attachment {}", filename_open);
+                    }
+                });
+                pill.add_controller(gesture);
+
+                // Remove button handler
+                let attachments_remove = attachments.clone();
+                let attachments_box_remove = attachments_box.clone();
+                let attachments_flow_remove = attachments_flow.clone();
+                let pill_weak = pill.downgrade();
+                let filename_to_remove = filename_for_remove.clone();
+                remove_btn.connect_clicked(move |_| {
+                    // Find and remove from list by filename
+                    let mut atts = attachments_remove.borrow_mut();
+                    if let Some(pos) = atts.iter().position(|(f, _, _, _)| f == &filename_to_remove) {
+                        atts.remove(pos);
+                    }
+                    // Remove pill from flow
+                    if let Some(pill) = pill_weak.upgrade() {
+                        if let Some(parent) = pill.parent() {
+                            if let Some(flow_child) = parent.downcast_ref::<gtk4::FlowBoxChild>() {
+                                attachments_flow_remove.remove(flow_child);
+                            }
+                        }
+                    }
+                    // Hide box if no attachments left
+                    if attachments_remove.borrow().is_empty() {
+                        attachments_box_remove.set_visible(false);
+                    }
+                });
+
+                attachments_flow.append(&pill);
+                attachments_box.set_visible(true);
+            }
+        };
+
+        // Attach button click handler
+        {
+            let compose_win = compose_window.clone();
+            let add_attachment = add_attachment_to_ui.clone();
+            attach_button.connect_clicked(move |_| {
+                let dialog = gtk4::FileDialog::builder()
+                    .title("Attach File")
+                    .modal(true)
+                    .build();
+
+                let add_att = add_attachment.clone();
+                dialog.open(Some(&compose_win), None::<&gtk4::gio::Cancellable>, move |result| {
+                    if let Ok(file) = result {
+                        if let Some(path) = file.path() {
+                            if let Ok(data) = std::fs::read(&path) {
+                                let filename = path.file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "attachment".to_string());
+
+                                // Guess MIME type from extension
+                                let mime_type = Self::guess_mime_type(&filename);
+
+                                add_att(filename, mime_type, data, Some(path));
+                            }
+                        }
+                    }
+                });
+            });
+        }
+
+        // Drag-and-drop support - add directly to TextView to intercept before its built-in handler
+        let drop_target = gtk4::DropTarget::new(gtk4::gio::File::static_type(), gtk4::gdk::DragAction::COPY);
+        {
+            let add_attachment = add_attachment_to_ui.clone();
+            drop_target.connect_drop(move |_, value, _, _| {
+                if let Ok(file) = value.get::<gtk4::gio::File>() {
+                    if let Some(path) = file.path() {
+                        if let Ok(data) = std::fs::read(&path) {
+                            let filename = path.file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "attachment".to_string());
+
+                            let mime_type = Self::guess_mime_type(&filename);
+                            add_attachment(filename, mime_type, data, Some(path));
+                            return true;
+                        }
+                    }
+                }
+                false
+            });
+        }
+        text_view.add_controller(drop_target);
+
+        // Also add drop target on the header fields area
+        let drop_target2 = gtk4::DropTarget::new(gtk4::gio::File::static_type(), gtk4::gdk::DragAction::COPY);
+        {
+            let add_attachment = add_attachment_to_ui.clone();
+            drop_target2.connect_drop(move |_, value, _, _| {
+                if let Ok(file) = value.get::<gtk4::gio::File>() {
+                    if let Some(path) = file.path() {
+                        if let Ok(data) = std::fs::read(&path) {
+                            let filename = path.file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "attachment".to_string());
+
+                            let mime_type = Self::guess_mime_type(&filename);
+                            add_attachment(filename, mime_type, data, Some(path));
+                            return true;
+                        }
+                    }
+                }
+                false
+            });
+        }
+        fields_box.add_controller(drop_target2);
 
         // --- Draft auto-save state ---
         // Track the saved draft: (account_index, uid)
@@ -917,15 +1217,19 @@ impl NorthMailWindow {
             let text_view_save = text_view.clone();
             let from_dropdown_save = from_dropdown.clone();
             let main_window = self.clone();
+            let draft_label_save = draft_label.clone();
 
             move || {
+                eprintln!("[draft] Reset timer called - scheduling 5s auto-save");
                 // Cancel any existing timer
                 if let Some(source_id) = timer_source.take() {
+                    eprintln!("[draft] Cancelled previous timer");
                     source_id.remove();
                 }
 
                 // Don't schedule if a save is already in progress
                 if save_in_progress.get() {
+                    eprintln!("[draft] Save in progress, skipping");
                     return;
                 }
 
@@ -937,8 +1241,10 @@ impl NorthMailWindow {
                 let text_view_timer = text_view_save.clone();
                 let from_dropdown_timer = from_dropdown_save.clone();
                 let main_window_timer = main_window.clone();
+                let draft_label_timer = draft_label_save.clone();
 
-                let source_id = glib::timeout_add_seconds_local_once(30, move || {
+                let source_id = glib::timeout_add_seconds_local_once(5, move || {
+                    eprintln!("[draft] Auto-save timer fired");
                     let subject = subject_entry_timer.text().to_string();
                     let body = {
                         let buf = text_view_timer.buffer();
@@ -948,8 +1254,14 @@ impl NorthMailWindow {
 
                     // Only save if there's content in subject or body
                     if subject.trim().is_empty() && body.trim().is_empty() {
+                        eprintln!("[draft] No content, skipping save");
                         return;
                     }
+                    eprintln!("[draft] Saving draft: subject='{}' body_len={}", subject, body.len());
+
+                    // Show immediate visual feedback that save is starting
+                    draft_label_timer.set_label("Saving...");
+                    draft_label_timer.set_visible(true);
 
                     let to_list = to_chips_timer.borrow().clone();
                     let cc_list = cc_chips_timer.borrow().clone();
@@ -996,42 +1308,52 @@ impl NorthMailWindow {
                     if let Some((old_acct, old_uid)) = old_state {
                         let app_delete = app.clone();
                         let app_save = app.clone();
+                        let draft_label_cb = draft_label_timer.clone();
+                        eprintln!("[draft] Deleting old draft uid={} then saving new", old_uid);
                         app_delete.delete_draft(old_acct, old_uid, move |_| {
                             // Ignore delete errors — old draft may already be gone
+                            let draft_label_inner = draft_label_cb.clone();
+                            eprintln!("[draft] Calling save_draft (after delete) for account {}", account_index);
                             app_save.save_draft(account_index, msg, move |result| {
                                 save_in_progress_cb.set(false);
                                 match result {
                                     Ok(Some(uid)) => {
+                                        eprintln!("[draft] Saved! uid={}", uid);
                                         *draft_state_cb.borrow_mut() = Some((account_index, uid));
-                                        debug!("Draft auto-saved (uid: {})", uid);
+                                        draft_label_inner.set_label("Saved as Draft");
                                     }
                                     Ok(None) => {
-                                        // Server didn't return APPENDUID — clear state
-                                        // (we can't delete what we can't identify)
+                                        eprintln!("[draft] Saved (no uid returned)");
                                         *draft_state_cb.borrow_mut() = None;
-                                        debug!("Draft auto-saved (no uid returned)");
+                                        draft_label_inner.set_label("Saved as Draft");
                                     }
                                     Err(e) => {
-                                        debug!("Draft auto-save failed: {}", e);
+                                        eprintln!("[draft] Save FAILED: {}", e);
+                                        draft_label_inner.set_label("Save failed");
                                     }
                                 }
                             });
                         });
                     } else {
                         let app_save = app.clone();
+                        let draft_label_cb = draft_label_timer.clone();
+                        eprintln!("[draft] Calling save_draft for account {}", account_index);
                         app_save.save_draft(account_index, msg, move |result| {
                             save_in_progress_cb.set(false);
                             match result {
                                 Ok(Some(uid)) => {
+                                    eprintln!("[draft] Saved! uid={}", uid);
                                     *draft_state_cb.borrow_mut() = Some((account_index, uid));
-                                    debug!("Draft auto-saved (uid: {})", uid);
+                                    draft_label_cb.set_label("Saved as Draft");
                                 }
                                 Ok(None) => {
+                                    eprintln!("[draft] Saved (no uid returned)");
                                     *draft_state_cb.borrow_mut() = None;
-                                    debug!("Draft auto-saved (no uid returned)");
+                                    draft_label_cb.set_label("Saved as Draft");
                                 }
                                 Err(e) => {
-                                    debug!("Draft auto-save failed: {}", e);
+                                    eprintln!("[draft] Save FAILED: {}", e);
+                                    draft_label_cb.set_label("Save failed");
                                 }
                             }
                         });
@@ -1056,6 +1378,50 @@ impl NorthMailWindow {
             });
         }
 
+        // Handle from_dropdown selection changes - show/hide warning icon, enable/disable send
+        {
+            let sendable = sendable_accounts.clone();
+            let warning_btn = warning_button.clone();
+            let send_btn = send_button.clone();
+
+            // Check initial selection
+            let initial_idx = from_dropdown.selected() as usize;
+            if initial_idx < sendable.len() && !sendable[initial_idx] {
+                warning_btn.set_visible(true);
+                send_btn.set_sensitive(false);
+                send_btn.set_tooltip_text(Some("Cannot send from this account"));
+            }
+
+            from_dropdown.connect_selected_notify(move |dropdown| {
+                let idx = dropdown.selected() as usize;
+                if idx < sendable.len() {
+                    if sendable[idx] {
+                        warning_btn.set_visible(false);
+                        send_btn.set_sensitive(true);
+                        send_btn.set_tooltip_text(None);
+                    } else {
+                        warning_btn.set_visible(true);
+                        send_btn.set_sensitive(false);
+                        send_btn.set_tooltip_text(Some("Cannot send from this account"));
+                    }
+                }
+            });
+        }
+
+        // Warning button click handler - show explanation dialog
+        {
+            let compose_win = compose_window.clone();
+            warning_button.connect_clicked(move |_| {
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Cannot Send from This Account")
+                    .body("Microsoft/Hotmail consumer accounts don't support OAuth2 for sending emails. This is a Microsoft limitation.\n\nTo send from this account, you can:\n1. Go to GNOME Settings → Online Accounts\n2. Remove this account\n3. Re-add it as \"IMAP and SMTP\" with your email and an App Password\n\nYou can generate an App Password in your Microsoft account security settings (requires 2-factor authentication).")
+                    .build();
+                dialog.add_response("ok", "OK");
+                dialog.set_default_response(Some("ok"));
+                dialog.present(Some(&compose_win));
+            });
+        }
+
         // Send button
         let window_ref = self.clone();
         let compose_win_ref = compose_window.clone();
@@ -1063,6 +1429,7 @@ impl NorthMailWindow {
         let was_sent_send = was_sent.clone();
         let draft_state_send = draft_state.clone();
         let timer_source_send = timer_source.clone();
+        let attachments_send = attachments.clone();
         send_button.connect_clicked(move |_| {
             let to_list = to_chips.borrow().clone();
             let cc_list = cc_chips.borrow().clone();
@@ -1072,6 +1439,13 @@ impl NorthMailWindow {
                 let (start, end) = buf.bounds();
                 buf.text(&start, &end, false).to_string()
             };
+
+            // Collect attachments: (filename, mime_type, data)
+            let att_list: Vec<(String, String, Vec<u8>)> = attachments_send
+                .borrow()
+                .iter()
+                .map(|(f, m, d, _)| (f.clone(), m.clone(), d.clone()))
+                .collect();
 
             if to_list.is_empty() {
                 if let Some(win) = window_ref.downcast_ref::<NorthMailWindow>() {
@@ -1104,6 +1478,7 @@ impl NorthMailWindow {
                         cc_list,
                         subject,
                         body,
+                        att_list,
                         move |result| {
                             match result {
                                 Ok(()) => {
@@ -1184,6 +1559,51 @@ impl NorthMailWindow {
         compose_window.present();
     }
 
+    /// Guess MIME type from filename extension
+    fn guess_mime_type(filename: &str) -> String {
+        let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
+        match ext.as_str() {
+            "pdf" => "application/pdf",
+            "doc" => "application/msword",
+            "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "xls" => "application/vnd.ms-excel",
+            "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "ppt" => "application/vnd.ms-powerpoint",
+            "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "txt" => "text/plain",
+            "html" | "htm" => "text/html",
+            "css" => "text/css",
+            "js" => "application/javascript",
+            "json" => "application/json",
+            "xml" => "application/xml",
+            "zip" => "application/zip",
+            "gz" | "gzip" => "application/gzip",
+            "tar" => "application/x-tar",
+            "rar" => "application/vnd.rar",
+            "7z" => "application/x-7z-compressed",
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "svg" => "image/svg+xml",
+            "ico" => "image/x-icon",
+            "bmp" => "image/bmp",
+            "tiff" | "tif" => "image/tiff",
+            "mp3" => "audio/mpeg",
+            "wav" => "audio/wav",
+            "ogg" => "audio/ogg",
+            "flac" => "audio/flac",
+            "m4a" => "audio/mp4",
+            "mp4" => "video/mp4",
+            "webm" => "video/webm",
+            "avi" => "video/x-msvideo",
+            "mov" => "video/quicktime",
+            "mkv" => "video/x-matroska",
+            "eml" => "message/rfc822",
+            _ => "application/octet-stream",
+        }.to_string()
+    }
+
     /// Build an inline chip-based recipient row (label + wrapping chips + entry)
     fn build_chip_row(
         label_text: &str,
@@ -1202,8 +1622,7 @@ impl NorthMailWindow {
             .label(label_text)
             .xalign(1.0)
             .width_request(label_width)
-            .valign(gtk4::Align::Start)
-            .margin_top(6)
+            .valign(gtk4::Align::Center)
             .css_classes(["dim-label", "compose-field-label"])
             .build();
 
@@ -1226,7 +1645,6 @@ impl NorthMailWindow {
             .has_frame(false)
             .placeholder_text("Add recipient")
             .css_classes(["compose-entry"])
-            .width_request(150)
             .build();
 
         chip_flow.append(&entry);

@@ -5,5 +5,5 @@
 mod client;
 mod error;
 
-pub use client::{build_lettre_message, OutgoingMessage, SmtpClient};
+pub use client::{build_lettre_message, OutgoingAttachment, OutgoingMessage, SmtpClient};
 pub use error::{SmtpError, SmtpResult};

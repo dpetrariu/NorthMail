@@ -375,6 +375,41 @@ mod imp {
             self.parent_startup();
             info!("Application starting up");
 
+            // Set human-readable application name (shown in GNOME shell, app switcher, etc.)
+            glib::set_application_name("NorthMail");
+
+            // Load bundled resources (compiled by build.rs)
+            if let Some(gresource_path) = option_env!("GRESOURCE_FILE") {
+                if let Ok(resource) = gio::Resource::load(gresource_path) {
+                    gio::resources_register(&resource);
+                    info!("Loaded bundled resources from {}", gresource_path);
+                }
+            }
+
+            // Add local icons directory to icon theme search path (for development)
+            if let Some(display) = gtk4::gdk::Display::default() {
+                let icon_theme = gtk4::IconTheme::for_display(&display);
+
+                // Add bundled resource path for icons
+                icon_theme.add_resource_path("/org/northmail/NorthMail/icons");
+
+                // Add project's data/icons directory for development builds
+                let exe_path = std::env::current_exe().ok();
+                if let Some(exe) = exe_path {
+                    // Check if running from target/debug or target/release
+                    if let Some(target_dir) = exe.parent() {
+                        let project_root = target_dir.parent().and_then(|p| p.parent());
+                        if let Some(root) = project_root {
+                            let icons_path = root.join("data").join("icons");
+                            if icons_path.exists() {
+                                icon_theme.add_search_path(&icons_path);
+                                info!("Added icon search path: {:?}", icons_path);
+                            }
+                        }
+                    }
+                }
+            }
+
             let app = self.obj();
             app.setup_actions();
         }
@@ -545,6 +580,11 @@ impl NorthMailApplication {
                                     info!("No GOA mail accounts found");
                                 } else {
                                     info!("Found {} GOA mail accounts", accounts.len());
+
+                                    // Sort accounts alphabetically by email for consistent ordering
+                                    let mut accounts = accounts;
+                                    accounts.sort_by(|a, b| a.email.to_lowercase().cmp(&b.email.to_lowercase()));
+
                                     for account in &accounts {
                                         info!(
                                             "  - {} ({}) [{}]",
@@ -4630,6 +4670,7 @@ impl NorthMailApplication {
         cc: Vec<String>,
         subject: String,
         body: String,
+        attachments: Vec<(String, String, Vec<u8>)>, // (filename, mime_type, data)
         callback: impl FnOnce(Result<(), String>) + 'static,
     ) {
         let accounts = self.imp().accounts.borrow().clone();
@@ -4652,6 +4693,9 @@ impl NorthMailApplication {
         let account_id = account.id.clone();
         let email = account.email.clone();
         let auth_type = account.auth_type.clone();
+        let provider_type = account.provider_type.clone();
+        let imap_host = account.imap_host.clone();
+        let imap_username = account.imap_username.clone();
 
         // Get user's display name from the system for From header
         let real_name = glib::real_name().to_string_lossy().to_string();
@@ -4679,6 +4723,12 @@ impl NorthMailApplication {
             msg = msg.cc(addr);
         }
         msg = msg.text(&body);
+        for (filename, mime_type, data) in attachments {
+            msg = msg.attachment(filename, mime_type, data);
+        }
+
+        // We need msg for both SMTP send and potentially Sent folder save
+        let msg_for_sent = msg.clone();
 
         // Spawn async task for sending
         glib::spawn_future_local(async move {
@@ -4693,31 +4743,75 @@ impl NorthMailApplication {
 
                         let smtp_client = northmail_smtp::SmtpClient::new(&smtp_host, 587);
 
-                        match auth_type {
-                            northmail_auth::GoaAuthType::OAuth2 => {
-                                let (email, token) = auth_manager
-                                    .get_xoauth2_token_for_goa(&account_id)
-                                    .await
-                                    .map_err(|e| format!("Failed to get token: {}", e))?;
-                                smtp_client
-                                    .send_xoauth2(&email, &token, msg)
-                                    .await
-                                    .map_err(|e| format!("Send failed: {}", e))
+                        // Microsoft/Outlook OAuth2 tokens from GOA don't have SMTP.Send scope,
+                        // so we need to use password auth for SMTP with Microsoft accounts
+                        let is_microsoft = provider_type == "windows_live" || provider_type == "microsoft";
+                        let is_gmail = provider_type == "google";
+
+                        let smtp_result = if is_microsoft {
+                            // Try password auth for Microsoft accounts
+                            match auth_manager.get_goa_password(&account_id).await {
+                                Ok(password) => {
+                                    eprintln!("[send] Using password auth for Microsoft SMTP");
+                                    smtp_client
+                                        .send_password(&email, &password, msg)
+                                        .await
+                                        .map_err(|e| format!("Send failed: {}", e))
+                                }
+                                Err(e) => {
+                                    Err(format!("Microsoft accounts require an app password for SMTP. \
+                                        GOA OAuth2 tokens don't have SMTP permissions. Error: {}", e))
+                                }
                             }
-                            northmail_auth::GoaAuthType::Password => {
-                                let password = auth_manager
-                                    .get_goa_password(&account_id)
-                                    .await
-                                    .map_err(|e| format!("Failed to get password: {}", e))?;
-                                smtp_client
-                                    .send_password(&email, &password, msg)
-                                    .await
-                                    .map_err(|e| format!("Send failed: {}", e))
+                        } else {
+                            match auth_type.clone() {
+                                northmail_auth::GoaAuthType::OAuth2 => {
+                                    let (email, token) = auth_manager
+                                        .get_xoauth2_token_for_goa(&account_id)
+                                        .await
+                                        .map_err(|e| format!("Failed to get token: {}", e))?;
+                                    smtp_client
+                                        .send_xoauth2(&email, &token, msg)
+                                        .await
+                                        .map_err(|e| format!("Send failed: {}", e))
+                                }
+                                northmail_auth::GoaAuthType::Password => {
+                                    let password = auth_manager
+                                        .get_goa_password(&account_id)
+                                        .await
+                                        .map_err(|e| format!("Failed to get password: {}", e))?;
+                                    smtp_client
+                                        .send_password(&email, &password, msg)
+                                        .await
+                                        .map_err(|e| format!("Send failed: {}", e))
+                                }
+                                northmail_auth::GoaAuthType::Unknown => {
+                                    Err("Unsupported auth type".to_string())
+                                }
                             }
-                            northmail_auth::GoaAuthType::Unknown => {
-                                Err("Unsupported auth type".to_string())
+                        };
+
+                        // If SMTP succeeded and not Gmail (Gmail auto-saves to Sent), save to Sent folder
+                        if smtp_result.is_ok() && !is_gmail {
+                            eprintln!("[send] Saving to Sent folder...");
+                            if let Err(e) = Self::save_to_sent_folder(
+                                &auth_manager,
+                                &account_id,
+                                &email,
+                                &auth_type,
+                                &provider_type,
+                                imap_host.as_deref(),
+                                imap_username.as_deref(),
+                                &msg_for_sent,
+                            ).await {
+                                // Log but don't fail the send - message was sent successfully
+                                eprintln!("[send] Warning: failed to save to Sent folder: {}", e);
+                            } else {
+                                eprintln!("[send] Saved to Sent folder");
                             }
                         }
+
+                        smtp_result
                     }.await;
                     match &result {
                         Ok(()) => eprintln!("[send] success!"),
@@ -4866,6 +4960,83 @@ impl NorthMailApplication {
 
             callback(result);
         });
+    }
+
+    /// Save a sent message to the Sent folder via IMAP APPEND
+    /// (For non-Gmail providers that don't auto-save sent messages)
+    async fn save_to_sent_folder(
+        auth_manager: &AuthManager,
+        account_id: &str,
+        email: &str,
+        auth_type: &northmail_auth::GoaAuthType,
+        provider_type: &str,
+        imap_host: Option<&str>,
+        imap_username: Option<&str>,
+        msg: &northmail_smtp::OutgoingMessage,
+    ) -> Result<(), String> {
+        // Build RFC 2822 message bytes
+        let lettre_msg = northmail_smtp::build_lettre_message(msg)
+            .map_err(|e| format!("Failed to build message: {}", e))?;
+        let message_bytes = lettre_msg.formatted();
+
+        // Connect to IMAP
+        let mut client = SimpleImapClient::new();
+
+        match auth_type {
+            northmail_auth::GoaAuthType::OAuth2 => {
+                let (_email, token) = auth_manager
+                    .get_xoauth2_token_for_goa(account_id)
+                    .await
+                    .map_err(|e| format!("Failed to get token: {}", e))?;
+
+                match provider_type {
+                    "google" => client.connect_gmail(email, &token).await,
+                    _ => client.connect_outlook(email, &token).await,
+                }
+                .map_err(|e| format!("IMAP connect failed: {}", e))?;
+            }
+            northmail_auth::GoaAuthType::Password => {
+                let password = auth_manager
+                    .get_goa_password(account_id)
+                    .await
+                    .map_err(|e| format!("Failed to get password: {}", e))?;
+
+                // Use provided IMAP host or default based on provider
+                let host = imap_host.unwrap_or("imap.mail.me.com");
+                let username = imap_username.unwrap_or(email);
+
+                client
+                    .connect_login(host, 993, username, &password)
+                    .await
+                    .map_err(|e| format!("IMAP connect failed: {}", e))?;
+            }
+            northmail_auth::GoaAuthType::Unknown => {
+                return Err("Unsupported auth type".to_string());
+            }
+        }
+
+        // APPEND to Sent folder with \Seen flag
+        // Try common Sent folder names
+        let sent_folders = ["Sent", "Sent Messages", "Sent Items", "[Gmail]/Sent Mail"];
+        let mut appended = false;
+
+        for sent_folder in &sent_folders {
+            match client.append(sent_folder, &["\\Seen"], &message_bytes).await {
+                Ok(_) => {
+                    appended = true;
+                    break;
+                }
+                Err(_) => continue, // Try next folder name
+            }
+        }
+
+        let _ = client.logout().await;
+
+        if appended {
+            Ok(())
+        } else {
+            Err("Could not find Sent folder".to_string())
+        }
     }
 
     /// Delete a draft from the IMAP Drafts folder by UID
