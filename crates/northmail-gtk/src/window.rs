@@ -8,6 +8,65 @@ use libadwaita::prelude::*;
 use std::rc::Rc;
 use tracing::debug;
 
+/// Mode for compose dialog
+#[derive(Clone, Default)]
+pub enum ComposeMode {
+    #[default]
+    New,
+    Reply {
+        to: String,
+        subject: String,
+        quoted_body: String,
+        in_reply_to: Option<String>,
+        references: Vec<String>,
+    },
+    ReplyAll {
+        to: Vec<String>,
+        cc: Vec<String>,
+        subject: String,
+        quoted_body: String,
+        in_reply_to: Option<String>,
+        references: Vec<String>,
+    },
+    Forward {
+        subject: String,
+        quoted_body: String,
+        attachments: Vec<(String, String, Vec<u8>)>, // (filename, mime_type, data)
+    },
+}
+
+/// Extract email address from a "Name <email>" or "email" string
+fn extract_email_address(from: &str) -> String {
+    if let Some(start) = from.find('<') {
+        if let Some(end) = from.find('>') {
+            return from[start + 1..end].trim().to_string();
+        }
+    }
+    from.trim().to_string()
+}
+
+/// Format the quoted body for reply
+fn format_quoted_body(from: &str, date: &str, body: &str) -> String {
+    let mut quoted = format!("\n\nOn {}, {} wrote:\n", date, from);
+    for line in body.lines() {
+        quoted.push_str(&format!("> {}\n", line));
+    }
+    quoted
+}
+
+/// Format the body for forward
+fn format_forward_body(from: &str, to: &[String], date: &str, subject: &str, body: &str) -> String {
+    let mut fwd = String::from("\n\n---------- Forwarded message ----------\n");
+    fwd.push_str(&format!("From: {}\n", from));
+    fwd.push_str(&format!("Date: {}\n", date));
+    fwd.push_str(&format!("Subject: {}\n", subject));
+    if !to.is_empty() {
+        fwd.push_str(&format!("To: {}\n", to.join(", ")));
+    }
+    fwd.push('\n');
+    fwd.push_str(body);
+    fwd
+}
 
 mod imp {
     use super::*;
@@ -271,15 +330,25 @@ impl NorthMailWindow {
         // Adjust button positions when sidebar visibility changes
         let toggle_for_signal = sidebar_toggle.clone();
         let compose_for_signal = compose_button.clone();
+        let inner_split_for_signal = imp.inner_split.clone();
         imp.outer_split.connect_notify_local(Some("show-sidebar"), move |split, _| {
             if split.shows_sidebar() {
                 // Sidebar visible: push buttons to align with columns
                 toggle_for_signal.set_margin_start(126);
                 compose_for_signal.set_margin_start(0);
             } else {
-                // Sidebar hidden: move buttons next to title
+                // Sidebar hidden: toggle next to title, compose above message view
                 toggle_for_signal.set_margin_start(8);
-                compose_for_signal.set_margin_start(8);
+                // Position compose button at the message list/view boundary
+                // Message list is ~40% of width, with min 300px
+                // Calculate dynamically based on current inner_split width
+                let list_width = inner_split_for_signal.sidebar_width_fraction();
+                let total_width = inner_split_for_signal.width() as f64;
+                // Account for: title box (~104px) + toggle button (~50px)
+                let header_offset = 154.0;
+                let target_pos = total_width * list_width;
+                let margin = (target_pos - header_offset).max(8.0) as i32;
+                compose_for_signal.set_margin_start(margin);
             }
         });
 
@@ -373,6 +442,95 @@ impl NorthMailWindow {
                 .icon_name("mail-forward-symbolic")
                 .tooltip_text("Forward")
                 .build();
+
+            // Shared state for body text (populated when body loads)
+            let body_text: Rc<std::cell::RefCell<Option<String>>> = Rc::new(std::cell::RefCell::new(None));
+
+            // Connect reply button
+            {
+                let window = self.clone();
+                let msg_clone = msg.clone();
+                let body_text = body_text.clone();
+                reply_button.connect_clicked(move |_| {
+                    let body = body_text.borrow().clone().unwrap_or_default();
+                    let reply_to = extract_email_address(&msg_clone.from);
+                    let subject = if msg_clone.subject.to_lowercase().starts_with("re:") {
+                        msg_clone.subject.clone()
+                    } else {
+                        format!("Re: {}", msg_clone.subject)
+                    };
+                    let quoted = format_quoted_body(&msg_clone.from, &msg_clone.date, &body);
+                    let mode = ComposeMode::Reply {
+                        to: reply_to,
+                        subject,
+                        quoted_body: quoted,
+                        in_reply_to: None,
+                        references: Vec::new(),
+                    };
+                    window.show_compose_dialog_with_mode(mode);
+                });
+            }
+
+            // Connect reply-all button
+            {
+                let window = self.clone();
+                let msg_clone = msg.clone();
+                let body_text = body_text.clone();
+                reply_all_button.connect_clicked(move |_| {
+                    let body = body_text.borrow().clone().unwrap_or_default();
+                    let reply_to = extract_email_address(&msg_clone.from);
+                    // For reply-all, include all To recipients
+                    let to_addrs = vec![reply_to];
+                    // Parse additional recipients from the To field (comma-separated)
+                    let cc_addrs: Vec<String> = msg_clone.to
+                        .split(',')
+                        .map(|s| extract_email_address(s.trim()))
+                        .filter(|e| !to_addrs.contains(e))
+                        .collect();
+
+                    let subject = if msg_clone.subject.to_lowercase().starts_with("re:") {
+                        msg_clone.subject.clone()
+                    } else {
+                        format!("Re: {}", msg_clone.subject)
+                    };
+                    let quoted = format_quoted_body(&msg_clone.from, &msg_clone.date, &body);
+                    let mode = ComposeMode::ReplyAll {
+                        to: to_addrs,
+                        cc: cc_addrs,
+                        subject,
+                        quoted_body: quoted,
+                        in_reply_to: None,
+                        references: Vec::new(),
+                    };
+                    window.show_compose_dialog_with_mode(mode);
+                });
+            }
+
+            // Connect forward button
+            {
+                let window = self.clone();
+                let msg_clone = msg.clone();
+                let body_text = body_text.clone();
+                forward_button.connect_clicked(move |_| {
+                    let body = body_text.borrow().clone().unwrap_or_default();
+                    let subject = if msg_clone.subject.to_lowercase().starts_with("fwd:") {
+                        msg_clone.subject.clone()
+                    } else {
+                        format!("Fwd: {}", msg_clone.subject)
+                    };
+                    let to_list: Vec<String> = msg_clone.to
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .collect();
+                    let quoted = format_forward_body(&msg_clone.from, &to_list, &msg_clone.date, &msg_clone.subject, &body);
+                    let mode = ComposeMode::Forward {
+                        subject,
+                        quoted_body: quoted,
+                        attachments: Vec::new(), // TODO: forward attachments
+                    };
+                    window.show_compose_dialog_with_mode(mode);
+                });
+            }
 
             let archive_button = gtk4::Button::builder()
                 .icon_name("folder-symbolic")
@@ -569,6 +727,7 @@ impl NorthMailWindow {
             // Fetch message body
             let body_box_ref = body_box.clone();
             let attachment_box_ref = attachment_box.clone();
+            let body_text_for_fetch = body_text.clone();
             if let Some(app) = self.application() {
                 if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
                     let msg_folder_id = if msg.folder_id != 0 { Some(msg.folder_id) } else { None };
@@ -580,6 +739,17 @@ impl NorthMailWindow {
 
                         match result {
                             Ok(parsed) => {
+                                // Store plain text for reply/forward
+                                // Prefer text version, fall back to stripped HTML
+                                let plain_text = if let Some(ref text) = parsed.text {
+                                    text.clone()
+                                } else if let Some(ref html) = parsed.html {
+                                    NorthMailApplication::strip_html_tags_public(html)
+                                } else {
+                                    String::new()
+                                };
+                                *body_text_for_fetch.borrow_mut() = Some(plain_text);
+
                                 // Prefer HTML if available, otherwise use plain text
                                 if let Some(html) = parsed.html {
                                     #[cfg(feature = "webkit")]
@@ -812,7 +982,11 @@ impl NorthMailWindow {
     }
 
     fn show_compose_dialog(&self) {
-        debug!("Opening compose window");
+        self.show_compose_dialog_with_mode(ComposeMode::New);
+    }
+
+    fn show_compose_dialog_with_mode(&self, mode: ComposeMode) {
+        debug!("Opening compose window with mode");
 
         // Compose-specific CSS
         let css_provider = gtk4::CssProvider::new();
@@ -940,8 +1114,8 @@ impl NorthMailWindow {
         let cc_chips: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
             std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
 
-        let to_row = Self::build_chip_row("To", to_chips.clone(), self, label_width);
-        let cc_row = Self::build_chip_row("Cc", cc_chips.clone(), self, label_width);
+        let (to_row, to_add_chip) = Self::build_chip_row("To", to_chips.clone(), self, label_width);
+        let (cc_row, cc_add_chip) = Self::build_chip_row("Cc", cc_chips.clone(), self, label_width);
 
         fields_box.append(&to_row);
         fields_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
@@ -1006,6 +1180,42 @@ impl NorthMailWindow {
             .build();
 
         content.append(&scrolled);
+
+        // Pre-fill fields based on compose mode
+        match &mode {
+            ComposeMode::New => {}
+            ComposeMode::Reply { to, subject, quoted_body, .. } => {
+                // Add the recipient chip (closure handles both UI and data)
+                to_add_chip(to, to);
+                subject_entry.set_text(subject);
+                text_view.buffer().set_text(quoted_body);
+            }
+            ComposeMode::ReplyAll { to, cc, subject, quoted_body, .. } => {
+                // Add To recipients
+                for addr in to {
+                    to_add_chip(addr, addr);
+                }
+                // Add Cc recipients
+                for addr in cc {
+                    cc_add_chip(addr, addr);
+                }
+                subject_entry.set_text(subject);
+                text_view.buffer().set_text(quoted_body);
+            }
+            ComposeMode::Forward { subject, quoted_body, attachments: fwd_attachments } => {
+                subject_entry.set_text(subject);
+                text_view.buffer().set_text(quoted_body);
+                // Add forwarded attachments
+                for (filename, mime_type, data) in fwd_attachments {
+                    attachments.borrow_mut().push((
+                        filename.clone(),
+                        mime_type.clone(),
+                        data.clone(),
+                        None,
+                    ));
+                }
+            }
+        }
 
         // Attachments area at bottom (hidden until files are added)
         let attachments_box = gtk4::Box::builder()
@@ -1610,7 +1820,7 @@ impl NorthMailWindow {
         chips: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
         window: &NorthMailWindow,
         label_width: i32,
-    ) -> gtk4::Box {
+    ) -> (gtk4::Box, Rc<dyn Fn(&str, &str)>) {
         let row = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
             .spacing(6)
@@ -1682,11 +1892,11 @@ impl NorthMailWindow {
         popover.set_parent(&entry);
 
         // --- Add chip helper ---
-        let add_chip = {
+        let add_chip: Rc<dyn Fn(&str, &str)> = {
             let chip_flow = chip_flow.clone();
             let chips = chips.clone();
             let entry = entry.clone();
-            move |display: &str, email: &str| {
+            Rc::new(move |display: &str, email: &str| {
                 // Show just the name in the chip (or email if no name)
                 let chip_text = if display.is_empty() || display == email {
                     email.to_string()
@@ -1742,8 +1952,9 @@ impl NorthMailWindow {
 
                 entry.set_text("");
                 entry.grab_focus();
-            }
+            })
         };
+        let add_chip_return = add_chip.clone();
 
         // Enter key → add manual entry
         let add_chip_enter = add_chip.clone();
@@ -1844,7 +2055,7 @@ impl NorthMailWindow {
             });
         });
 
-        row
+        (row, add_chip_return)
     }
 
     fn refresh_messages(&self) {
@@ -1864,7 +2075,9 @@ impl NorthMailWindow {
         let Some(app) = app.downcast_ref::<NorthMailApplication>() else { return };
 
         let folder_id = app.cache_folder_id();
+        debug!("Search requested: query='{}', folder_id={}", query, folder_id);
         if folder_id == 0 {
+            debug!("Search aborted: folder_id is 0 (not yet set)");
             return;
         }
 

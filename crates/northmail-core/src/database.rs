@@ -5,6 +5,28 @@ use sqlx::{sqlite::SqlitePoolOptions, Pool, Row, Sqlite};
 use std::path::Path;
 use tracing::{debug, info};
 
+/// Prepare a user query for FTS5 search with prefix matching
+/// Transforms "jenni smith" → "jenni* smith*" for partial word matching
+fn prepare_fts_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(|word| {
+            // Escape special FTS5 characters and add wildcard
+            let escaped = word
+                .replace('"', "\"\"")
+                .replace('*', "")
+                .replace(':', " ");
+            if escaped.is_empty() {
+                String::new()
+            } else {
+                format!("{}*", escaped)
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Database folder record
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DbFolder {
@@ -232,6 +254,9 @@ impl Database {
         // Migration: Add date_epoch column if it doesn't exist
         self.migrate_add_date_epoch().await?;
 
+        // Migration: Rebuild FTS index to ensure all messages are indexed
+        self.migrate_rebuild_fts().await?;
+
         info!("Database schema initialized");
         Ok(())
     }
@@ -276,6 +301,49 @@ impl Database {
                 .execute(&self.pool)
                 .await
                 .ok();
+        }
+
+        Ok(())
+    }
+
+    /// Rebuild FTS index to ensure all messages are indexed
+    /// This is needed because messages inserted before the FTS table existed won't be in the index
+    async fn migrate_rebuild_fts(&self) -> CoreResult<()> {
+        // Check if there are messages not in FTS by comparing counts
+        let msg_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
+
+        let fts_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages_fts")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
+
+        if msg_count > fts_count {
+            info!(
+                "FTS index incomplete ({} messages, {} indexed). Rebuilding...",
+                msg_count, fts_count
+            );
+
+            // Rebuild FTS index by re-inserting all messages
+            // First delete all FTS entries
+            sqlx::query("DELETE FROM messages_fts")
+                .execute(&self.pool)
+                .await
+                .ok();
+
+            // Then repopulate from messages table
+            sqlx::query(
+                r#"
+                INSERT INTO messages_fts(rowid, subject, from_address, from_name, snippet)
+                SELECT id, subject, from_address, from_name, snippet FROM messages
+                "#,
+            )
+            .execute(&self.pool)
+            .await?;
+
+            info!("FTS index rebuilt with {} messages", msg_count);
         }
 
         Ok(())
@@ -639,6 +707,13 @@ impl Database {
 
     /// Search messages using FTS
     pub async fn search_messages(&self, query: &str, limit: i64) -> CoreResult<Vec<DbMessage>> {
+        let fts_query = prepare_fts_query(query);
+        debug!("FTS search: '{}' -> '{}'", query, fts_query);
+
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let messages = sqlx::query_as::<_, DbMessage>(
             r#"
             SELECT m.id, m.folder_id, m.uid, m.message_id, m.subject, m.from_address,
@@ -652,7 +727,7 @@ impl Database {
             LIMIT ?
             "#,
         )
-        .bind(query)
+        .bind(&fts_query)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -667,6 +742,13 @@ impl Database {
         query: &str,
         limit: i64,
     ) -> CoreResult<Vec<DbMessage>> {
+        let fts_query = prepare_fts_query(query);
+        debug!("FTS folder search: '{}' -> '{}' (folder_id={})", query, fts_query, folder_id);
+
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let messages = sqlx::query_as::<_, DbMessage>(
             r#"
             SELECT m.id, m.folder_id, m.uid, m.message_id, m.subject, m.from_address,
@@ -680,7 +762,7 @@ impl Database {
             LIMIT ?
             "#,
         )
-        .bind(query)
+        .bind(&fts_query)
         .bind(folder_id)
         .bind(limit)
         .fetch_all(&self.pool)
@@ -943,6 +1025,13 @@ impl Database {
         query: &str,
         limit: i64,
     ) -> CoreResult<Vec<DbMessage>> {
+        let fts_query = prepare_fts_query(query);
+        debug!("FTS inbox search: '{}' -> '{}'", query, fts_query);
+
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let messages = sqlx::query_as::<_, DbMessage>(
             r#"
             SELECT m.id, m.folder_id, m.uid, m.message_id, m.subject, m.from_address,
@@ -957,7 +1046,7 @@ impl Database {
             LIMIT ?
             "#,
         )
-        .bind(query)
+        .bind(&fts_query)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;

@@ -213,28 +213,8 @@ impl MessageList {
             .hexpand(true)
             .build();
 
-        // As-you-type filtering
-        let widget_search = self.clone();
-        search_entry.connect_search_changed(move |entry| {
-            let query = entry.text().to_string();
-            widget_search.imp().search_query.replace(query);
-            widget_search.apply_filter();
-        });
-
-        // Enter → emit search-requested for FTS database search
-        let widget_activate = self.clone();
-        search_entry.connect_activate(move |entry| {
-            let query = entry.text().to_string();
-            widget_activate.emit_by_name::<()>("search-requested", &[&query]);
-        });
-
-        // Escape / clear → reset search, emit empty search-requested to reload
-        let widget_stop = self.clone();
-        search_entry.connect_stop_search(move |entry| {
-            entry.set_text("");
-            widget_stop.imp().search_query.replace(String::new());
-            widget_stop.emit_by_name::<()>("search-requested", &[&String::new()]);
-        });
+        // Store search entry reference early so we can connect signals after setup
+        let search_entry_for_signals = search_entry.clone();
 
         // --- Filter MenuButton with Popover ---
         let filter_button = self.build_filter_button();
@@ -275,6 +255,55 @@ impl MessageList {
 
         imp.scrolled.replace(Some(scrolled));
         imp.list_box.replace(Some(list_box));
+
+        // Connect search signals AFTER all widgets are fully initialized
+        // As-you-type filtering with simple debounce (no source removal)
+        let widget_search = self.clone();
+        let pending_query: std::rc::Rc<std::cell::RefCell<Option<String>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let pending_for_closure = pending_query.clone();
+        search_entry_for_signals.connect_search_changed(move |entry| {
+            let query = entry.text().to_string();
+            widget_search.imp().search_query.replace(query.clone());
+            widget_search.apply_filter();
+
+            // Store pending query and schedule debounced FTS search
+            if !query.is_empty() {
+                *pending_for_closure.borrow_mut() = Some(query.clone());
+                let widget_weak = widget_search.downgrade();
+                let pending = pending_for_closure.clone();
+                let expected_query = query;
+                glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(300),
+                    move || {
+                        // Only emit if the query hasn't changed since we scheduled this
+                        let current = pending.borrow().clone();
+                        if current.as_ref() == Some(&expected_query) {
+                            if let Some(widget) = widget_weak.upgrade() {
+                                widget.emit_by_name::<()>("search-requested", &[&expected_query]);
+                            }
+                        }
+                    },
+                );
+            } else {
+                *pending_for_closure.borrow_mut() = None;
+            }
+        });
+
+        // Enter → immediate FTS database search
+        let widget_activate = self.clone();
+        search_entry_for_signals.connect_activate(move |entry| {
+            let query = entry.text().to_string();
+            widget_activate.emit_by_name::<()>("search-requested", &[&query]);
+        });
+
+        // Escape / clear → reset search, emit empty search-requested to reload
+        let widget_stop = self.clone();
+        search_entry_for_signals.connect_stop_search(move |entry| {
+            entry.set_text("");
+            widget_stop.imp().search_query.replace(String::new());
+            widget_stop.emit_by_name::<()>("search-requested", &[&String::new()]);
+        });
     }
 
     /// Build the filter MenuButton with its popover

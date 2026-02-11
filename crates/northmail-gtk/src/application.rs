@@ -688,6 +688,32 @@ impl NorthMailApplication {
         Self::is_google_account(account) || Self::is_microsoft_account(account) || Self::is_password_account(account)
     }
 
+    /// Convert folder path to a friendly display name
+    fn friendly_folder_name(folder_path: &str) -> String {
+        // Handle Gmail special folders like "[Gmail]/Sent Mail"
+        let name = if let Some(stripped) = folder_path.strip_prefix("[Gmail]/") {
+            stripped
+        } else if let Some(stripped) = folder_path.strip_prefix("[Google Mail]/") {
+            stripped
+        } else {
+            // Use the last path component for nested folders
+            folder_path.rsplit('/').next().unwrap_or(folder_path)
+        };
+
+        // Title case common folder names
+        match name.to_uppercase().as_str() {
+            "INBOX" => "Inbox".to_string(),
+            "SENT" | "SENT MAIL" | "SENT MESSAGES" | "SENT ITEMS" => "Sent".to_string(),
+            "DRAFTS" | "DRAFT" => "Drafts".to_string(),
+            "TRASH" | "DELETED" | "DELETED ITEMS" | "DELETED MESSAGES" => "Trash".to_string(),
+            "SPAM" | "JUNK" | "JUNK E-MAIL" | "JUNK MAIL" => "Junk".to_string(),
+            "ARCHIVE" | "ALL MAIL" => "Archive".to_string(),
+            "STARRED" | "FLAGGED" => "Starred".to_string(),
+            "IMPORTANT" => "Important".to_string(),
+            _ => name.to_string(),
+        }
+    }
+
     /// Restore last selected folder on startup
     fn restore_last_folder(&self) {
         // Load saved state
@@ -1784,13 +1810,16 @@ impl NorthMailApplication {
         // Save state to disk
         self.imp().state.borrow().save();
 
-        // Highlight the selected folder in the sidebar
+        // Highlight the selected folder in the sidebar and update window title
         if let Some(window) = self.active_window() {
             if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
                 if let Some(sidebar) = win.folder_sidebar() {
                     sidebar.select_folder(&account_id, &folder_path);
                 }
             }
+            // Update window title with friendly folder name
+            let folder_name = Self::friendly_folder_name(&folder_path);
+            window.set_title(Some(&format!("{} — NorthMail", folder_name)));
         }
 
         let account_email = account.email.clone();
@@ -3197,7 +3226,8 @@ impl NorthMailApplication {
             let _ = sender.send(result);
         });
 
-        match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+        // Short timeout - DB queries are usually fast, but don't block UI for too long
+        match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(Ok(Some(folder))) => Some((folder.account_id, folder.full_path)),
             _ => None,
         }
@@ -3213,6 +3243,11 @@ impl NorthMailApplication {
             state.unified_inbox = true;
             state.last_folder = None;
             state.save();
+        }
+
+        // Update window title
+        if let Some(window) = self.active_window() {
+            window.set_title(Some("All Inboxes — NorthMail"));
         }
 
         // Clear previous load state and set unified sentinel
@@ -3691,23 +3726,35 @@ impl NorthMailApplication {
             let _ = sender.send(result);
         });
 
+        // Non-blocking poll with yield to GTK main loop
+        let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(1);
-        match receiver.recv_timeout(timeout) {
-            Ok(Ok(Some((body_text, body_html)))) => {
-                // Only return if we have at least one body part
-                if body_text.is_some() || body_html.is_some() {
-                    info!("📧 Body cache HIT: Found cached body for message {}", uid);
-                    Some(ParsedEmailBody {
-                        text: body_text,
-                        html: body_html,
-                        attachments: Vec::new(),
-                    })
-                } else {
-                    info!("📭 Body cache MISS: No cached body for message {}", uid);
-                    None
+        loop {
+            match receiver.try_recv() {
+                Ok(Ok(Some((body_text, body_html)))) => {
+                    // Only return if we have at least one body part
+                    if body_text.is_some() || body_html.is_some() {
+                        info!("📧 Body cache HIT: Found cached body for message {}", uid);
+                        return Some(ParsedEmailBody {
+                            text: body_text,
+                            html: body_html,
+                            attachments: Vec::new(),
+                        });
+                    } else {
+                        info!("📭 Body cache MISS: No cached body for message {}", uid);
+                        return None;
+                    }
                 }
+                Ok(_) => return None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if start.elapsed() > timeout {
+                        return None;
+                    }
+                    // Yield to GTK main loop
+                    glib::timeout_future(std::time::Duration::from_millis(5)).await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
             }
-            _ => None,
         }
     }
 
