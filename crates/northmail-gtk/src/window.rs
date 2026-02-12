@@ -362,18 +362,27 @@ impl NorthMailWindow {
             outer_pos.saturating_sub(header_title_width + button_width + padding).max(8)
         };
 
-        let calc_compose_margin = |inner_pos: i32| -> i32 {
+        let calc_compose_margin = |outer_pos: i32, inner_pos: i32| -> i32 {
             // Position compose button at left edge of message view
-            // Only depends on inner_pos (message list width), not sidebar width
-            // The toggle button already moves with sidebar, compose follows after it
-            let offset = 56; // small offset to align with divider
-            inner_pos.saturating_sub(offset).max(8)
+            // When sidebar visible: needs to account for sidebar width
+            // When sidebar hidden: message list starts at left edge
+            if outer_pos == 0 {
+                // Sidebar collapsed - compose above filter button
+                let offset = 215; // header title + toggle button + padding
+                inner_pos.saturating_sub(offset).max(8)
+            } else {
+                // Sidebar visible - only inner_pos matters (toggle already at sidebar edge)
+                let offset = 58;
+                inner_pos.saturating_sub(offset).max(8)
+            }
         };
 
         // Update button positions when outer paned position changes
         let toggle_for_signal = sidebar_toggle.clone();
+        let compose_for_outer = compose_button.clone();
         let is_toggling_for_signal = is_toggling.clone();
         let saved_pos_for_signal = saved_position.clone();
+        let inner_paned_for_outer = imp.inner_paned.clone();
         imp.outer_paned.connect_notify_local(Some("position"), move |paned, _| {
             let pos = paned.position();
 
@@ -396,21 +405,24 @@ impl NorthMailWindow {
             }
 
             toggle_for_signal.set_margin_start(calc_toggle_margin(pos));
-            // Compose button only moves with inner paned, not outer
+            // Update compose position when sidebar collapses/expands
+            compose_for_outer.set_margin_start(calc_compose_margin(pos, inner_paned_for_outer.position()));
         });
 
         // Update compose button position when inner paned position changes
         let compose_for_inner = compose_button.clone();
+        let outer_paned_for_inner = imp.outer_paned.clone();
         imp.inner_paned.connect_notify_local(Some("position"), move |paned, _| {
             let inner_pos = paned.position();
-            compose_for_inner.set_margin_start(calc_compose_margin(inner_pos));
+            let outer_pos = outer_paned_for_inner.position();
+            compose_for_inner.set_margin_start(calc_compose_margin(outer_pos, inner_pos));
         });
 
         // Set initial button positions
         let initial_outer_pos = imp.outer_paned.position();
         let initial_inner_pos = imp.inner_paned.position();
         sidebar_toggle.set_margin_start(calc_toggle_margin(initial_outer_pos));
-        compose_button.set_margin_start(calc_compose_margin(initial_inner_pos));
+        compose_button.set_margin_start(calc_compose_margin(initial_outer_pos, initial_inner_pos));
 
         // Create and add folder sidebar
         let folder_sidebar = FolderSidebar::new();
