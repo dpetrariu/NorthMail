@@ -430,6 +430,9 @@ mod imp {
                         }
                     }
                 }
+
+                // Set the default window icon for all windows
+                gtk4::Window::set_default_icon_name("org.northmail.NorthMail");
             }
 
             let app = self.obj();
@@ -558,7 +561,7 @@ impl NorthMailApplication {
         }
     }
 
-    /// Check for new mail by comparing IMAP counts with cache and fetching new messages
+    /// Check for new mail by comparing IMAP counts with previously seen counts
     fn check_for_new_mail(&self) {
         // Prevent overlapping syncs
         if self.imp().sync_in_progress.get() {
@@ -571,9 +574,6 @@ impl NorthMailApplication {
 
         let app = self.clone();
         glib::spawn_future_local(async move {
-            // Get current cache counts
-            let cache_counts = app.get_all_inbox_counts().await;
-
             let accounts = app.imp().accounts.borrow().clone();
             let mut new_messages: Vec<(String, i64)> = Vec::new();
             let mut accounts_to_refresh: Vec<northmail_auth::GoaAccount> = Vec::new();
@@ -586,15 +586,24 @@ impl NorthMailApplication {
 
                 // Get IMAP inbox count via STATUS
                 let imap_count = app.get_imap_inbox_count(account).await;
-                let cache_count = cache_counts.get(&account.id).copied().unwrap_or(0);
 
-                if imap_count > cache_count {
-                    let diff = imap_count - cache_count;
-                    info!("Account {} has {} new messages (IMAP: {}, cache: {})",
-                          account.email, diff, imap_count, cache_count);
+                // Compare with last known IMAP count (not cache count)
+                let last_count = app.imp().last_inbox_counts.borrow()
+                    .get(&account.id)
+                    .copied()
+                    .unwrap_or(imap_count); // If not initialized, assume no new
+
+                if imap_count > last_count {
+                    let diff = imap_count - last_count;
+                    info!("Account {} has {} new messages (IMAP: {}, last: {})",
+                          account.email, diff, imap_count, last_count);
                     new_messages.push((account.id.clone(), diff));
                     accounts_to_refresh.push(account.clone());
                 }
+
+                // Update last known count
+                app.imp().last_inbox_counts.borrow_mut()
+                    .insert(account.id.clone(), imap_count);
             }
 
             // Fetch new messages for accounts that have them
@@ -794,11 +803,14 @@ impl NorthMailApplication {
 
     /// Show desktop notification for new mail
     async fn notify_new_mail(&self, new_messages: &[(String, i64)]) {
+        info!("notify_new_mail called with {} accounts", new_messages.len());
         let settings = self.settings();
 
         // Check if notifications are enabled
-        if !settings.boolean("notifications-enabled") {
-            debug!("Notifications disabled, skipping");
+        let notifications_enabled = settings.boolean("notifications-enabled");
+        info!("notifications-enabled setting: {}", notifications_enabled);
+        if !notifications_enabled {
+            info!("Notifications disabled in settings, skipping");
             return;
         }
 
@@ -848,19 +860,33 @@ impl NorthMailApplication {
             ("New Email".to_string(), "You have a new message".to_string())
         };
 
-        // Send notification
-        if let Err(e) = notify_rust::Notification::new()
-            .summary(&summary)
-            .body(&body)
-            .icon("mail-unread")
-            .appname("NorthMail")
-            .timeout(notify_rust::Timeout::Milliseconds(5000))
-            .show()
-        {
-            error!("Failed to show notification: {}", e);
-        } else {
-            info!("Showed notification: {}", summary);
-        }
+        // Send notification using libnotify (works on both X11 and Wayland)
+        // Spawn in a thread to avoid blocking the GTK main loop
+        // IMPORTANT: Must wait for notification to complete for GNOME 46+ Wayland
+        // otherwise D-Bus connection closes before notification is displayed
+        let summary_clone = summary.clone();
+        let body_clone = body.clone();
+        std::thread::spawn(move || {
+            let notification = notify_rust::Notification::new()
+                .summary(&summary_clone)
+                .body(&body_clone)
+                .icon("org.northmail.NorthMail")
+                .appname("NorthMail")
+                .hint(notify_rust::Hint::Category("email.arrived".to_string()))
+                .urgency(notify_rust::Urgency::Normal)
+                .timeout(notify_rust::Timeout::Milliseconds(5000))
+                .finalize();
+
+            match notification.show() {
+                Ok(handle) => {
+                    tracing::info!("Notification sent, waiting for close");
+                    // Wait for notification to close - required for GNOME Wayland
+                    handle.wait_for_action(|_| {});
+                }
+                Err(e) => tracing::error!("Failed to show notification: {}", e),
+            }
+        });
+        info!("Showed notification: {}", summary);
     }
 
     /// Get sender and subject of the latest inbox message for an account
@@ -956,6 +982,20 @@ impl NorthMailApplication {
         let app = self.clone();
 
         glib::spawn_future_local(async move {
+            // Initialize last_inbox_counts from IMAP before starting IDLE
+            // This prevents false "new mail" notifications on startup
+            for account in &accounts {
+                if !Self::is_supported_account(account) {
+                    continue;
+                }
+                // Use IMAP count (not cache count) as baseline
+                let count = app.get_imap_inbox_count(account).await;
+                app.imp().last_inbox_counts.borrow_mut()
+                    .insert(account.id.clone(), count);
+                info!("Initialized IMAP inbox count for {}: {}", account.email, count);
+            }
+
+            // Now start IDLE for each account
             for account in accounts {
                 if !Self::is_supported_account(&account) {
                     continue;
@@ -1081,9 +1121,10 @@ impl NorthMailApplication {
             // Check for new messages
             let new_count = app.get_inbox_count_for_account(&account_id).await;
 
+            info!("IDLE sync: old_count={}, new_count={} for {}", old_count, new_count, account_id);
             if new_count > old_count {
                 let diff = new_count - old_count;
-                info!("IDLE sync found {} new messages", diff);
+                info!("IDLE sync found {} new messages, triggering notification", diff);
 
                 // Update stored count
                 app.imp().last_inbox_counts.borrow_mut()
@@ -1092,6 +1133,8 @@ impl NorthMailApplication {
                 // Show notification
                 let new_messages = vec![(account_id.clone(), diff)];
                 app.notify_new_mail(&new_messages).await;
+            } else {
+                info!("IDLE sync: no new messages detected (count unchanged)");
             }
 
             // Refresh unified inbox if that's what we're viewing
