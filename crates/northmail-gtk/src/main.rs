@@ -3,6 +3,7 @@
 //! Built with GTK4/libadwaita for a native GNOME experience.
 
 mod application;
+mod idle_manager;
 mod imap_pool;
 mod window;
 mod widgets;

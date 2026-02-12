@@ -1,5 +1,6 @@
 //! Main application setup
 
+use crate::idle_manager::{IdleAuthType, IdleCredentials, IdleManager, IdleManagerEvent};
 use crate::imap_pool::{ImapCommand, ImapCredentials, ImapPool, ImapResponse};
 use crate::widgets::MessageInfo;
 use crate::window::NorthMailWindow;
@@ -317,7 +318,8 @@ pub struct ParsedEmailBody {
 mod imp {
     use super::*;
     use libadwaita::subclass::prelude::*;
-    use std::cell::{OnceCell, RefCell};
+    use std::cell::{Cell, OnceCell, RefCell};
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tracing::info;
 
@@ -332,17 +334,27 @@ mod imp {
         pub(super) database: OnceCell<Arc<northmail_core::Database>>,
         /// Generation counter for folder fetches - increments each time a folder is selected
         /// Used to detect and ignore stale fetch results
-        pub(super) fetch_generation: std::cell::Cell<u64>,
+        pub(super) fetch_generation: Cell<u64>,
         /// IMAP connection pool for reusing connections
         pub(super) imap_pool: OnceCell<Arc<ImapPool>>,
         /// Current cache pagination offset (how many messages already loaded from cache)
-        pub(super) cache_offset: std::cell::Cell<i64>,
+        pub(super) cache_offset: Cell<i64>,
         /// Current folder ID in the database (for cache-based pagination)
-        pub(super) cache_folder_id: std::cell::Cell<i64>,
+        pub(super) cache_folder_id: Cell<i64>,
         /// Current folder type (inbox, drafts, sent, etc.) for UI behavior
         pub(super) current_folder_type: RefCell<String>,
         /// Cached contacts from EDS (preloaded at startup)
         pub(super) contacts_cache: RefCell<Vec<(String, String)>>,
+        /// Timer source ID for periodic mail checking
+        pub(super) sync_timer_source: RefCell<Option<glib::SourceId>>,
+        /// Whether a sync is currently in progress (prevent overlapping syncs)
+        pub(super) sync_in_progress: Cell<bool>,
+        /// Last known inbox message counts per account (for detecting new mail)
+        pub(super) last_inbox_counts: RefCell<HashMap<String, i64>>,
+        /// IMAP IDLE manager for real-time push notifications
+        pub(super) idle_manager: OnceCell<Arc<IdleManager>>,
+        /// Receiver for IDLE manager events
+        pub(super) idle_event_receiver: RefCell<Option<std::sync::mpsc::Receiver<IdleManagerEvent>>>,
     }
 
     #[glib::object_subclass]
@@ -373,6 +385,12 @@ mod imp {
 
             // Preload contacts from GNOME Contacts (EDS) in background
             app.preload_contacts();
+
+            // Start periodic mail checking timer
+            app.start_sync_timer();
+
+            // Initialize IDLE manager for real-time push notifications
+            app.init_idle_manager();
         }
 
         fn startup(&self) {
@@ -491,6 +509,667 @@ impl NorthMailApplication {
     /// Get the database (public, for use from window.rs)
     pub fn database_ref(&self) -> Option<&std::sync::Arc<northmail_core::Database>> {
         self.imp().database.get()
+    }
+
+    /// Get application settings
+    fn settings(&self) -> gio::Settings {
+        gio::Settings::new(APP_ID)
+    }
+
+    /// Start the periodic mail sync timer based on GSettings interval
+    fn start_sync_timer(&self) {
+        // Stop any existing timer first
+        self.stop_sync_timer();
+
+        let settings = self.settings();
+        let interval_minutes = settings.int("sync-interval") as u32;
+        let interval_seconds = interval_minutes * 60;
+
+        info!("Starting mail sync timer with {} minute interval", interval_minutes);
+
+        // Do an immediate check on startup (after a short delay for UI to settle)
+        let app_immediate = self.clone();
+        glib::timeout_add_seconds_local_once(3, move || {
+            app_immediate.check_for_new_mail();
+        });
+
+        let app = self.clone();
+        let source_id = glib::timeout_add_seconds_local(interval_seconds, move || {
+            app.check_for_new_mail();
+            glib::ControlFlow::Continue
+        });
+
+        self.imp().sync_timer_source.replace(Some(source_id));
+
+        // Connect to settings changes to restart timer if interval changes
+        let app_for_settings = self.clone();
+        settings.connect_changed(Some("sync-interval"), move |settings, _| {
+            let new_interval = settings.int("sync-interval");
+            info!("Sync interval changed to {} minutes, restarting timer", new_interval);
+            app_for_settings.start_sync_timer();
+        });
+    }
+
+    /// Stop the periodic mail sync timer
+    fn stop_sync_timer(&self) {
+        if let Some(source_id) = self.imp().sync_timer_source.take() {
+            source_id.remove();
+            info!("Stopped mail sync timer");
+        }
+    }
+
+    /// Check for new mail by comparing IMAP counts with cache and fetching new messages
+    fn check_for_new_mail(&self) {
+        // Prevent overlapping syncs
+        if self.imp().sync_in_progress.get() {
+            debug!("Sync already in progress, skipping scheduled check");
+            return;
+        }
+
+        self.imp().sync_in_progress.set(true);
+        info!("Starting scheduled mail check");
+
+        let app = self.clone();
+        glib::spawn_future_local(async move {
+            // Get current cache counts
+            let cache_counts = app.get_all_inbox_counts().await;
+
+            let accounts = app.imp().accounts.borrow().clone();
+            let mut new_messages: Vec<(String, i64)> = Vec::new();
+            let mut accounts_to_refresh: Vec<northmail_auth::GoaAccount> = Vec::new();
+
+            // Check each account for new messages via IMAP STATUS
+            for account in &accounts {
+                if !Self::is_supported_account(account) {
+                    continue;
+                }
+
+                // Get IMAP inbox count via STATUS
+                let imap_count = app.get_imap_inbox_count(account).await;
+                let cache_count = cache_counts.get(&account.id).copied().unwrap_or(0);
+
+                if imap_count > cache_count {
+                    let diff = imap_count - cache_count;
+                    info!("Account {} has {} new messages (IMAP: {}, cache: {})",
+                          account.email, diff, imap_count, cache_count);
+                    new_messages.push((account.id.clone(), diff));
+                    accounts_to_refresh.push(account.clone());
+                }
+            }
+
+            // Fetch new messages for accounts that have them
+            for account in &accounts_to_refresh {
+                info!("Fetching new messages for {}", account.email);
+                app.stream_inbox_to_cache(account).await;
+            }
+
+            // If we found new messages, refresh the UI
+            if !accounts_to_refresh.is_empty() {
+                // Show notification
+                app.notify_new_mail(&new_messages).await;
+
+                // Refresh sidebar folder counts
+                app.refresh_sidebar_folders();
+
+                // Refresh current view if showing unified inbox
+                if app.imp().state.borrow().unified_inbox {
+                    app.fetch_unified_inbox();
+                }
+            }
+
+            // Update window title with unread count
+            app.update_unread_badge();
+
+            app.imp().sync_in_progress.set(false);
+        });
+    }
+
+    /// Get inbox message count from IMAP via STATUS query
+    async fn get_imap_inbox_count(&self, account: &northmail_auth::GoaAccount) -> i64 {
+        let auth_manager = match AuthManager::new().await {
+            Ok(am) => am,
+            Err(_) => return 0,
+        };
+
+        let result: i64 = match account.provider_type.as_str() {
+            "google" => {
+                match auth_manager.get_xoauth2_token_for_goa(&account.id).await {
+                    Ok((email, access_token)) => {
+                        Self::get_inbox_count_google(&email, &access_token).await.unwrap_or(0) as i64
+                    }
+                    Err(_) => 0,
+                }
+            }
+            "windows_live" | "microsoft" => {
+                match auth_manager.get_xoauth2_token_for_goa(&account.id).await {
+                    Ok((email, access_token)) => {
+                        Self::get_inbox_count_microsoft(&email, &access_token).await.unwrap_or(0) as i64
+                    }
+                    Err(_) => 0,
+                }
+            }
+            _ => {
+                // Password auth (iCloud, etc.)
+                let host = account.imap_host.clone().unwrap_or_else(|| "imap.mail.me.com".to_string());
+                let username = account.imap_username.clone().unwrap_or_else(|| account.email.clone());
+                match auth_manager.get_goa_password(&account.id).await {
+                    Ok(password) => {
+                        Self::get_inbox_count_password(&host, &username, &password).await.unwrap_or(0) as i64
+                    }
+                    Err(_) => 0,
+                }
+            }
+        };
+
+        result
+    }
+
+    /// Get inbox count from Gmail via IMAP STATUS
+    async fn get_inbox_count_google(email: &str, access_token: &str) -> Option<u32> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let email = email.to_string();
+        let token = access_token.to_string();
+
+        std::thread::spawn(move || {
+            let result = async_std::task::block_on(async {
+                let mut client = SimpleImapClient::new();
+                client.connect_gmail(&email, &token).await?;
+                let (count, _) = client.folder_status("INBOX").await?;
+                client.logout().await.ok();
+                Ok::<_, northmail_imap::ImapError>(count)
+            });
+            let _ = sender.send(result);
+        });
+
+        loop {
+            match receiver.try_recv() {
+                Ok(Ok(count)) => return Some(count),
+                Ok(Err(_)) => return None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Get inbox count from Outlook via IMAP STATUS
+    async fn get_inbox_count_microsoft(email: &str, access_token: &str) -> Option<u32> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let email = email.to_string();
+        let token = access_token.to_string();
+
+        std::thread::spawn(move || {
+            let result = async_std::task::block_on(async {
+                let mut client = SimpleImapClient::new();
+                client.connect_outlook(&email, &token).await?;
+                let (count, _) = client.folder_status("INBOX").await?;
+                client.logout().await.ok();
+                Ok::<_, northmail_imap::ImapError>(count)
+            });
+            let _ = sender.send(result);
+        });
+
+        loop {
+            match receiver.try_recv() {
+                Ok(Ok(count)) => return Some(count),
+                Ok(Err(_)) => return None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Get inbox count via password auth IMAP STATUS
+    async fn get_inbox_count_password(host: &str, username: &str, password: &str) -> Option<u32> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let host = host.to_string();
+        let username = username.to_string();
+        let password = password.to_string();
+
+        std::thread::spawn(move || {
+            let result = async_std::task::block_on(async {
+                let mut client = SimpleImapClient::new();
+                client.connect_login(&host, 993, &username, &password).await?;
+                let (count, _) = client.folder_status("INBOX").await?;
+                client.logout().await.ok();
+                Ok::<_, northmail_imap::ImapError>(count)
+            });
+            let _ = sender.send(result);
+        });
+
+        loop {
+            match receiver.try_recv() {
+                Ok(Ok(count)) => return Some(count),
+                Ok(Err(_)) => return None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Get inbox message counts for all accounts
+    async fn get_all_inbox_counts(&self) -> std::collections::HashMap<String, i64> {
+        let mut counts = std::collections::HashMap::new();
+        let Some(db) = self.database() else {
+            return counts;
+        };
+
+        let accounts = self.imp().accounts.borrow().clone();
+        for account in accounts {
+            let db = db.clone();
+            let account_id = account.id.clone();
+
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result = rt.block_on(async {
+                    db.get_inbox_message_count_for_account(&account_id).await
+                });
+                let _ = sender.send(result);
+            });
+
+            // Wait for result
+            loop {
+                match receiver.try_recv() {
+                    Ok(Ok(count)) => {
+                        counts.insert(account.id.clone(), count);
+                        break;
+                    }
+                    Ok(Err(_)) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        counts
+    }
+
+    /// Show desktop notification for new mail
+    async fn notify_new_mail(&self, new_messages: &[(String, i64)]) {
+        let settings = self.settings();
+
+        // Check if notifications are enabled
+        if !settings.boolean("notifications-enabled") {
+            debug!("Notifications disabled, skipping");
+            return;
+        }
+
+        // Check Do Not Disturb
+        if settings.boolean("do-not-disturb") {
+            debug!("Do Not Disturb enabled, skipping notification");
+            return;
+        }
+
+        let total_new: i64 = new_messages.iter().map(|(_, count)| count).sum();
+        let show_preview = settings.boolean("notification-preview-enabled");
+
+        // Build notification
+        let (summary, body) = if total_new == 1 && show_preview {
+            // Single message - try to get sender and subject
+            if let Some((account_id, _)) = new_messages.first() {
+                if let Some(msg_info) = self.get_latest_message_info(account_id).await {
+                    (msg_info.0, msg_info.1) // (from, subject)
+                } else {
+                    ("New Email".to_string(), "You have a new message".to_string())
+                }
+            } else {
+                ("New Email".to_string(), "You have a new message".to_string())
+            }
+        } else if total_new > 1 {
+            // Multiple messages
+            let summary = format!("{} New Emails", total_new);
+            let body = if show_preview {
+                new_messages
+                    .iter()
+                    .map(|(account_id, count)| {
+                        let accounts = self.imp().accounts.borrow();
+                        let email = accounts
+                            .iter()
+                            .find(|a| a.id == *account_id)
+                            .map(|a| a.email.as_str())
+                            .unwrap_or("Unknown");
+                        format!("{}: {} new", email, count)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                "You have new messages".to_string()
+            };
+            (summary, body)
+        } else {
+            ("New Email".to_string(), "You have a new message".to_string())
+        };
+
+        // Send notification
+        if let Err(e) = notify_rust::Notification::new()
+            .summary(&summary)
+            .body(&body)
+            .icon("mail-unread")
+            .appname("NorthMail")
+            .timeout(notify_rust::Timeout::Milliseconds(5000))
+            .show()
+        {
+            error!("Failed to show notification: {}", e);
+        } else {
+            info!("Showed notification: {}", summary);
+        }
+    }
+
+    /// Get sender and subject of the latest inbox message for an account
+    async fn get_latest_message_info(&self, account_id: &str) -> Option<(String, String)> {
+        let db = self.database()?.clone();
+        let account_id = account_id.to_string();
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async {
+                db.get_latest_inbox_message(&account_id).await
+            });
+            let _ = sender.send(result);
+        });
+
+        // Wait for result
+        loop {
+            match receiver.try_recv() {
+                Ok(Ok(Some(msg))) => {
+                    let from = msg.from_name.or(msg.from_address).unwrap_or_else(|| "Unknown".to_string());
+                    let subject = msg.subject.unwrap_or_else(|| "(No subject)".to_string());
+                    return Some((from, subject));
+                }
+                Ok(Ok(None)) => return None,
+                Ok(Err(_)) => return None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Initialize the IDLE manager and start event loop
+    fn init_idle_manager(&self) {
+        let (idle_manager, event_rx) = IdleManager::new();
+
+        // Store the manager and receiver
+        if self.imp().idle_manager.set(idle_manager.clone()).is_err() {
+            warn!("IDLE manager already initialized");
+            return;
+        }
+        self.imp().idle_event_receiver.replace(Some(event_rx));
+
+        info!("IDLE manager initialized");
+
+        // Start the event loop
+        self.start_idle_event_loop();
+
+        // Start IDLE for all accounts (will happen after accounts are loaded)
+        // The actual IDLE connections will be started in load_accounts or after sync
+    }
+
+    /// Start the IDLE event processing loop
+    fn start_idle_event_loop(&self) {
+        let app = self.clone();
+
+        // Poll for IDLE events every 500ms
+        glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+            let receiver = app.imp().idle_event_receiver.borrow();
+            if let Some(rx) = receiver.as_ref() {
+                while let Ok(event) = rx.try_recv() {
+                    match event {
+                        IdleManagerEvent::NewMail { account_id } => {
+                            info!("IDLE: New mail for account {}", account_id);
+                            // Trigger a quick sync for this account
+                            app.quick_sync_account(&account_id);
+                        }
+                        IdleManagerEvent::ConnectionLost { account_id } => {
+                            warn!("IDLE: Connection lost for account {}", account_id);
+                            // Will auto-reconnect via the worker
+                        }
+                        IdleManagerEvent::NotSupported { account_id } => {
+                            warn!("IDLE: Not supported for account {}", account_id);
+                            // Fall back to polling only for this account
+                        }
+                    }
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    /// Start IDLE connections for all supported accounts
+    fn start_idle_for_all_accounts(&self) {
+        let Some(idle_manager) = self.imp().idle_manager.get() else {
+            return;
+        };
+
+        let accounts = self.imp().accounts.borrow().clone();
+        let idle_manager = idle_manager.clone();
+        let app = self.clone();
+
+        glib::spawn_future_local(async move {
+            for account in accounts {
+                if !Self::is_supported_account(&account) {
+                    continue;
+                }
+
+                app.start_idle_for_account_async(&account, &idle_manager).await;
+            }
+        });
+    }
+
+    /// Start IDLE for a single account (async to get credentials)
+    async fn start_idle_for_account_async(
+        &self,
+        account: &northmail_auth::GoaAccount,
+        idle_manager: &std::sync::Arc<IdleManager>,
+    ) {
+        let auth_manager = match AuthManager::new().await {
+            Ok(am) => am,
+            Err(e) => {
+                warn!("IDLE: Failed to create auth manager for {}: {}", account.email, e);
+                return;
+            }
+        };
+
+        let credentials = match account.provider_type.as_str() {
+            "google" => {
+                match auth_manager.get_xoauth2_token_for_goa(&account.id).await {
+                    Ok((email, access_token)) => {
+                        IdleCredentials {
+                            account_id: account.id.clone(),
+                            email,
+                            auth_type: IdleAuthType::OAuth2 {
+                                host: "imap.gmail.com".to_string(),
+                                access_token,
+                            },
+                        }
+                    }
+                    Err(e) => {
+                        warn!("IDLE: Failed to get OAuth2 token for Gmail {}: {}", account.email, e);
+                        return;
+                    }
+                }
+            }
+            "windows_live" | "microsoft" => {
+                match auth_manager.get_xoauth2_token_for_goa(&account.id).await {
+                    Ok((email, access_token)) => {
+                        IdleCredentials {
+                            account_id: account.id.clone(),
+                            email,
+                            auth_type: IdleAuthType::OAuth2 {
+                                host: "outlook.office365.com".to_string(),
+                                access_token,
+                            },
+                        }
+                    }
+                    Err(e) => {
+                        warn!("IDLE: Failed to get OAuth2 token for Outlook {}: {}", account.email, e);
+                        return;
+                    }
+                }
+            }
+            _ => {
+                // Password-based auth (iCloud, etc.)
+                let host = account.imap_host.clone().unwrap_or_else(|| {
+                    "imap.mail.me.com".to_string()
+                });
+                let username = account.imap_username.clone().unwrap_or_else(|| {
+                    account.email.clone()
+                });
+                match auth_manager.get_goa_password(&account.id).await {
+                    Ok(password) => {
+                        IdleCredentials {
+                            account_id: account.id.clone(),
+                            email: account.email.clone(),
+                            auth_type: IdleAuthType::Password {
+                                host,
+                                port: 993, // Standard IMAPS port
+                                username,
+                                password,
+                            },
+                        }
+                    }
+                    Err(e) => {
+                        warn!("IDLE: Failed to get password for {}: {}", account.email, e);
+                        return;
+                    }
+                }
+            }
+        };
+
+        idle_manager.start_idle(credentials);
+        info!("IDLE: Started for {}", account.email);
+    }
+
+    /// Quick sync for a single account (triggered by IDLE event)
+    fn quick_sync_account(&self, account_id: &str) {
+        let accounts = self.imp().accounts.borrow().clone();
+        let account = match accounts.iter().find(|a| a.id == account_id) {
+            Some(a) => a.clone(),
+            None => {
+                warn!("Account {} not found for quick sync", account_id);
+                return;
+            }
+        };
+
+        // Get old count for comparison
+        let old_count = self.imp().last_inbox_counts.borrow()
+            .get(account_id)
+            .copied()
+            .unwrap_or(0);
+
+        let app = self.clone();
+        let account_id = account_id.to_string();
+
+        glib::spawn_future_local(async move {
+            // Actually fetch new messages from IMAP (not just STATUS)
+            info!("IDLE quick sync: fetching new messages for {}", account.email);
+            app.stream_inbox_to_cache(&account).await;
+
+            // Refresh sidebar folder counts
+            app.refresh_sidebar_folders();
+
+            // Check for new messages
+            let new_count = app.get_inbox_count_for_account(&account_id).await;
+
+            if new_count > old_count {
+                let diff = new_count - old_count;
+                info!("IDLE sync found {} new messages", diff);
+
+                // Update stored count
+                app.imp().last_inbox_counts.borrow_mut()
+                    .insert(account_id.clone(), new_count);
+
+                // Show notification
+                let new_messages = vec![(account_id.clone(), diff)];
+                app.notify_new_mail(&new_messages).await;
+            }
+
+            // Refresh unified inbox if that's what we're viewing
+            if app.imp().state.borrow().unified_inbox {
+                app.fetch_unified_inbox();
+            }
+
+            // Update window title with unread count
+            app.update_unread_badge();
+        });
+    }
+
+    /// Get inbox message count for a single account
+    async fn get_inbox_count_for_account(&self, account_id: &str) -> i64 {
+        let Some(db) = self.database() else {
+            return 0;
+        };
+
+        let db = db.clone();
+        let account_id = account_id.to_string();
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async {
+                db.get_inbox_message_count_for_account(&account_id).await
+            });
+            let _ = sender.send(result);
+        });
+
+        loop {
+            match receiver.try_recv() {
+                Ok(Ok(count)) => return count,
+                Ok(Err(_)) => return 0,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                }
+                Err(_) => return 0,
+            }
+        }
+    }
+
+    /// Update the window title to show total unread count
+    fn update_unread_badge(&self) {
+        let Some(db) = self.database() else {
+            return;
+        };
+        let db = db.clone();
+        let app = self.clone();
+
+        glib::spawn_future_local(async move {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result = rt.block_on(async {
+                    db.get_total_unread_count().await
+                });
+                let _ = sender.send(result);
+            });
+
+            loop {
+                match receiver.try_recv() {
+                    Ok(Ok(count)) => {
+                        if let Some(window) = app.active_window() {
+                            if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                                win.set_unread_count(count);
+                            }
+                        }
+                        break;
+                    }
+                    Ok(Err(_)) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
     }
 
     /// Get the current cache folder ID
@@ -671,6 +1350,9 @@ impl NorthMailApplication {
                                     // Start background sync for all supported accounts
                                     // On fresh DB, this will also stream INBOX messages
                                     app.sync_all_accounts();
+
+                                    // Start IDLE connections for real-time notifications
+                                    app.start_idle_for_all_accounts();
                                 }
                             }
                             Err(e) => {
@@ -4939,24 +5621,106 @@ impl NorthMailApplication {
         appearance_group.add(&theme_row);
         general_page.add(&appearance_group);
 
-        // Behavior group
-        let behavior_group = adw::PreferencesGroup::builder().title("Behavior").build();
+        // Sync group
+        let sync_group = adw::PreferencesGroup::builder()
+            .title("Mail Checking")
+            .build();
+
+        let sync_interval_row = adw::ComboRow::builder()
+            .title("Check for New Mail")
+            .subtitle("How often to automatically check for new emails")
+            .build();
+
+        // Sync interval options: 1, 2, 5, 10, 15, 30 minutes
+        let intervals = gtk4::StringList::new(&[
+            "Every minute",
+            "Every 2 minutes",
+            "Every 5 minutes",
+            "Every 10 minutes",
+            "Every 15 minutes",
+            "Every 30 minutes",
+        ]);
+        sync_interval_row.set_model(Some(&intervals));
+
+        // Map stored interval value to dropdown index
+        let settings = self.settings();
+        let current_interval = settings.int("sync-interval");
+        let interval_index = match current_interval {
+            1 => 0u32,
+            2 => 1,
+            5 => 2,
+            10 => 3,
+            15 => 4,
+            30 => 5,
+            _ => 2, // Default to 5 minutes
+        };
+        sync_interval_row.set_selected(interval_index);
+
+        // Wire up interval changes
+        let settings_for_interval = settings.clone();
+        sync_interval_row.connect_selected_notify(move |row| {
+            let interval = match row.selected() {
+                0 => 1,
+                1 => 2,
+                2 => 5,
+                3 => 10,
+                4 => 15,
+                5 => 30,
+                _ => 5,
+            };
+            let _ = settings_for_interval.set_int("sync-interval", interval);
+        });
+
+        sync_group.add(&sync_interval_row);
+        general_page.add(&sync_group);
+
+        // Notifications group
+        let notifications_group = adw::PreferencesGroup::builder()
+            .title("Notifications")
+            .build();
 
         let notifications_row = adw::SwitchRow::builder()
             .title("Desktop Notifications")
             .subtitle("Show notifications for new emails")
-            .active(true)
+            .build();
+
+        // Bind to GSettings
+        settings
+            .bind("notifications-enabled", &notifications_row, "active")
             .build();
 
         let sound_row = adw::SwitchRow::builder()
             .title("Notification Sound")
             .subtitle("Play a sound when new emails arrive")
-            .active(true)
             .build();
 
-        behavior_group.add(&notifications_row);
-        behavior_group.add(&sound_row);
-        general_page.add(&behavior_group);
+        settings
+            .bind("notification-sound", &sound_row, "active")
+            .build();
+
+        let preview_row = adw::SwitchRow::builder()
+            .title("Show Message Preview")
+            .subtitle("Display sender and subject in notifications")
+            .build();
+
+        settings
+            .bind("notification-preview-enabled", &preview_row, "active")
+            .build();
+
+        let dnd_row = adw::SwitchRow::builder()
+            .title("Do Not Disturb")
+            .subtitle("Suppress all notifications")
+            .build();
+
+        settings
+            .bind("do-not-disturb", &dnd_row, "active")
+            .build();
+
+        notifications_group.add(&notifications_row);
+        notifications_group.add(&sound_row);
+        notifications_group.add(&preview_row);
+        notifications_group.add(&dnd_row);
+        general_page.add(&notifications_group);
 
         dialog.add(&general_page);
 

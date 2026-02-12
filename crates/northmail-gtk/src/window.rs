@@ -3663,6 +3663,15 @@ impl NorthMailWindow {
             imp.message_list_box.append(message_list);
         }
     }
+
+    /// Update the window title to show unread count
+    pub fn set_unread_count(&self, count: i64) {
+        if count > 0 {
+            self.set_title(Some(&format!("NorthMail ({})", count)));
+        } else {
+            self.set_title(Some("NorthMail"));
+        }
+    }
 }
 
 fn format_file_size(bytes: usize) -> String {

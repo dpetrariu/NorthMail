@@ -62,5 +62,23 @@
       <description>Whether to show message snippets in the message list.</description>
     </key>
 
+    <key name="notification-sound" type="b">
+      <default>true</default>
+      <summary>Notification sound</summary>
+      <description>Whether to play a sound when new emails arrive.</description>
+    </key>
+
+    <key name="notification-preview-enabled" type="b">
+      <default>true</default>
+      <summary>Show notification preview</summary>
+      <description>Whether to show sender and subject in notifications.</description>
+    </key>
+
+    <key name="do-not-disturb" type="b">
+      <default>false</default>
+      <summary>Do not disturb</summary>
+      <description>Whether to suppress all notifications.</description>
+    </key>
+
   </schema>
 </schemalist>

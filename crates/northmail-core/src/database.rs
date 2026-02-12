@@ -1147,6 +1147,59 @@ impl Database {
         Ok(row.get::<i64, _>("count"))
     }
 
+    /// Get inbox message count for a specific account
+    pub async fn get_inbox_message_count_for_account(&self, account_id: &str) -> CoreResult<i64> {
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*) as count FROM messages m
+            INNER JOIN folders f ON m.folder_id = f.id
+            WHERE f.account_id = ? AND f.folder_type = 'inbox'
+            "#,
+        )
+        .bind(account_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row.get::<i64, _>("count"))
+    }
+
+    /// Get the latest inbox message for a specific account (for notifications)
+    pub async fn get_latest_inbox_message(&self, account_id: &str) -> CoreResult<Option<DbMessage>> {
+        let message = sqlx::query_as::<_, DbMessage>(
+            r#"
+            SELECT m.id, m.folder_id, m.uid, m.message_id, m.subject, m.from_address,
+                   m.from_name, m.to_addresses, m.cc_addresses, m.date_sent, m.date_epoch, m.snippet,
+                   m.is_read, m.is_starred, m.has_attachments, m.size, m.maildir_path,
+                   m.body_text, m.body_html
+            FROM messages m
+            JOIN folders f ON m.folder_id = f.id
+            WHERE f.account_id = ? AND f.folder_type = 'inbox'
+            ORDER BY m.date_epoch DESC, m.uid DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(message)
+    }
+
+    /// Get total unread count across all accounts (for window badge)
+    pub async fn get_total_unread_count(&self) -> CoreResult<i64> {
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*) as count FROM messages m
+            INNER JOIN folders f ON m.folder_id = f.id
+            WHERE f.folder_type = 'inbox' AND m.is_read = 0
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row.get::<i64, _>("count"))
+    }
+
     /// Clear all cached data for an account
     pub async fn clear_account_cache(&self, account_id: &str) -> CoreResult<()> {
         // Delete messages first (foreign key constraint)

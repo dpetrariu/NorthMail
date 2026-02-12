@@ -11,7 +11,24 @@ use tracing::{debug, info};
 use crate::{Folder, FolderType, ImapError, ImapResult, MessageHeader, MessageFlags};
 use crate::message::{EmailAddress, Envelope};
 
+use std::time::Duration;
+
 type TlsStream = async_native_tls::TlsStream<TcpStream>;
+
+/// Event returned from IDLE mode
+#[derive(Debug, Clone, PartialEq)]
+pub enum IdleEvent {
+    /// New messages exist (reported count from EXISTS response)
+    NewMessages(u32),
+    /// A message was expunged (sequence number)
+    Expunge(u32),
+    /// Flags changed on a message
+    FlagsChanged,
+    /// IDLE timed out (for keepalive)
+    Timeout,
+    /// Server closed connection
+    ServerBye,
+}
 
 /// Simple IMAP client that works in any async context
 pub struct SimpleImapClient {
@@ -1491,6 +1508,160 @@ impl SimpleImapClient {
     }
 
     /// Logout
+    /// Enter IDLE mode and wait for server events or timeout
+    ///
+    /// IDLE allows the server to push notifications about mailbox changes.
+    /// The client must call `idle_done()` to exit IDLE mode before sending
+    /// other commands.
+    ///
+    /// # Arguments
+    /// * `timeout` - Maximum time to wait before returning `IdleEvent::Timeout`
+    ///
+    /// # Returns
+    /// The first event received from the server, or `Timeout` if no event
+    /// arrives within the specified duration.
+    pub async fn idle(&mut self, timeout: Duration) -> ImapResult<IdleEvent> {
+        // Get tag before borrowing stream to avoid borrow checker issues
+        let tag = self.next_tag();
+        let cmd = format!("{} IDLE\r\n", tag);
+
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            ImapError::ServerError("Not connected".to_string())
+        })?;
+
+        stream
+            .get_mut()
+            .write_all(cmd.as_bytes())
+            .await
+            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+        // Wait for continuation response (+)
+        let mut line = String::new();
+        stream
+            .read_line(&mut line)
+            .await
+            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+        debug!("IDLE response: {}", line.trim());
+
+        if !line.starts_with('+') {
+            return Err(ImapError::ServerError(format!(
+                "Expected '+' continuation, got: {}",
+                line.trim()
+            )));
+        }
+
+        // Clear line before entering event loop (read_line appends!)
+        line.clear();
+
+        // Now we're in IDLE mode - wait for untagged responses
+        // Use a timeout to allow periodic keepalive
+        let start = std::time::Instant::now();
+
+        loop {
+            // Check if we've exceeded timeout
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                return Ok(IdleEvent::Timeout);
+            }
+
+            // Calculate remaining timeout
+            let remaining = timeout - elapsed;
+
+            // Try to read a line with timeout
+            let read_future = stream.read_line(&mut line);
+            let result = async_std::future::timeout(remaining, read_future).await;
+
+            match result {
+                Ok(Ok(0)) => {
+                    // Connection closed
+                    return Ok(IdleEvent::ServerBye);
+                }
+                Ok(Ok(_)) => {
+                    let trimmed = line.trim();
+                    info!("IDLE received: {}", trimmed);
+
+                    // Parse untagged response
+                    if trimmed.starts_with("* BYE") {
+                        return Ok(IdleEvent::ServerBye);
+                    } else if let Some(rest) = trimmed.strip_prefix("* ") {
+                        // Parse "* N EXISTS", "* N EXPUNGE", "* N FETCH (FLAGS ...)"
+                        let parts: Vec<&str> = rest.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            if let Ok(num) = parts[0].parse::<u32>() {
+                                match parts[1].to_uppercase().as_str() {
+                                    "EXISTS" => {
+                                        info!("IDLE: Detected EXISTS event with count {}", num);
+                                        return Ok(IdleEvent::NewMessages(num));
+                                    }
+                                    "RECENT" => {
+                                        // Some servers send RECENT for new mail
+                                        if num > 0 {
+                                            info!("IDLE: Detected RECENT event with count {}", num);
+                                            return Ok(IdleEvent::NewMessages(num));
+                                        }
+                                    }
+                                    "EXPUNGE" => return Ok(IdleEvent::Expunge(num)),
+                                    "FETCH" => {
+                                        // Flags updated
+                                        return Ok(IdleEvent::FlagsChanged);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+
+                    // Clear line for next read
+                    line.clear();
+                }
+                Ok(Err(e)) => {
+                    return Err(ImapError::ServerError(format!("Read error: {}", e)));
+                }
+                Err(_) => {
+                    // Timeout
+                    return Ok(IdleEvent::Timeout);
+                }
+            }
+        }
+    }
+
+    /// Exit IDLE mode by sending DONE
+    ///
+    /// This must be called before sending any other IMAP commands after `idle()`.
+    pub async fn idle_done(&mut self) -> ImapResult<()> {
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            ImapError::ServerError("Not connected".to_string())
+        })?;
+
+        // Send DONE to exit IDLE
+        stream
+            .get_mut()
+            .write_all(b"DONE\r\n")
+            .await
+            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+        // Read the tagged response
+        let mut line = String::new();
+        loop {
+            line.clear();
+            stream
+                .read_line(&mut line)
+                .await
+                .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+            let trimmed = line.trim();
+            debug!("IDLE DONE response: {}", trimmed);
+
+            // Look for tagged response (OK or error)
+            if trimmed.contains(" OK") || trimmed.contains(" NO") || trimmed.contains(" BAD") {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn logout(&mut self) -> ImapResult<()> {
         let tag = self.next_tag();
         let cmd = format!("{} LOGOUT\r\n", tag);

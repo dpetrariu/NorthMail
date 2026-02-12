@@ -31,6 +31,8 @@ chrono = "0.4"
 zbus = { workspace = true }
 mail-parser = { workspace = true }
 
+notify-rust = { workspace = true }
+
 northmail-core = { workspace = true }
 northmail-auth = { workspace = true }
 northmail-imap = { workspace = true }

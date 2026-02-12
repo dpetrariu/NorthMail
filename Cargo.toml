@@ -64,6 +64,9 @@ uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 async-std = { version = "1.12", features = ["attributes"] }
 
+# Desktop notifications
+notify-rust = "4"
+
 # Internal crates
 northmail-core = { path = "crates/northmail-core" }
 northmail-imap = { path = "crates/northmail-imap" }
