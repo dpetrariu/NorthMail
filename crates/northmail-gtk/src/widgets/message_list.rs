@@ -3,6 +3,7 @@
 use gtk4::{glib, prelude::*, subclass::prelude::*};
 use libadwaita as adw;
 use std::cell::Cell;
+use std::rc::Rc;
 
 /// Escape XML/Pango markup special characters
 fn escape_markup(text: &str) -> String {
@@ -106,6 +107,7 @@ mod imp {
         pub starred_only: bool,
         pub has_attachments: bool,
         pub from_contains: String,
+        pub to_cc_contains: String,
         pub date_after: Option<i64>,
         pub date_before: Option<i64>,
     }
@@ -116,6 +118,7 @@ mod imp {
                 || self.starred_only
                 || self.has_attachments
                 || !self.from_contains.is_empty()
+                || !self.to_cc_contains.is_empty()
                 || self.date_after.is_some()
                 || self.date_before.is_some()
         }
@@ -146,6 +149,10 @@ mod imp {
         pub search_query: RefCell<String>,
         /// Currently selected message UID (to preserve selection across rebuilds)
         pub selected_uid: Cell<Option<u32>>,
+        /// Current folder context for drag-and-drop (account_id)
+        pub current_account_id: RefCell<String>,
+        /// Current folder context for drag-and-drop (folder_path)
+        pub current_folder_path: RefCell<String>,
     }
 
     #[glib::object_subclass]
@@ -165,6 +172,9 @@ mod imp {
                         .build(),
                     Signal::builder("search-requested")
                         .param_types([String::static_type()])
+                        .build(),
+                    Signal::builder("star-toggled")
+                        .param_types([u32::static_type(), i64::static_type(), i64::static_type(), bool::static_type()])
                         .build(),
                 ]
             })
@@ -295,6 +305,18 @@ impl MessageList {
             .search-bar-container {
                 background-color: white;
             }
+            /* Drag preview styling */
+            .drag-preview {
+                background-color: @card_bg_color;
+                border-radius: 12px;
+                box-shadow: 0 4px 16px alpha(black, 0.3);
+                min-width: 220px;
+                padding: 12px 16px;
+            }
+            /* Row being dragged */
+            .message-row.dragging {
+                background-color: alpha(@accent_bg_color, 0.1);
+            }
             "
         );
         gtk4::style_context_add_provider_for_display(
@@ -377,17 +399,49 @@ impl MessageList {
             .margin_bottom(12)
             .build();
 
-        // --- Checkboxes (custom child labels for indicator–text spacing) ---
-        let unread_check = gtk4::CheckButton::new();
-        unread_check.set_child(Some(&gtk4::Label::builder().label("Unread only").margin_start(6).build()));
-        let starred_check = gtk4::CheckButton::new();
-        starred_check.set_child(Some(&gtk4::Label::builder().label("Starred").margin_start(6).build()));
-        let attachment_check = gtk4::CheckButton::new();
-        attachment_check.set_child(Some(&gtk4::Label::builder().label("Has attachments").margin_start(6).build()));
+        // --- Toggle switches ---
+        let unread_row = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(12)
+            .build();
+        let unread_label = gtk4::Label::builder()
+            .label("Unread only")
+            .hexpand(true)
+            .xalign(0.0)
+            .build();
+        let unread_check = gtk4::Switch::new();
+        unread_row.append(&unread_label);
+        unread_row.append(&unread_check);
 
-        popover_content.append(&unread_check);
-        popover_content.append(&starred_check);
-        popover_content.append(&attachment_check);
+        let starred_row = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(12)
+            .build();
+        let starred_label = gtk4::Label::builder()
+            .label("Starred")
+            .hexpand(true)
+            .xalign(0.0)
+            .build();
+        let starred_check = gtk4::Switch::new();
+        starred_row.append(&starred_label);
+        starred_row.append(&starred_check);
+
+        let attachment_row = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(12)
+            .build();
+        let attachment_label = gtk4::Label::builder()
+            .label("Has attachments")
+            .hexpand(true)
+            .xalign(0.0)
+            .build();
+        let attachment_check = gtk4::Switch::new();
+        attachment_row.append(&attachment_label);
+        attachment_row.append(&attachment_check);
+
+        popover_content.append(&unread_row);
+        popover_content.append(&starred_row);
+        popover_content.append(&attachment_row);
 
         popover_content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
@@ -396,6 +450,12 @@ impl MessageList {
             .placeholder_text("From...")
             .build();
         popover_content.append(&from_entry);
+
+        // --- To/Cc filter ---
+        let to_cc_entry = gtk4::Entry::builder()
+            .placeholder_text("To/Cc...")
+            .build();
+        popover_content.append(&to_cc_entry);
 
         popover_content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
@@ -447,27 +507,27 @@ impl MessageList {
             .build();
         filter_button.add_css_class("flat");
 
-        // --- Connect checkbox signals ---
+        // --- Connect switch signals ---
         let widget = self.clone();
         let btn_ref = filter_button.clone();
-        unread_check.connect_toggled(move |check| {
-            widget.imp().filter_state.borrow_mut().unread_only = check.is_active();
+        unread_check.connect_active_notify(move |switch| {
+            widget.imp().filter_state.borrow_mut().unread_only = switch.is_active();
             widget.update_filter_indicator(&btn_ref);
             widget.apply_filter();
         });
 
         let widget = self.clone();
         let btn_ref = filter_button.clone();
-        starred_check.connect_toggled(move |check| {
-            widget.imp().filter_state.borrow_mut().starred_only = check.is_active();
+        starred_check.connect_active_notify(move |switch| {
+            widget.imp().filter_state.borrow_mut().starred_only = switch.is_active();
             widget.update_filter_indicator(&btn_ref);
             widget.apply_filter();
         });
 
         let widget = self.clone();
         let btn_ref = filter_button.clone();
-        attachment_check.connect_toggled(move |check| {
-            widget.imp().filter_state.borrow_mut().has_attachments = check.is_active();
+        attachment_check.connect_active_notify(move |switch| {
+            widget.imp().filter_state.borrow_mut().has_attachments = switch.is_active();
             widget.update_filter_indicator(&btn_ref);
             widget.apply_filter();
         });
@@ -477,6 +537,15 @@ impl MessageList {
         let btn_ref = filter_button.clone();
         from_entry.connect_changed(move |entry| {
             widget.imp().filter_state.borrow_mut().from_contains = entry.text().to_string();
+            widget.update_filter_indicator(&btn_ref);
+            widget.apply_filter();
+        });
+
+        // --- To/Cc entry ---
+        let widget = self.clone();
+        let btn_ref = filter_button.clone();
+        to_cc_entry.connect_changed(move |entry| {
+            widget.imp().filter_state.borrow_mut().to_cc_contains = entry.text().to_string();
             widget.update_filter_indicator(&btn_ref);
             widget.apply_filter();
         });
@@ -505,6 +574,7 @@ impl MessageList {
         let starred_c = starred_check.clone();
         let attachment_c = attachment_check.clone();
         let from_c = from_entry.clone();
+        let to_cc_c = to_cc_entry.clone();
         let after_c = after_entry.clone();
         let before_c = before_entry.clone();
         clear_button.connect_clicked(move |_| {
@@ -513,6 +583,7 @@ impl MessageList {
             starred_c.set_active(false);
             attachment_c.set_active(false);
             from_c.set_text("");
+            to_cc_c.set_text("");
             after_c.set_text("");
             before_c.set_text("");
             // Ensure state is clean
@@ -567,6 +638,20 @@ impl MessageList {
         )
     }
 
+    /// Connect callback for when star button is toggled in message list
+    pub fn connect_star_toggled<F>(&self, f: F) -> glib::SignalHandlerId
+    where
+        F: Fn(&Self, u32, i64, i64, bool) + 'static,
+    {
+        self.connect_closure(
+            "star-toggled",
+            false,
+            glib::closure_local!(move |list: &MessageList, uid: u32, msg_id: i64, folder_id: i64, is_starred: bool| {
+                f(list, uid, msg_id, folder_id, is_starred);
+            }),
+        )
+    }
+
     /// Connect callback for when user wants to load more messages
     pub fn connect_load_more<F: Fn() + 'static>(&self, callback: F) {
         self.imp().on_load_more.replace(Some(Box::new(callback)));
@@ -595,6 +680,22 @@ impl MessageList {
         let state = self.imp().filter_state.borrow();
         let query = self.imp().search_query.borrow();
         state.is_active() || !query.is_empty()
+    }
+
+    /// Set the current folder context for drag-and-drop operations
+    pub fn set_folder_context(&self, account_id: &str, folder_path: &str) {
+        let imp = self.imp();
+        *imp.current_account_id.borrow_mut() = account_id.to_string();
+        *imp.current_folder_path.borrow_mut() = folder_path.to_string();
+    }
+
+    /// Get the current folder context (account_id, folder_path)
+    pub fn folder_context(&self) -> (String, String) {
+        let imp = self.imp();
+        (
+            imp.current_account_id.borrow().clone(),
+            imp.current_folder_path.borrow().clone(),
+        )
     }
 
     /// Show or hide load more capability (with infinite scroll)
@@ -751,6 +852,16 @@ impl MessageList {
             }
         }
 
+        // To/Cc substring filter
+        if !state.to_cc_contains.is_empty() {
+            let to_lower = msg.to.to_lowercase();
+            let cc_lower = msg.cc.to_lowercase();
+            let search = state.to_cc_contains.to_lowercase();
+            if !to_lower.contains(&search) && !cc_lower.contains(&search) {
+                return false;
+            }
+        }
+
         // Date range filters (use date_epoch if available)
         if let Some(after) = state.date_after {
             match msg.date_epoch {
@@ -767,17 +878,19 @@ impl MessageList {
             }
         }
 
-        // Text search (subject + from substring) - skip if showing FTS results
+        // Text search (subject + from + to/cc + snippet) - skip if showing FTS results
         if !skip_search_filter && !query.is_empty() {
             let q = query.to_lowercase();
             let in_subject = msg.subject.to_lowercase().contains(&q);
             let in_from = msg.from.to_lowercase().contains(&q);
+            let in_to = msg.to.to_lowercase().contains(&q);
+            let in_cc = msg.cc.to_lowercase().contains(&q);
             let in_snippet = msg
                 .snippet
                 .as_deref()
                 .map(|s| s.to_lowercase().contains(&q))
                 .unwrap_or(false);
-            if !in_subject && !in_from && !in_snippet {
+            if !in_subject && !in_from && !in_to && !in_cc && !in_snippet {
                 return false;
             }
         }
@@ -801,9 +914,29 @@ impl MessageList {
         let scrolled = imp.scrolled.borrow();
         let list_box = imp.list_box.borrow();
 
+        // Deduplicate by UID (keep first occurrence)
+        let mut seen_uids = std::collections::HashSet::new();
+        let deduped: Vec<MessageInfo> = messages
+            .into_iter()
+            .filter(|m| seen_uids.insert(m.uid))
+            .collect();
+
+        // Sort messages by date (newest first) to ensure correct order
+        let mut sorted_messages = deduped;
+        sorted_messages.sort_by(|a, b| {
+            // Sort by date_epoch descending (newest first), fall back to uid descending
+            match (b.date_epoch, a.date_epoch) {
+                (Some(b_date), Some(a_date)) => b_date.cmp(&a_date),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => b.uid.cmp(&a.uid),
+            }
+        });
+
         // Reset counters and store messages
-        imp.message_count.set(messages.len());
-        imp.messages.replace(messages.clone());
+        imp.message_count.set(sorted_messages.len());
+        imp.messages.replace(sorted_messages.clone());
+        let messages = sorted_messages;
 
         if let (Some(scrolled), Some(list_box)) = (scrolled.as_ref(), list_box.as_ref()) {
             // Remember selected UID before clearing
@@ -900,31 +1033,25 @@ impl MessageList {
     pub fn append_messages(&self, messages: Vec<MessageInfo>) {
         let imp = self.imp();
 
-        if let Some(list_box) = imp.list_box.borrow().as_ref() {
-            // Remove load more row temporarily
-            let load_more_row = imp.load_more_row.take();
-            if let Some(ref row) = load_more_row {
-                list_box.remove(row);
-            }
+        // Add new messages to stored list
+        {
+            let mut stored = imp.messages.borrow_mut();
+            stored.extend(messages);
+            imp.message_count.set(stored.len());
 
-            // Add new messages (filtered)
-            for msg in &messages {
-                if self.message_matches(msg) {
-                    self.add_message_row(list_box, msg);
+            // Sort all messages by date (newest first)
+            stored.sort_by(|a, b| {
+                match (b.date_epoch, a.date_epoch) {
+                    (Some(b_date), Some(a_date)) => b_date.cmp(&a_date),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => b.uid.cmp(&a.uid),
                 }
-            }
-
-            // Update count and stored messages
-            imp.message_count.set(imp.message_count.get() + messages.len());
-            imp.messages.borrow_mut().extend(messages);
-
-            // Re-add load more row if we have one
-            if let Some(row) = load_more_row {
-                list_box.append(&row);
-                imp.load_more_row.replace(Some(row));
-            }
+            });
         }
 
+        // Rebuild visible rows to show sorted messages
+        self.rebuild_visible_rows();
         self.finish_loading_more();
     }
 
@@ -966,22 +1093,27 @@ impl MessageList {
             .margin_bottom(8)
             .build();
 
-        // Unread indicator (blue dot, becomes white when selected)
-        let unread_indicator = gtk4::Box::builder()
-            .width_request(8)
+        // Indicator column (unread dot only)
+        let indicator_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .width_request(12)
             .valign(gtk4::Align::Start)
-            .margin_top(6)
+            .margin_top(4)
+            .spacing(4)
             .build();
 
+        // Unread indicator (blue dot)
         if !msg.is_read {
             let dot = gtk4::Box::builder()
                 .width_request(8)
                 .height_request(8)
                 .css_classes(["unread-dot"])
+                .halign(gtk4::Align::Center)
                 .build();
-            unread_indicator.append(&dot);
+            indicator_box.append(&dot);
         }
-        hbox.append(&unread_indicator);
+
+        hbox.append(&indicator_box);
 
         // Content area (sender, subject, preview)
         let content_box = gtk4::Box::builder()
@@ -1018,14 +1150,6 @@ impl MessageList {
             .build();
         top_row.append(&date_label);
 
-        // Star indicator
-        if msg.is_starred {
-            let star = gtk4::Image::from_icon_name("starred-symbolic");
-            star.add_css_class("warning");
-            star.set_pixel_size(14);
-            top_row.append(&star);
-        }
-
         content_box.append(&top_row);
 
         // Middle row: Subject + attachment icon
@@ -1061,6 +1185,28 @@ impl MessageList {
             middle_row.append(&attachment);
         }
 
+        // Star button (always visible, clickable)
+        let star_button = gtk4::ToggleButton::builder()
+            .icon_name(if msg.is_starred { "starred-symbolic" } else { "non-starred-symbolic" })
+            .active(msg.is_starred)
+            .css_classes(["flat", "circular", "star-button"])
+            .valign(gtk4::Align::Center)
+            .build();
+
+        // Connect star button to emit signal
+        let widget = self.clone();
+        let msg_uid = msg.uid;
+        let msg_id = msg.id;
+        let msg_folder_id = msg.folder_id;
+        star_button.connect_toggled(move |button| {
+            let is_starred = button.is_active();
+            // Update icon
+            button.set_icon_name(if is_starred { "starred-symbolic" } else { "non-starred-symbolic" });
+            // Emit signal for the window to handle IMAP sync
+            widget.emit_by_name::<()>("star-toggled", &[&msg_uid, &msg_id, &msg_folder_id, &is_starred]);
+        });
+        middle_row.append(&star_button);
+
         content_box.append(&middle_row);
 
         // Bottom row: Preview snippet (if available)
@@ -1080,8 +1226,202 @@ impl MessageList {
         hbox.append(&content_box);
         row.set_child(Some(&hbox));
 
+        // Add drag source for drag-and-drop to folders
+        let drag_source = gtk4::DragSource::builder()
+            .actions(gtk4::gdk::DragAction::MOVE)
+            .build();
+
+        // Store message data for drag (use folder context from MessageList, not msg.folder_id which may be 0)
+        let (account_id, folder_path) = self.folder_context();
+        let drag_data = Rc::new((msg.uid, msg.id, account_id.clone(), folder_path.clone(), msg.subject.clone()));
+        let drag_data_for_prepare = drag_data.clone();
+
+        drag_source.connect_prepare(move |_source, _x, _y| {
+            // Create content with message info as string: "uid:msg_id:account_id:folder_path"
+            let data = format!("{}:{}:{}:{}",
+                drag_data_for_prepare.0,
+                drag_data_for_prepare.1,
+                drag_data_for_prepare.2,
+                drag_data_for_prepare.3);
+            Some(gtk4::gdk::ContentProvider::for_value(&data.to_value()))
+        });
+
+        // Show message info as drag icon (handle UTF-8 properly)
+        let subject_for_drag = if msg.subject.is_empty() {
+            "(No Subject)".to_string()
+        } else {
+            let chars: Vec<char> = msg.subject.chars().collect();
+            if chars.len() > 40 {
+                format!("{}...", chars[..37].iter().collect::<String>())
+            } else {
+                msg.subject.clone()
+            }
+        };
+        let from_for_drag = {
+            let chars: Vec<char> = msg.from.chars().collect();
+            if chars.len() > 25 {
+                format!("{}...", chars[..22].iter().collect::<String>())
+            } else {
+                msg.from.clone()
+            }
+        };
+
+        // Use the row itself as the drag icon source for proper rendering
+        let row_weak = row.downgrade();
+        drag_source.connect_drag_begin(move |source, _drag| {
+            // Create a styled container for the drag preview
+            let drag_widget = gtk4::Box::builder()
+                .orientation(gtk4::Orientation::Horizontal)
+                .spacing(12)
+                .css_classes(["card", "drag-preview"])
+                .build();
+
+            // Add mail icon
+            let icon = gtk4::Image::builder()
+                .icon_name("mail-unread-symbolic")
+                .pixel_size(24)
+                .css_classes(["accent"])
+                .build();
+            drag_widget.append(&icon);
+
+            // Text container
+            let text_box = gtk4::Box::builder()
+                .orientation(gtk4::Orientation::Vertical)
+                .spacing(2)
+                .build();
+
+            let from_label = gtk4::Label::builder()
+                .label(&from_for_drag)
+                .xalign(0.0)
+                .css_classes(["heading"])
+                .build();
+
+            let subject_label = gtk4::Label::builder()
+                .label(&subject_for_drag)
+                .xalign(0.0)
+                .css_classes(["dim-label"])
+                .build();
+
+            text_box.append(&from_label);
+            text_box.append(&subject_label);
+            drag_widget.append(&text_box);
+
+            // Get the DragIcon from the drag and set content directly
+            let drag_icon = gtk4::DragIcon::for_drag(_drag);
+            drag_icon.set_child(Some(&drag_widget));
+
+            // Make the original row semi-transparent during drag
+            if let Some(row) = row_weak.upgrade() {
+                row.set_opacity(0.4);
+                row.add_css_class("dragging");
+            }
+        });
+
+        // Restore opacity when drag ends
+        let row_weak2 = row.downgrade();
+        drag_source.connect_drag_end(move |_source, _drag, _delete| {
+            if let Some(row) = row_weak2.upgrade() {
+                row.set_opacity(1.0);
+                row.remove_css_class("dragging");
+            }
+        });
+
+        row.add_controller(drag_source);
+
         // Add separator between messages
         list_box.append(&row);
+    }
+
+    /// Update a message's starred status in the list
+    pub fn update_message_starred(&self, uid: u32, is_starred: bool) {
+        let imp = self.imp();
+        let mut messages = imp.messages.borrow_mut();
+        if let Some(msg) = messages.iter_mut().find(|m| m.uid == uid) {
+            msg.is_starred = is_starred;
+        }
+        drop(messages);
+        // Rebuild the list to reflect the change
+        self.rebuild_visible_rows();
+    }
+
+    /// Update a message's read status in the list
+    pub fn update_message_read(&self, uid: u32, is_read: bool) {
+        let imp = self.imp();
+        let mut messages = imp.messages.borrow_mut();
+        if let Some(msg) = messages.iter_mut().find(|m| m.uid == uid) {
+            msg.is_read = is_read;
+        }
+        drop(messages);
+        self.rebuild_visible_rows();
+    }
+
+    /// Remove a message from the list by UID
+    pub fn remove_message(&self, uid: u32) {
+        let imp = self.imp();
+        let mut messages = imp.messages.borrow_mut();
+        messages.retain(|m| m.uid != uid);
+        imp.message_count.set(messages.len());
+        drop(messages);
+        // Rebuild the list to reflect the change
+        self.rebuild_visible_rows();
+    }
+
+    /// Rebuild visible rows from stored messages (used after status updates)
+    fn rebuild_visible_rows(&self) {
+        let imp = self.imp();
+
+        // If there's an active filter with a DB callback, delegate to it instead of
+        // doing client-side filtering (which only filters in-memory messages, not DB)
+        if self.has_active_filter() {
+            if let Some(callback) = imp.on_filter_changed.borrow().as_ref() {
+                callback();
+                return;
+            }
+        }
+
+        let list_box = imp.list_box.borrow();
+        let scrolled = imp.scrolled.borrow();
+        let messages = imp.messages.borrow();
+
+        if let (Some(list_box), Some(_scrolled)) = (list_box.as_ref(), scrolled.as_ref()) {
+            // Remember selected UID
+            let selected_uid = imp.selected_uid.get();
+
+            // Clear existing rows
+            while let Some(child) = list_box.first_child() {
+                list_box.remove(&child);
+            }
+            imp.load_more_row.replace(None);
+
+            // Rebuild with current filters (client-side)
+            let visible: Vec<&MessageInfo> = messages.iter()
+                .filter(|m| self.message_matches(m))
+                .collect();
+
+            for msg in &visible {
+                self.add_message_row(list_box, msg);
+            }
+
+            // Re-add load more row if needed
+            if imp.can_load_more.get() {
+                let load_row = self.create_loading_row();
+                load_row.set_visible(false);
+                list_box.append(&load_row);
+                imp.load_more_row.replace(Some(load_row));
+            }
+
+            // Restore selection
+            if let Some(uid) = selected_uid {
+                let filtered: Vec<&MessageInfo> = messages.iter()
+                    .filter(|m| self.message_matches(m))
+                    .collect();
+                if let Some(pos) = filtered.iter().position(|m| m.uid == uid) {
+                    if let Some(row) = list_box.row_at_index(pos as i32) {
+                        list_box.select_row(Some(&row));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1127,6 +1467,7 @@ pub struct MessageInfo {
     pub from: String,
     pub from_address: String,
     pub to: String,
+    pub cc: String,
     pub date: String,
     pub date_epoch: Option<i64>,
     pub snippet: Option<String>,
@@ -1149,6 +1490,7 @@ impl From<&northmail_core::models::DbMessage> for MessageInfo {
                 .unwrap_or_else(|| "Unknown".to_string()),
             from_address: db_msg.from_address.clone().unwrap_or_default(),
             to: db_msg.to_addresses.clone().unwrap_or_default(),
+            cc: db_msg.cc_addresses.clone().unwrap_or_default(),
             date: db_msg.date_sent.clone().unwrap_or_default(),
             date_epoch: db_msg.date_epoch,
             snippet: db_msg.snippet.clone(),

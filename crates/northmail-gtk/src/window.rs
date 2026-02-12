@@ -9,10 +9,11 @@ use std::rc::Rc;
 use tracing::debug;
 
 /// Mode for compose dialog
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub enum ComposeMode {
-    #[default]
-    New,
+    New {
+        to: Option<(String, String)>,  // Optional (email, display_name) for pre-filled recipient
+    },
     Reply {
         to: String,           // email address
         to_display: String,   // display name (for chip UI)
@@ -75,6 +76,89 @@ fn format_forward_body(from: &str, to: &[String], date: &str, subject: &str, bod
     fwd.push('\n');
     fwd.push_str(body);
     fwd
+}
+
+/// Generate a color from a string (for avatar background)
+fn string_to_avatar_color(s: &str) -> (f64, f64, f64) {
+    let colors: [(f64, f64, f64); 12] = [
+        (0.29, 0.56, 0.85), // #4A90D9
+        (0.91, 0.30, 0.24), // #E74C3C
+        (0.18, 0.80, 0.44), // #2ECC71
+        (0.61, 0.35, 0.71), // #9B59B6
+        (0.95, 0.61, 0.07), // #F39C12
+        (0.10, 0.74, 0.61), // #1ABC9C
+        (0.91, 0.12, 0.39), // #E91E63
+        (0.25, 0.32, 0.71), // #3F51B5
+        (0.00, 0.74, 0.83), // #00BCD4
+        (0.55, 0.76, 0.29), // #8BC34A
+        (1.00, 0.34, 0.13), // #FF5722
+        (0.38, 0.49, 0.55), // #607D8B
+    ];
+
+    let hash: usize = s.bytes().fold(0, |acc, b| acc.wrapping_add(b as usize));
+    colors[hash % colors.len()]
+}
+
+/// Get initials from a name or email
+fn get_initials(name: &str, email: &str) -> String {
+    let display = if name.is_empty() || name == email || name.contains('@') {
+        email.split('@').next().unwrap_or("?")
+    } else {
+        // Remove email part if present
+        if name.contains('<') {
+            name.split('<').next().unwrap_or(name).trim()
+        } else {
+            name
+        }
+    };
+
+    let words: Vec<&str> = display.split_whitespace().collect();
+    match words.len() {
+        0 => "?".to_string(),
+        1 => words[0].chars().next().unwrap_or('?').to_uppercase().to_string(),
+        _ => {
+            let first = words[0].chars().next().unwrap_or('?');
+            let last = words[words.len() - 1].chars().next().unwrap_or('?');
+            format!("{}{}", first, last).to_uppercase()
+        }
+    }
+}
+
+/// Create an avatar widget with initials
+fn create_avatar(name: &str, email: &str) -> gtk4::Widget {
+    let initials = get_initials(name, email);
+    let (r, g, b) = string_to_avatar_color(email);
+
+    let drawing_area = gtk4::DrawingArea::builder()
+        .width_request(40)
+        .height_request(40)
+        .valign(gtk4::Align::Center)
+        .build();
+
+    drawing_area.set_draw_func(move |_, cr, width, height| {
+        // Draw circle
+        let radius = (width.min(height) as f64) / 2.0;
+        let cx = width as f64 / 2.0;
+        let cy = height as f64 / 2.0;
+
+        cr.arc(cx, cy, radius, 0.0, 2.0 * std::f64::consts::PI);
+        cr.set_source_rgb(r, g, b);
+        let _ = cr.fill();
+
+        // Draw text
+        cr.set_source_rgb(1.0, 1.0, 1.0);
+        cr.select_font_face("Sans", gtk4::cairo::FontSlant::Normal, gtk4::cairo::FontWeight::Bold);
+        cr.set_font_size(16.0);
+
+        let extents = cr.text_extents(&initials).unwrap();
+        let x = cx - extents.width() / 2.0 - extents.x_bearing();
+        let y = cy - extents.height() / 2.0 - extents.y_bearing();
+
+        cr.move_to(x, y);
+        let _ = cr.show_text(&initials);
+    });
+
+    drawing_area.upcast()
 }
 
 mod imp {
@@ -280,8 +364,89 @@ impl NorthMailWindow {
              .header-button-animated {
                  transition: margin 200ms ease-out;
              }
-             #message_list_box, #message_view_box {
+             #message_list_box {
                  background-color: @view_bg_color;
+             }
+             /* Make entire message view area white */
+             #inner_paned,
+             #message_view_box,
+             #message_view_box > *,
+             #message_view_box scrolledwindow,
+             #message_view_box scrolledwindow > *,
+             #message_view_box viewport,
+             #message_view_box viewport > *,
+             .message-view-content {
+                 background-color: white;
+                 background: white;
+             }
+             /* Force white on inner paned end child */
+             #inner_paned > :last-child {
+                 background-color: white;
+                 background: white;
+             }
+             /* Message view header card */
+             .message-header-card {
+                 background-color: #f5f5f5;
+                 border-radius: 12px;
+                 margin: 12px;
+             }
+             .message-action-bar {
+                 padding: 8px 12px;
+                 border-bottom: 1px solid alpha(black, 0.06);
+             }
+             .message-action-bar button {
+                 background: transparent;
+                 box-shadow: none;
+             }
+             .message-header-content {
+                 padding: 12px 16px;
+             }
+             .message-subject-large {
+                 font-size: 18px;
+                 font-weight: 600;
+             }
+             .message-sender-name {
+                 font-size: 14px;
+                 font-weight: 600;
+             }
+             .message-sender-email {
+                 font-size: 12px;
+                 color: alpha(@view_fg_color, 0.6);
+             }
+             .message-date-small {
+                 font-size: 12px;
+                 color: alpha(@view_fg_color, 0.6);
+             }
+             .message-recipients-label {
+                 font-size: 12px;
+                 color: alpha(@view_fg_color, 0.5);
+                 min-width: 28px;
+             }
+             .message-recipients-value {
+                 font-size: 12px;
+                 color: alpha(@view_fg_color, 0.7);
+             }
+             /* Clickable sender button styling */
+             .sender-clickable {
+                 padding: 0;
+                 margin: 0;
+                 background: transparent;
+                 border: none;
+                 box-shadow: none;
+             }
+             .sender-clickable:hover {
+                 background: alpha(@accent_bg_color, 0.1);
+                 border-radius: 6px;
+             }
+             .message-body-area {
+                 background-color: white;
+                 padding: 0 16px 16px 16px;
+             }
+             .message-body-scrolled,
+             .message-body-scrolled > *,
+             .message-body-box {
+                 background-color: white;
+                 background: white;
              }
              /* Hide paned separators */
              paned > separator {
@@ -297,6 +462,39 @@ impl NorthMailWindow {
                  border-right: none;
                  border: none;
                  box-shadow: none;
+             }
+             /* Star button styling */
+             .star-button {
+                 color: alpha(@window_fg_color, 0.3);
+                 min-width: 24px;
+                 min-height: 24px;
+                 padding: 2px;
+             }
+             .star-button:hover {
+                 color: #f5c211;
+             }
+             .star-button:checked,
+             .star-button:checked:hover {
+                 color: #f5c211;
+             }
+             .star-button:checked image,
+             .star-button image:checked {
+                 color: #f5c211;
+                 -gtk-icon-style: symbolic;
+             }
+             /* Star button in selected row - ensure visibility */
+             row:selected .star-button {
+                 color: rgba(255, 255, 255, 0.5);
+             }
+             row:selected .star-button:checked {
+                 color: #f5c211;
+             }
+             row:selected .star-button:hover {
+                 color: #f5c211;
+             }
+             /* Star indicator in message list */
+             .star-indicator {
+                 color: #f5c211;
              }"
         );
         gtk4::style_context_add_provider_for_display(
@@ -427,6 +625,42 @@ impl NorthMailWindow {
         // Create and add folder sidebar
         let folder_sidebar = FolderSidebar::new();
         imp.sidebar_box.append(&folder_sidebar);
+
+        // Connect message-dropped signal for drag-and-drop move
+        let window = self.clone();
+        folder_sidebar.connect_message_dropped(move |_sidebar, uid, msg_id, source_account_id, source_folder_path, target_account_id, target_folder_path| {
+            debug!(
+                "Message dropped: uid={}, from {}/{}, to {}/{}",
+                uid, source_account_id, source_folder_path, target_account_id, target_folder_path
+            );
+            if let Some(app) = window.application() {
+                if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                    // Move the message (returns false for cross-account moves)
+                    if app.move_message_to_folder(msg_id, uid, source_account_id, source_folder_path, target_account_id, target_folder_path) {
+                        // Remove from message list UI
+                        let imp = window.imp();
+                        if let Some(message_list) = imp.message_list.get() {
+                            message_list.remove_message(uid);
+                        }
+
+                        // Clear message view if this message was being displayed
+                        if *imp.current_message_uid.borrow() == Some(uid) {
+                            while let Some(child) = imp.message_view_box.first_child() {
+                                imp.message_view_box.remove(&child);
+                            }
+                            *imp.current_message_uid.borrow_mut() = None;
+                        }
+
+                        // Extract just the folder name for a friendlier message
+                        let folder_name = target_folder_path.rsplit('/').next().unwrap_or(target_folder_path);
+                        window.add_toast(adw::Toast::new(&format!("Moved to {}", folder_name)));
+                    } else {
+                        window.add_toast(adw::Toast::new("Cannot move between different accounts"));
+                    }
+                }
+            }
+        });
+
         imp.folder_sidebar.set(folder_sidebar).unwrap();
 
         // Create and add message list
@@ -453,6 +687,24 @@ impl NorthMailWindow {
             if let Some(app) = window.application() {
                 if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
                     app.handle_filter_changed();
+                }
+            }
+        });
+
+        // Connect star-toggled callback (star button clicked in message list)
+        let window = self.clone();
+        message_list.connect_star_toggled(move |list, uid, msg_id, folder_id, is_starred| {
+            debug!("Star toggled in list: uid={}, is_starred={}", uid, is_starred);
+            // Update the message info in the list
+            if is_starred {
+                list.update_message_starred(uid, true);
+            } else {
+                list.update_message_starred(uid, false);
+            }
+            // Sync to database and IMAP via application
+            if let Some(app) = window.application() {
+                if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                    app.set_message_starred(msg_id, uid, folder_id, is_starred);
                 }
             }
         });
@@ -492,40 +744,49 @@ impl NorthMailWindow {
                 imp.message_view_box.remove(&child);
             }
 
-            // Create message view content
+            // Create message view content - white background container
             let content = gtk4::Box::builder()
                 .orientation(gtk4::Orientation::Vertical)
                 .spacing(0)
                 .vexpand(true)
+                .css_classes(["message-view-content"])
                 .build();
 
-            // Toolbar with message actions
+            // Header card (floating rounded box)
+            let header_card = gtk4::Box::builder()
+                .orientation(gtk4::Orientation::Vertical)
+                .css_classes(["message-header-card"])
+                .build();
+
+            // Action bar at top of card
             let toolbar = gtk4::Box::builder()
                 .orientation(gtk4::Orientation::Horizontal)
                 .spacing(6)
-                .margin_start(12)
-                .margin_end(12)
-                .margin_top(6)
-                .margin_bottom(6)
+                .css_classes(["message-action-bar"])
                 .build();
 
             let reply_button = gtk4::Button::builder()
                 .icon_name("mail-reply-sender-symbolic")
                 .tooltip_text("Reply")
+                .css_classes(["flat"])
                 .build();
 
             let reply_all_button = gtk4::Button::builder()
                 .icon_name("mail-reply-all-symbolic")
                 .tooltip_text("Reply All")
+                .css_classes(["flat"])
                 .build();
 
             let forward_button = gtk4::Button::builder()
                 .icon_name("mail-forward-symbolic")
                 .tooltip_text("Forward")
+                .css_classes(["flat"])
                 .build();
 
             // Shared state for body text (populated when body loads)
             let body_text: Rc<std::cell::RefCell<Option<String>>> = Rc::new(std::cell::RefCell::new(None));
+            // Shared state for attachments (populated when body loads)
+            let attachments_data: Rc<std::cell::RefCell<Vec<(String, String, Vec<u8>)>>> = Rc::new(std::cell::RefCell::new(Vec::new()));
 
             // Connect reply button
             {
@@ -586,7 +847,7 @@ impl NorthMailWindow {
                             let email = extract_email_address(s.trim());
                             (email.clone(), email) // email as both display and address
                         })
-                        .filter(|(e, _)| e != &reply_to_email)
+                        .filter(|(e, _)| !e.is_empty() && e.contains('@') && e != &reply_to_email)
                         .collect();
 
                     let subject = if msg_clone.subject.to_lowercase().starts_with("re:") {
@@ -612,6 +873,7 @@ impl NorthMailWindow {
                 let window = self.clone();
                 let msg_clone = msg.clone();
                 let body_text = body_text.clone();
+                let attachments_data = attachments_data.clone();
                 forward_button.connect_clicked(move |_| {
                     let body = body_text.borrow().clone().unwrap_or_else(|| {
                         "(Message body is still loading...)".to_string()
@@ -626,23 +888,61 @@ impl NorthMailWindow {
                         .map(|s| s.trim().to_string())
                         .collect();
                     let quoted = format_forward_body(&msg_clone.from, &to_list, &msg_clone.date, &msg_clone.subject, &body);
-                    let mode = ComposeMode::Forward {
-                        subject,
-                        quoted_body: quoted,
-                        attachments: Vec::new(), // TODO: forward attachments
-                    };
-                    window.show_compose_dialog_with_mode(mode);
+
+                    let stored_attachments = attachments_data.borrow().clone();
+                    if !stored_attachments.is_empty() {
+                        // Ask user if they want to include attachments
+                        let dialog = adw::AlertDialog::builder()
+                            .heading("Include Attachments?")
+                            .body(&format!("This message has {} attachment{}. Do you want to include {} in the forwarded message?",
+                                stored_attachments.len(),
+                                if stored_attachments.len() == 1 { "" } else { "s" },
+                                if stored_attachments.len() == 1 { "it" } else { "them" }))
+                            .build();
+                        dialog.add_response("no", "No");
+                        dialog.add_response("yes", "Yes");
+                        dialog.set_response_appearance("yes", adw::ResponseAppearance::Suggested);
+                        dialog.set_default_response(Some("yes"));
+
+                        let window_ref = window.clone();
+                        let subject_ref = subject.clone();
+                        let quoted_ref = quoted.clone();
+                        let attachments_ref = stored_attachments.clone();
+                        dialog.choose(window.upcast_ref::<gtk4::Window>(), None::<&gio::Cancellable>, move |response| {
+                            let attachments = if response == "yes" {
+                                attachments_ref.clone()
+                            } else {
+                                Vec::new()
+                            };
+                            let mode = ComposeMode::Forward {
+                                subject: subject_ref.clone(),
+                                quoted_body: quoted_ref.clone(),
+                                attachments,
+                            };
+                            window_ref.show_compose_dialog_with_mode(mode);
+                        });
+                    } else {
+                        // No attachments, forward directly
+                        let mode = ComposeMode::Forward {
+                            subject,
+                            quoted_body: quoted,
+                            attachments: Vec::new(),
+                        };
+                        window.show_compose_dialog_with_mode(mode);
+                    }
                 });
             }
 
             let archive_button = gtk4::Button::builder()
                 .icon_name("folder-symbolic")
                 .tooltip_text("Archive")
+                .css_classes(["flat"])
                 .build();
 
             let delete_button = gtk4::Button::builder()
                 .icon_name("user-trash-symbolic")
                 .tooltip_text("Delete")
+                .css_classes(["flat"])
                 .build();
 
             // Edit button (only visible for drafts) - blue accent color
@@ -711,16 +1011,133 @@ impl NorthMailWindow {
                 });
             }
 
+            // Connect archive button
+            {
+                let window = self.clone();
+                let message_id = msg.id;
+                let msg_uid = msg.uid;
+                let msg_folder_id = msg.folder_id;
+                archive_button.connect_clicked(move |_| {
+                    debug!("Archive button clicked: uid={}", msg_uid);
+                    if let Some(app) = window.application() {
+                        if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                            app.archive_message(message_id, msg_uid, msg_folder_id);
+                            // Update message list by removing this message
+                            let imp = window.imp();
+                            if let Some(message_list) = imp.message_list.get() {
+                                message_list.remove_message(msg_uid);
+                            }
+                            // Clear message view
+                            while let Some(child) = imp.message_view_box.first_child() {
+                                imp.message_view_box.remove(&child);
+                            }
+                            *imp.current_message_uid.borrow_mut() = None;
+                            window.add_toast(adw::Toast::new("Message archived"));
+                        }
+                    }
+                });
+            }
+
+            // Connect delete button
+            {
+                let window = self.clone();
+                let message_id = msg.id;
+                let msg_uid = msg.uid;
+                let msg_folder_id = msg.folder_id;
+                delete_button.connect_clicked(move |_| {
+                    debug!("Delete button clicked: uid={}", msg_uid);
+                    if let Some(app) = window.application() {
+                        if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                            app.delete_message(message_id, msg_uid, msg_folder_id);
+                            // Update message list by removing this message
+                            let imp = window.imp();
+                            if let Some(message_list) = imp.message_list.get() {
+                                message_list.remove_message(msg_uid);
+                            }
+                            // Clear message view
+                            while let Some(child) = imp.message_view_box.first_child() {
+                                imp.message_view_box.remove(&child);
+                            }
+                            *imp.current_message_uid.borrow_mut() = None;
+                            window.add_toast(adw::Toast::new("Message deleted"));
+                        }
+                    }
+                });
+            }
+
             let spacer = gtk4::Box::builder()
                 .hexpand(true)
                 .build();
 
             let star_button = gtk4::ToggleButton::builder()
-                .icon_name("starred-symbolic")
-                .tooltip_text("Star")
+                .icon_name(if msg.is_starred { "starred-symbolic" } else { "non-starred-symbolic" })
+                .tooltip_text(if msg.is_starred { "Unstar" } else { "Star" })
                 .active(msg.is_starred)
+                .css_classes(["flat", "star-button"])
                 .build();
 
+            // Connect star button toggle
+            {
+                let window = self.clone();
+                let message_id = msg.id;
+                let msg_uid = msg.uid;
+                let msg_folder_id = msg.folder_id;
+                star_button.connect_toggled(move |button| {
+                    let is_starred = button.is_active();
+                    // Update icon and tooltip
+                    button.set_icon_name(if is_starred { "starred-symbolic" } else { "non-starred-symbolic" });
+                    button.set_tooltip_text(Some(if is_starred { "Unstar" } else { "Star" }));
+                    // Update database and IMAP via application
+                    if let Some(app) = window.application() {
+                        if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                            app.set_message_starred(message_id, msg_uid, msg_folder_id, is_starred);
+                        }
+                    }
+                    // Update the message list indicator
+                    let imp = window.imp();
+                    if let Some(message_list) = imp.message_list.get() {
+                        message_list.update_message_starred(msg_uid, is_starred);
+                    }
+                });
+            }
+
+            // Read/Unread toggle button (icon shows action)
+            let read_button = gtk4::ToggleButton::builder()
+                .icon_name(if msg.is_read { "mail-read-symbolic" } else { "mail-unread-symbolic" })
+                .tooltip_text(if msg.is_read { "Mark as Unread" } else { "Mark as Read" })
+                .active(msg.is_read)
+                .css_classes(["flat"])
+                .build();
+
+            // Connect read button toggle
+            {
+                let window = self.clone();
+                let message_id = msg.id;
+                let msg_uid = msg.uid;
+                let msg_folder_id = msg.folder_id;
+                read_button.connect_toggled(move |button| {
+                    let is_read = button.is_active();
+                    // Update icon and tooltip (icon shows action)
+                    button.set_icon_name(if is_read { "mail-read-symbolic" } else { "mail-unread-symbolic" });
+                    button.set_tooltip_text(Some(if is_read { "Mark as Unread" } else { "Mark as Read" }));
+                    // Update database and IMAP via application
+                    if let Some(app) = window.application() {
+                        if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                            app.set_message_read(message_id, msg_uid, msg_folder_id, is_read);
+                        }
+                    }
+                    // Update the message list indicator
+                    let imp = window.imp();
+                    if let Some(message_list) = imp.message_list.get() {
+                        message_list.update_message_read(msg_uid, is_read);
+                    }
+                });
+            }
+
+            // Star and read on left, actions on right
+            toolbar.append(&star_button);
+            toolbar.append(&read_button);
+            toolbar.append(&spacer);
             // For drafts, show Edit first; for others, show Reply/Forward
             if is_drafts {
                 toolbar.append(&edit_button);
@@ -730,134 +1147,190 @@ impl NorthMailWindow {
             toolbar.append(&forward_button);
             toolbar.append(&archive_button);
             toolbar.append(&delete_button);
-            toolbar.append(&spacer);
-            toolbar.append(&star_button);
 
-            content.append(&toolbar);
+            header_card.append(&toolbar);
 
-            // Separator
-            let separator1 = gtk4::Separator::new(gtk4::Orientation::Horizontal);
-            content.append(&separator1);
-
-            // Header area
-            let header_box = gtk4::Box::builder()
+            // Header content inside the card
+            let header_content = gtk4::Box::builder()
                 .orientation(gtk4::Orientation::Vertical)
-                .spacing(6)
-                .margin_start(16)
-                .margin_end(16)
-                .margin_top(12)
-                .margin_bottom(12)
-                .build();
-
-            // Subject
-            let subject_label = gtk4::Label::builder()
-                .label(&msg.subject)
-                .xalign(0.0)
-                .wrap(true)
-                .css_classes(["title-2"])
-                .build();
-            header_box.append(&subject_label);
-
-            // From
-            let from_box = gtk4::Box::builder()
-                .orientation(gtk4::Orientation::Horizontal)
                 .spacing(8)
+                .css_classes(["message-header-content"])
                 .build();
 
-            let from_label = gtk4::Label::builder()
-                .label("From:")
-                .css_classes(["dim-label"])
-                .xalign(1.0)
-                .width_request(38)
+            // Sender row: Avatar + Name/Email + Date
+            let sender_row = gtk4::Box::builder()
+                .orientation(gtk4::Orientation::Horizontal)
+                .spacing(12)
                 .build();
-            from_box.append(&from_label);
 
-            let from_value = gtk4::Label::builder()
-                .label(&msg.from)
-                .xalign(0.0)
+            // Avatar with initials
+            let from_email = if !msg.from_address.is_empty() {
+                msg.from_address.clone()
+            } else {
+                extract_email_address(&msg.from)
+            };
+            let from_name = msg.from.clone();
+            let avatar = create_avatar(&from_name, &from_email);
+            sender_row.append(&avatar);
+
+            // Sender name and email (clickable to compose)
+            let sender_info = gtk4::Box::builder()
+                .orientation(gtk4::Orientation::Vertical)
+                .spacing(2)
                 .hexpand(true)
+                .valign(gtk4::Align::Center)
+                .build();
+
+            let display_name = if from_name.is_empty() || from_name == from_email {
+                from_email.split('@').next().unwrap_or(&from_email).to_string()
+            } else {
+                // Extract just the name part if it contains email
+                if from_name.contains('<') {
+                    from_name.split('<').next().unwrap_or(&from_name).trim().to_string()
+                } else {
+                    from_name.clone()
+                }
+            };
+
+            let name_label = gtk4::Label::builder()
+                .label(&display_name)
+                .xalign(0.0)
+                .css_classes(["message-sender-name"])
+                .build();
+
+            let email_label = gtk4::Label::builder()
+                .label(&from_email)
+                .xalign(0.0)
+                .css_classes(["message-sender-email"])
+                .build();
+
+            // To: row (inline with sender info)
+            let to_display = if msg.to.is_empty() { "(sync to update)".to_string() } else { msg.to.clone() };
+            let to_row = gtk4::Box::builder()
+                .orientation(gtk4::Orientation::Horizontal)
+                .spacing(4)
+                .build();
+            let to_label = gtk4::Label::builder()
+                .label("To:")
+                .css_classes(["message-recipients-label"])
+                .xalign(0.0)
+                .build();
+            let to_value = gtk4::Label::builder()
+                .label(&to_display)
+                .css_classes(["message-recipients-value"])
+                .xalign(0.0)
                 .ellipsize(gtk4::pango::EllipsizeMode::End)
                 .build();
-            from_box.append(&from_value);
+            to_row.append(&to_label);
+            to_row.append(&to_value);
 
-            header_box.append(&from_box);
+            sender_info.append(&name_label);
+            sender_info.append(&email_label);
+            sender_info.append(&to_row);
 
-            // To
-            if !msg.to.is_empty() {
-                let to_box = gtk4::Box::builder()
-                    .orientation(gtk4::Orientation::Horizontal)
-                    .spacing(8)
-                    .build();
+            // Make sender clickable to compose new email
+            let sender_button = gtk4::Button::builder()
+                .child(&sender_info)
+                .css_classes(["flat", "sender-clickable"])
+                .tooltip_text("Click to compose email")
+                .build();
 
-                let to_label = gtk4::Label::builder()
-                    .label("To:")
-                    .css_classes(["dim-label"])
-                    .xalign(1.0)
-                    .width_request(38)
-                    .build();
-                to_box.append(&to_label);
-
-                let to_value = gtk4::Label::builder()
-                    .label(&msg.to)
-                    .xalign(0.0)
-                    .hexpand(true)
-                    .wrap(true)
-                    .build();
-                to_box.append(&to_value);
-
-                header_box.append(&to_box);
+            {
+                let window = self.clone();
+                let to_email = from_email.clone();
+                let to_name = display_name.clone();
+                sender_button.connect_clicked(move |_| {
+                    let mode = ComposeMode::New {
+                        to: Some((to_email.clone(), to_name.clone())),
+                    };
+                    window.show_compose_dialog_with_mode(mode);
+                });
             }
 
-            // Date — format using system locale via GLib DateTime
+            sender_row.append(&sender_button);
+
+            // Date on right — format nicely
             let formatted_date = if let Some(epoch) = msg.date_epoch {
                 glib::DateTime::from_unix_local(epoch)
-                    .and_then(|dt| dt.format("%c"))
+                    .and_then(|dt| dt.format("%b %d, %Y %H:%M"))
                     .map(|s| s.to_string())
                     .unwrap_or_else(|_| msg.date.clone())
             } else {
                 msg.date.clone()
             };
 
-            let date_box = gtk4::Box::builder()
+            let date_label = gtk4::Label::builder()
+                .label(&formatted_date)
+                .css_classes(["message-date-small"])
+                .valign(gtk4::Align::Start)
+                .build();
+            sender_row.append(&date_label);
+
+            header_content.append(&sender_row);
+
+            // Cc: (if available) - shown separately below sender row
+            if !msg.cc.is_empty() {
+                let cc_row = gtk4::Box::builder()
+                    .orientation(gtk4::Orientation::Horizontal)
+                    .spacing(6)
+                    .margin_top(4)
+                    .build();
+
+                let cc_label = gtk4::Label::builder()
+                    .label("Cc:")
+                    .css_classes(["message-recipients-label"])
+                    .xalign(0.0)
+                    .build();
+
+                let cc_value = gtk4::Label::builder()
+                    .label(&msg.cc)
+                    .css_classes(["message-recipients-value"])
+                    .xalign(0.0)
+                    .hexpand(true)
+                    .wrap(true)
+                    .ellipsize(gtk4::pango::EllipsizeMode::End)
+                    .max_width_chars(60)
+                    .build();
+
+                cc_row.append(&cc_label);
+                cc_row.append(&cc_value);
+                header_content.append(&cc_row);
+            }
+
+            // Subject row with attachment indicator on right
+            let subject_row = gtk4::Box::builder()
                 .orientation(gtk4::Orientation::Horizontal)
                 .spacing(8)
+                .margin_top(8)
                 .build();
 
-            let date_label = gtk4::Label::builder()
-                .label("Date:")
-                .css_classes(["dim-label"])
-                .xalign(1.0)
-                .width_request(38)
-                .build();
-            date_box.append(&date_label);
-
-            let date_value = gtk4::Label::builder()
-                .label(&formatted_date)
+            let subject_label = gtk4::Label::builder()
+                .label(&msg.subject)
                 .xalign(0.0)
+                .wrap(true)
                 .hexpand(true)
+                .css_classes(["message-subject-large"])
                 .build();
-            date_box.append(&date_value);
+            subject_row.append(&subject_label);
 
-            // Attachment dropdown placeholder (populated after body fetch)
-            // Sits on the same row as the date, pushed to the right
+            // Attachment indicator (populated after body fetch or from has_attachments flag)
             let attachment_box = gtk4::Box::builder()
                 .orientation(gtk4::Orientation::Horizontal)
                 .halign(gtk4::Align::End)
+                .valign(gtk4::Align::End)
+                .spacing(4)
                 .build();
-            date_box.append(&attachment_box);
+            subject_row.append(&attachment_box);
 
-            header_box.append(&date_box);
-
-            content.append(&header_box);
-
-            // Separator
-            let separator2 = gtk4::Separator::new(gtk4::Orientation::Horizontal);
-            content.append(&separator2);
+            header_content.append(&subject_row);
+            header_card.append(&header_content);
+            content.append(&header_card);
 
             // Body area with loading indicator initially
             let body_scrolled = gtk4::ScrolledWindow::builder()
                 .vexpand(true)
                 .hexpand(true)
+                .css_classes(["message-body-scrolled"])
                 .build();
 
             let body_box = gtk4::Box::builder()
@@ -866,6 +1339,7 @@ impl NorthMailWindow {
                 .margin_end(16)
                 .margin_top(12)
                 .margin_bottom(12)
+                .css_classes(["message-body-box"])
                 .build();
 
             // Show loading spinner initially
@@ -901,6 +1375,7 @@ impl NorthMailWindow {
             let body_box_ref = body_box.clone();
             let attachment_box_ref = attachment_box.clone();
             let body_text_for_fetch = body_text.clone();
+            let attachments_data_for_fetch = attachments_data.clone();
             if let Some(app) = self.application() {
                 if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
                     let msg_folder_id = if msg.folder_id != 0 { Some(msg.folder_id) } else { None };
@@ -922,6 +1397,12 @@ impl NorthMailWindow {
                                     String::new()
                                 };
                                 *body_text_for_fetch.borrow_mut() = Some(plain_text);
+
+                                // Store attachments for forwarding
+                                let stored: Vec<(String, String, Vec<u8>)> = parsed.attachments.iter()
+                                    .map(|a| (a.filename.clone(), a.mime_type.clone(), a.data.clone()))
+                                    .collect();
+                                *attachments_data_for_fetch.borrow_mut() = stored;
 
                                 // Prefer HTML if available, otherwise use plain text
                                 if let Some(html) = parsed.html {
@@ -1146,7 +1627,7 @@ impl NorthMailWindow {
     }
 
     fn show_compose_dialog(&self) {
-        self.show_compose_dialog_with_mode(ComposeMode::New);
+        self.show_compose_dialog_with_mode(ComposeMode::New { to: None });
     }
 
     fn show_compose_dialog_with_mode(&self, mode: ComposeMode) {
@@ -1923,7 +2404,11 @@ impl NorthMailWindow {
 
         // Pre-fill fields based on compose mode
         match &mode {
-            ComposeMode::New => {}
+            ComposeMode::New { to } => {
+                if let Some((email, display)) = to {
+                    to_add_chip(display, email);
+                }
+            }
             ComposeMode::Reply { to, to_display, subject, quoted_body, .. } => {
                 to_add_chip(to_display, to);
                 subject_entry.set_text(subject);
@@ -1991,7 +2476,7 @@ impl NorthMailWindow {
                 attachments_box.set_visible(true);
 
                 // Create compact pill for each attachment
-                for (filename, _mime, _data, temp_path) in atts.iter() {
+                for (filename, _mime, data, temp_path) in atts.iter() {
                     let pill = gtk4::Box::builder()
                         .orientation(gtk4::Orientation::Horizontal)
                         .spacing(2)
@@ -2032,14 +2517,29 @@ impl NorthMailWindow {
                     pill.append(&label);
                     pill.append(&remove_btn);
 
-                    // Click to open file
-                    if let Some(path) = temp_path.clone() {
-                        let gesture = gtk4::GestureClick::new();
-                        gesture.connect_released(move |_, _, _, _| {
-                            let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
-                        });
-                        pill.add_controller(gesture);
-                    }
+                    // Double-click to open file
+                    let gesture = gtk4::GestureClick::new();
+                    gesture.set_button(1); // Left click only
+                    let filename_for_open = filename.clone();
+                    let data_for_open = data.clone();
+                    let temp_path_for_open = temp_path.clone();
+                    gesture.connect_released(move |gesture, n_press, _, _| {
+                        if n_press == 2 {
+                            // Double-click
+                            if let Some(ref path) = temp_path_for_open {
+                                // File already exists on disk
+                                let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+                            } else {
+                                // Forwarded attachment - write to temp file first
+                                let temp_dir = std::env::temp_dir();
+                                let temp_path = temp_dir.join(&filename_for_open);
+                                if std::fs::write(&temp_path, &data_for_open).is_ok() {
+                                    let _ = std::process::Command::new("xdg-open").arg(&temp_path).spawn();
+                                }
+                            }
+                        }
+                    });
+                    pill.add_controller(gesture);
 
                     // Remove button
                     let filename_to_remove = filename.clone();
@@ -2067,6 +2567,11 @@ impl NorthMailWindow {
                 }
             })
         };
+
+        // If we have pre-loaded attachments (from forwarding), show them now
+        if !attachments.borrow().is_empty() {
+            rebuild_attachments_ui();
+        }
 
         // --- Attachment add handler ---
         let add_attachment_to_ui = {

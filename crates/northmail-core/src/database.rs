@@ -41,6 +41,28 @@ pub struct DbFolder {
     pub unread_count: Option<i64>,
 }
 
+/// Attachment metadata from database
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct AttachmentMetadata {
+    pub id: i64,
+    pub message_id: i64,
+    pub filename: String,
+    pub mime_type: String,
+    pub size: i64,
+    pub content_id: Option<String>,
+    pub is_inline: bool,
+}
+
+/// Attachment info for saving (without id)
+#[derive(Debug, Clone)]
+pub struct AttachmentInfo {
+    pub filename: String,
+    pub mime_type: String,
+    pub size: usize,
+    pub content_id: Option<String>,
+    pub is_inline: bool,
+}
+
 /// Database message record
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DbMessage {
@@ -52,6 +74,7 @@ pub struct DbMessage {
     pub from_address: Option<String>,
     pub from_name: Option<String>,
     pub to_addresses: Option<String>,
+    pub cc_addresses: Option<String>,
     pub date_sent: Option<String>,
     /// Unix timestamp for proper date sorting
     pub date_epoch: Option<i64>,
@@ -196,6 +219,7 @@ impl Database {
                 from_address TEXT,
                 from_name TEXT,
                 to_addresses TEXT,
+                cc_addresses TEXT,
                 date_sent TEXT,
                 date_epoch INTEGER,
                 snippet TEXT,
@@ -243,6 +267,20 @@ impl Database {
                 INSERT INTO messages_fts(rowid, subject, from_address, from_name, snippet)
                 VALUES (new.id, new.subject, new.from_address, new.from_name, new.snippet);
             END;
+
+            -- Attachment metadata cache (data fetched from IMAP on demand)
+            CREATE TABLE IF NOT EXISTS attachments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                filename TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                size INTEGER DEFAULT 0,
+                content_id TEXT,
+                is_inline INTEGER DEFAULT 0,
+                UNIQUE(message_id, filename)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
             "#,
         )
         .execute(&self.pool)
@@ -253,6 +291,9 @@ impl Database {
 
         // Migration: Add date_epoch column if it doesn't exist
         self.migrate_add_date_epoch().await?;
+
+        // Migration: Add cc_addresses column if it doesn't exist
+        self.migrate_add_cc_addresses().await?;
 
         // Migration: Rebuild FTS index to ensure all messages are indexed
         self.migrate_rebuild_fts().await?;
@@ -298,6 +339,23 @@ impl Database {
                 .ok();
             // Create index for sorting
             sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_date_epoch ON messages(date_epoch DESC)")
+                .execute(&self.pool)
+                .await
+                .ok();
+        }
+
+        Ok(())
+    }
+
+    /// Add cc_addresses column if it doesn't exist
+    async fn migrate_add_cc_addresses(&self) -> CoreResult<()> {
+        let result = sqlx::query("SELECT cc_addresses FROM messages LIMIT 1")
+            .fetch_optional(&self.pool)
+            .await;
+
+        if result.is_err() {
+            debug!("Migrating database: adding cc_addresses column");
+            sqlx::query("ALTER TABLE messages ADD COLUMN cc_addresses TEXT")
                 .execute(&self.pool)
                 .await
                 .ok();
@@ -531,16 +589,17 @@ impl Database {
                 r#"
                 INSERT INTO messages (
                     folder_id, uid, message_id, subject, from_address, from_name,
-                    to_addresses, date_sent, date_epoch, snippet, is_read, is_starred,
+                    to_addresses, cc_addresses, date_sent, date_epoch, snippet, is_read, is_starred,
                     has_attachments, size, maildir_path
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(folder_id, uid) DO UPDATE SET
                     message_id = excluded.message_id,
                     subject = excluded.subject,
                     from_address = excluded.from_address,
                     from_name = excluded.from_name,
                     to_addresses = excluded.to_addresses,
+                    cc_addresses = excluded.cc_addresses,
                     date_sent = excluded.date_sent,
                     date_epoch = excluded.date_epoch,
                     snippet = excluded.snippet,
@@ -559,6 +618,7 @@ impl Database {
             .bind(&msg.from_address)
             .bind(&msg.from_name)
             .bind(&msg.to_addresses)
+            .bind(&msg.cc_addresses)
             .bind(&msg.date_sent)
             .bind(msg.date_epoch)
             .bind(&msg.snippet)
@@ -588,16 +648,17 @@ impl Database {
             r#"
             INSERT INTO messages (
                 folder_id, uid, message_id, subject, from_address, from_name,
-                to_addresses, date_sent, date_epoch, snippet, is_read, is_starred,
+                to_addresses, cc_addresses, date_sent, date_epoch, snippet, is_read, is_starred,
                 has_attachments, size, maildir_path
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(folder_id, uid) DO UPDATE SET
                 message_id = excluded.message_id,
                 subject = excluded.subject,
                 from_address = excluded.from_address,
                 from_name = excluded.from_name,
                 to_addresses = excluded.to_addresses,
+                cc_addresses = excluded.cc_addresses,
                 date_sent = excluded.date_sent,
                 date_epoch = excluded.date_epoch,
                 snippet = excluded.snippet,
@@ -617,6 +678,7 @@ impl Database {
         .bind(&msg.from_address)
         .bind(&msg.from_name)
         .bind(&msg.to_addresses)
+        .bind(&msg.cc_addresses)
         .bind(&msg.date_sent)
         .bind(msg.date_epoch)
         .bind(&msg.snippet)
@@ -641,7 +703,7 @@ impl Database {
         let messages = sqlx::query_as::<_, DbMessage>(
             r#"
             SELECT id, folder_id, uid, message_id, subject, from_address, from_name,
-                   to_addresses, date_sent, date_epoch, snippet, is_read, is_starred,
+                   to_addresses, cc_addresses, date_sent, date_epoch, snippet, is_read, is_starred,
                    has_attachments, size, maildir_path, body_text, body_html
             FROM messages
             WHERE folder_id = ?
@@ -705,6 +767,112 @@ impl Database {
         Ok(())
     }
 
+    /// Get attachment metadata for a message
+    pub async fn get_message_attachments(
+        &self,
+        folder_id: i64,
+        uid: i64,
+    ) -> CoreResult<Vec<AttachmentMetadata>> {
+        // First get the message id
+        let msg_id: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM messages WHERE folder_id = ? AND uid = ?",
+        )
+        .bind(folder_id)
+        .bind(uid)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some((message_id,)) = msg_id else {
+            return Ok(Vec::new());
+        };
+
+        let attachments = sqlx::query_as::<_, AttachmentMetadata>(
+            "SELECT id, message_id, filename, mime_type, size, content_id, is_inline FROM attachments WHERE message_id = ?",
+        )
+        .bind(message_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(attachments)
+    }
+
+    /// Save attachment metadata for a message (replaces existing)
+    pub async fn save_message_attachments(
+        &self,
+        folder_id: i64,
+        uid: i64,
+        attachments: &[AttachmentInfo],
+    ) -> CoreResult<()> {
+        // First get the message id
+        let msg_id: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM messages WHERE folder_id = ? AND uid = ?",
+        )
+        .bind(folder_id)
+        .bind(uid)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some((message_id,)) = msg_id else {
+            return Ok(());
+        };
+
+        // Delete existing attachments
+        sqlx::query("DELETE FROM attachments WHERE message_id = ?")
+            .bind(message_id)
+            .execute(&self.pool)
+            .await?;
+
+        // Insert new attachments
+        for att in attachments {
+            sqlx::query(
+                r#"
+                INSERT INTO attachments (message_id, filename, mime_type, size, content_id, is_inline)
+                VALUES (?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(message_id)
+            .bind(&att.filename)
+            .bind(&att.mime_type)
+            .bind(att.size as i64)
+            .bind(&att.content_id)
+            .bind(att.is_inline)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Get message UIDs that need body prefetch (no cached body, within last N days)
+    /// Returns (uid, is_unread) pairs, prioritizing unread messages
+    pub async fn get_messages_needing_body_prefetch(
+        &self,
+        folder_id: i64,
+        days: i64,
+        limit: i64,
+    ) -> CoreResult<Vec<(i64, bool)>> {
+        let cutoff_epoch = chrono::Utc::now().timestamp() - (days * 24 * 60 * 60);
+
+        let results: Vec<(i64, bool)> = sqlx::query_as(
+            r#"
+            SELECT uid, is_read = 0 as is_unread
+            FROM messages
+            WHERE folder_id = ?
+              AND (body_text IS NULL AND body_html IS NULL)
+              AND (date_epoch IS NULL OR date_epoch >= ?)
+            ORDER BY is_read ASC, date_epoch DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(folder_id)
+        .bind(cutoff_epoch)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(results)
+    }
+
     /// Search messages using FTS
     pub async fn search_messages(&self, query: &str, limit: i64) -> CoreResult<Vec<DbMessage>> {
         let fts_query = prepare_fts_query(query);
@@ -717,7 +885,7 @@ impl Database {
         let messages = sqlx::query_as::<_, DbMessage>(
             r#"
             SELECT m.id, m.folder_id, m.uid, m.message_id, m.subject, m.from_address,
-                   m.from_name, m.to_addresses, m.date_sent, m.date_epoch, m.snippet,
+                   m.from_name, m.to_addresses, m.cc_addresses, m.date_sent, m.date_epoch, m.snippet,
                    m.is_read, m.is_starred, m.has_attachments, m.size, m.maildir_path,
                    m.body_text, m.body_html
             FROM messages m
@@ -752,7 +920,7 @@ impl Database {
         let messages = sqlx::query_as::<_, DbMessage>(
             r#"
             SELECT m.id, m.folder_id, m.uid, m.message_id, m.subject, m.from_address,
-                   m.from_name, m.to_addresses, m.date_sent, m.date_epoch, m.snippet,
+                   m.from_name, m.to_addresses, m.cc_addresses, m.date_sent, m.date_epoch, m.snippet,
                    m.is_read, m.is_starred, m.has_attachments, m.size, m.maildir_path,
                    m.body_text, m.body_html
             FROM messages m
@@ -808,6 +976,32 @@ impl Database {
         .bind(uid)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Get the has_attachments flag for a message
+    pub async fn get_message_has_attachments(
+        &self,
+        folder_id: i64,
+        uid: i64,
+    ) -> CoreResult<bool> {
+        let result: Option<(bool,)> = sqlx::query_as(
+            "SELECT has_attachments FROM messages WHERE folder_id = ? AND uid = ?",
+        )
+        .bind(folder_id)
+        .bind(uid)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(result.map(|(v,)| v).unwrap_or(false))
+    }
+
+    /// Delete a single message by ID
+    pub async fn delete_message(&self, message_id: i64) -> CoreResult<()> {
+        sqlx::query("DELETE FROM messages WHERE id = ?")
+            .bind(message_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -986,7 +1180,7 @@ impl Database {
         let messages = sqlx::query_as::<_, DbMessage>(
             r#"
             SELECT m.id, m.folder_id, m.uid, m.message_id, m.subject, m.from_address,
-                   m.from_name, m.to_addresses, m.date_sent, m.date_epoch, m.snippet,
+                   m.from_name, m.to_addresses, m.cc_addresses, m.date_sent, m.date_epoch, m.snippet,
                    m.is_read, m.is_starred, m.has_attachments, m.size, m.maildir_path,
                    m.body_text, m.body_html
             FROM messages m
@@ -1035,7 +1229,7 @@ impl Database {
         let messages = sqlx::query_as::<_, DbMessage>(
             r#"
             SELECT m.id, m.folder_id, m.uid, m.message_id, m.subject, m.from_address,
-                   m.from_name, m.to_addresses, m.date_sent, m.date_epoch, m.snippet,
+                   m.from_name, m.to_addresses, m.cc_addresses, m.date_sent, m.date_epoch, m.snippet,
                    m.is_read, m.is_starred, m.has_attachments, m.size, m.maildir_path,
                    m.body_text, m.body_html
             FROM messages m
@@ -1084,7 +1278,7 @@ impl Database {
         let where_clause = conditions.join(" AND ");
         let query_str = format!(
             r#"SELECT m.id, m.folder_id, m.uid, m.message_id, m.subject, m.from_address,
-                   m.from_name, m.to_addresses, m.date_sent, m.date_epoch, m.snippet,
+                   m.from_name, m.to_addresses, m.cc_addresses, m.date_sent, m.date_epoch, m.snippet,
                    m.is_read, m.is_starred, m.has_attachments, m.size, m.maildir_path,
                    m.body_text, m.body_html
             FROM messages m
@@ -1148,7 +1342,7 @@ impl Database {
         let where_clause = conditions.join(" AND ");
         let query_str = format!(
             r#"SELECT m.id, m.folder_id, m.uid, m.message_id, m.subject, m.from_address,
-                   m.from_name, m.to_addresses, m.date_sent, m.date_epoch, m.snippet,
+                   m.from_name, m.to_addresses, m.cc_addresses, m.date_sent, m.date_epoch, m.snippet,
                    m.is_read, m.is_starred, m.has_attachments, m.size, m.maildir_path,
                    m.body_text, m.body_html
             FROM messages m
@@ -1222,6 +1416,18 @@ impl Database {
             .await?;
 
         Ok(row.get::<Option<i64>, _>("min_uid").map(|v| v as u32))
+    }
+
+    /// Get the folder_id for a message by its database ID
+    pub async fn get_message_folder_id(&self, message_id: i64) -> CoreResult<Option<i64>> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT folder_id FROM messages WHERE id = ?"
+        )
+        .bind(message_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|(folder_id,)| folder_id))
     }
 
     /// Batch update is_read and is_starred flags by UID within a transaction

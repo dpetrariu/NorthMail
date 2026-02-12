@@ -67,13 +67,25 @@ mod imp {
         fn signals() -> &'static [Signal] {
             static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
             SIGNALS.get_or_init(|| {
-                vec![Signal::builder("folder-selected")
-                    .param_types([
-                        String::static_type(), // account_id
-                        String::static_type(), // folder_path
-                        bool::static_type(),   // is_unified
-                    ])
-                    .build()]
+                vec![
+                    Signal::builder("folder-selected")
+                        .param_types([
+                            String::static_type(), // account_id
+                            String::static_type(), // folder_path
+                            bool::static_type(),   // is_unified
+                        ])
+                        .build(),
+                    Signal::builder("message-dropped")
+                        .param_types([
+                            u32::static_type(),    // message uid
+                            i64::static_type(),    // message id (db)
+                            String::static_type(), // source account_id
+                            String::static_type(), // source folder_path
+                            String::static_type(), // target account_id
+                            String::static_type(), // target folder_path
+                        ])
+                        .build(),
+                ]
             })
         }
 
@@ -117,6 +129,26 @@ impl FolderSidebar {
                                        folder_path: &str,
                                        is_unified: bool| {
                 f(sidebar, account_id, folder_path, is_unified);
+            }),
+        )
+    }
+
+    /// Connect to the message-dropped signal (drag-and-drop move)
+    pub fn connect_message_dropped<F>(&self, f: F) -> glib::SignalHandlerId
+    where
+        F: Fn(&Self, u32, i64, &str, &str, &str, &str) + 'static,
+    {
+        self.connect_closure(
+            "message-dropped",
+            false,
+            glib::closure_local!(move |sidebar: &FolderSidebar,
+                                       uid: u32,
+                                       msg_id: i64,
+                                       source_account_id: &str,
+                                       source_folder_path: &str,
+                                       target_account_id: &str,
+                                       target_folder_path: &str| {
+                f(sidebar, uid, msg_id, source_account_id, source_folder_path, target_account_id, target_folder_path);
             }),
         )
     }
@@ -228,6 +260,14 @@ impl FolderSidebar {
                 margin-right: 12px;
                 margin-top: 4px;
                 margin-bottom: 4px;
+            }
+            /* Drop highlight for drag-and-drop - subtle background only */
+            .folders-list > row.drop-highlight {
+                background-color: alpha(@accent_bg_color, 0.25);
+            }
+            /* Drop highlight for inbox rows - more visible on accent background */
+            .inboxes-list > row.drop-highlight {
+                background-color: alpha(white, 0.4);
             }
             "
         );
@@ -474,17 +514,20 @@ impl FolderSidebar {
         let mut expanded_states = HashMap::new();
 
         // ── Section 0: Unified Inbox (in inboxes list) ──
+        // No drop target for unified inbox (can't drop to all accounts at once)
         let total_unread: u32 = accounts.iter().filter_map(|a| a.inbox_unread).sum();
-        let row = self.create_inbox_row("mail-inbox-symbolic", "All Inboxes", Some(total_unread));
+        let row = self.create_inbox_row("mail-inbox-symbolic", "All Inboxes", Some(total_unread), None);
         row.set_widget_name(&encode_row_name(0, "unified", "", ""));
         inboxes_list.append(&row);
 
         // ── Section 1: Per-account inboxes (in inboxes list) ──
+        // These have drop targets so users can drag messages back to inbox
         for account in &accounts {
             let row = self.create_inbox_row(
                 "mail-inbox-symbolic",
                 &account.email,
                 account.inbox_unread,
+                Some(&account.id),
             );
             row.set_widget_name(&encode_row_name(1, "inbox", &account.id, ""));
             inboxes_list.append(&row);
@@ -508,6 +551,8 @@ impl FolderSidebar {
                     &folder.name,
                     folder.unread_count,
                     true,
+                    &account.id,
+                    &folder.full_path,
                 );
                 row.set_widget_name(&encode_row_name(
                     section,
@@ -552,11 +597,13 @@ impl FolderSidebar {
     // ── Row factories ────────────────────────────────────────────────
 
     /// Create a row for the inboxes section (white text on accent background)
+    /// If account_id is provided, add a drop target for drag-and-drop
     fn create_inbox_row(
         &self,
         icon_name: &str,
         label: &str,
         unread_count: Option<u32>,
+        account_id: Option<&str>,
     ) -> gtk4::ListBoxRow {
         let row = gtk4::ListBoxRow::builder()
             .selectable(true)
@@ -595,6 +642,63 @@ impl FolderSidebar {
         }
 
         row.set_child(Some(&content));
+
+        // Add drop target for per-account inbox rows (not unified inbox)
+        if let Some(account_id) = account_id {
+            let drop_target = gtk4::DropTarget::builder()
+                .actions(gtk4::gdk::DragAction::MOVE)
+                .build();
+            drop_target.set_types(&[glib::Type::STRING]);
+
+            let sidebar = self.clone();
+            let target_account_id = account_id.to_string();
+            let row_weak = row.downgrade();
+
+            drop_target.connect_drop(move |_target, value, _x, _y| {
+                if let Ok(data) = value.get::<String>() {
+                    // Parse "uid:msg_id:source_account_id:source_folder_path"
+                    let parts: Vec<&str> = data.split(':').collect();
+                    if parts.len() >= 4 {
+                        if let (Ok(uid), Ok(msg_id)) = (
+                            parts[0].parse::<u32>(),
+                            parts[1].parse::<i64>(),
+                        ) {
+                            let source_account_id = parts[2].to_string();
+                            // folder_path may contain colons, so join remaining parts
+                            let source_folder_path = parts[3..].join(":");
+                            tracing::debug!(
+                                "Message dropped on inbox: uid={} from {}/{} to {}/INBOX",
+                                uid, source_account_id, source_folder_path, target_account_id
+                            );
+                            sidebar.emit_by_name::<()>(
+                                "message-dropped",
+                                &[&uid, &msg_id, &source_account_id, &source_folder_path, &target_account_id, &"INBOX".to_string()],
+                            );
+                            return true;
+                        }
+                    }
+                }
+                false
+            });
+
+            // Visual feedback when dragging over
+            drop_target.connect_enter(move |_target, _x, _y| {
+                if let Some(row) = row_weak.upgrade() {
+                    row.add_css_class("drop-highlight");
+                }
+                gtk4::gdk::DragAction::MOVE
+            });
+
+            let row_weak2 = row.downgrade();
+            drop_target.connect_leave(move |_target| {
+                if let Some(row) = row_weak2.upgrade() {
+                    row.remove_css_class("drop-highlight");
+                }
+            });
+
+            row.add_controller(drop_target);
+        }
+
         row
     }
 
@@ -605,6 +709,8 @@ impl FolderSidebar {
         label: &str,
         unread_count: Option<u32>,
         indent: bool,
+        account_id: &str,
+        folder_path: &str,
     ) -> gtk4::ListBoxRow {
         let row = gtk4::ListBoxRow::builder()
             .selectable(true)
@@ -646,6 +752,61 @@ impl FolderSidebar {
         }
 
         row.set_child(Some(&content));
+
+        // Add drop target for drag-and-drop message moving
+        let drop_target = gtk4::DropTarget::builder()
+            .actions(gtk4::gdk::DragAction::MOVE)
+            .build();
+        drop_target.set_types(&[glib::Type::STRING]);
+
+        let sidebar = self.clone();
+        let target_account_id = account_id.to_string();
+        let target_folder_path = folder_path.to_string();
+        let row_weak = row.downgrade();
+
+        drop_target.connect_drop(move |_target, value, _x, _y| {
+            if let Ok(data) = value.get::<String>() {
+                // Parse "uid:msg_id:source_account_id:source_folder_path"
+                let parts: Vec<&str> = data.split(':').collect();
+                if parts.len() >= 4 {
+                    if let (Ok(uid), Ok(msg_id)) = (
+                        parts[0].parse::<u32>(),
+                        parts[1].parse::<i64>(),
+                    ) {
+                        let source_account_id = parts[2].to_string();
+                        // folder_path may contain colons, so join remaining parts
+                        let source_folder_path = parts[3..].join(":");
+                        tracing::debug!(
+                            "Message dropped: uid={} from {}/{} to {}/{}",
+                            uid, source_account_id, source_folder_path, target_account_id, target_folder_path
+                        );
+                        sidebar.emit_by_name::<()>(
+                            "message-dropped",
+                            &[&uid, &msg_id, &source_account_id, &source_folder_path, &target_account_id, &target_folder_path],
+                        );
+                        return true;
+                    }
+                }
+            }
+            false
+        });
+
+        // Visual feedback when dragging over
+        drop_target.connect_enter(move |_target, _x, _y| {
+            if let Some(row) = row_weak.upgrade() {
+                row.add_css_class("drop-highlight");
+            }
+            gtk4::gdk::DragAction::MOVE
+        });
+
+        let row_weak2 = row.downgrade();
+        drop_target.connect_leave(move |_target| {
+            if let Some(row) = row_weak2.upgrade() {
+                row.remove_css_class("drop-highlight");
+            }
+        });
+
+        row.add_controller(drop_target);
         row
     }
 

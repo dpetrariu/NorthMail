@@ -340,6 +340,19 @@ impl SyncEngine {
                             .collect::<Vec<_>>()
                             .join(", "),
                     ),
+                    cc_addresses: if header.envelope.cc.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            header
+                                .envelope
+                                .cc
+                                .iter()
+                                .map(|a| a.address.clone())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        )
+                    },
                     date_sent: header.envelope.date.clone(),
                     date_epoch: header.envelope.date.as_deref().and_then(|d| {
                         let mut s = d.to_string();

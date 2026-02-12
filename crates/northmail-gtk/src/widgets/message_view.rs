@@ -11,8 +11,9 @@ mod imp {
 
     #[derive(Default)]
     pub struct MessageView {
-        pub header_box: RefCell<Option<gtk4::Box>>,
+        pub header_card: RefCell<Option<gtk4::Box>>,
         pub content_box: RefCell<Option<gtk4::Box>>,
+        pub star_button: RefCell<Option<gtk4::ToggleButton>>,
     }
 
     #[glib::object_subclass]
@@ -53,101 +54,172 @@ impl MessageView {
     fn setup_ui(&self) {
         let imp = self.imp();
 
-        // Toolbar with message actions
-        let toolbar = gtk4::Box::builder()
-            .orientation(gtk4::Orientation::Horizontal)
-            .spacing(6)
-            .margin_start(12)
-            .margin_end(12)
-            .margin_top(6)
-            .margin_bottom(6)
+        // Add CSS for styling
+        let css_provider = gtk4::CssProvider::new();
+        css_provider.load_from_string(
+            r#"
+            .message-view-container {
+                background-color: white;
+            }
+            .message-header-card {
+                background-color: alpha(@view_bg_color, 0.7);
+                border-radius: 12px;
+                margin: 12px;
+                padding: 0;
+            }
+            .message-header-card-inner {
+                padding: 12px 16px;
+            }
+            .message-action-bar {
+                padding: 8px 12px;
+                border-bottom: 1px solid alpha(black, 0.08);
+            }
+            .message-subject {
+                font-size: 18px;
+                font-weight: 600;
+            }
+            .message-sender-name {
+                font-size: 14px;
+                font-weight: 600;
+            }
+            .message-sender-email {
+                font-size: 12px;
+                color: alpha(@view_fg_color, 0.6);
+            }
+            .message-date {
+                font-size: 12px;
+                color: alpha(@view_fg_color, 0.6);
+            }
+            .message-recipients {
+                font-size: 12px;
+                color: alpha(@view_fg_color, 0.7);
+            }
+            .message-recipients-label {
+                font-size: 12px;
+                color: alpha(@view_fg_color, 0.5);
+                min-width: 24px;
+            }
+            .avatar-circle {
+                border-radius: 50%;
+                min-width: 40px;
+                min-height: 40px;
+            }
+            .message-content-area {
+                background-color: white;
+                padding: 16px;
+            }
+            "#,
+        );
+        gtk4::style_context_add_provider_for_display(
+            &gtk4::gdk::Display::default().unwrap(),
+            &css_provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_USER,
+        );
+
+        // Main container with white background
+        self.add_css_class("message-view-container");
+
+        // Scrolled window for entire message view
+        let scrolled = gtk4::ScrolledWindow::builder()
+            .vexpand(true)
+            .hexpand(true)
             .build();
 
+        let main_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .build();
+
+        // Header card (floating rounded box)
+        let header_card = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .css_classes(["message-header-card"])
+            .build();
+
+        // Action bar at top of card
+        let action_bar = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .css_classes(["message-action-bar"])
+            .build();
+
+        // Star button on left
+        let star_button = gtk4::ToggleButton::builder()
+            .icon_name("non-starred-symbolic")
+            .tooltip_text("Star")
+            .css_classes(["flat"])
+            .build();
+
+        // Update icon when toggled
+        star_button.connect_toggled(|btn| {
+            if btn.is_active() {
+                btn.set_icon_name("starred-symbolic");
+            } else {
+                btn.set_icon_name("non-starred-symbolic");
+            }
+        });
+
+        let action_spacer = gtk4::Box::builder()
+            .hexpand(true)
+            .build();
+
+        // Action buttons on right
         let reply_button = gtk4::Button::builder()
             .icon_name("mail-reply-sender-symbolic")
             .tooltip_text("Reply")
+            .css_classes(["flat"])
             .build();
 
         let reply_all_button = gtk4::Button::builder()
             .icon_name("mail-reply-all-symbolic")
             .tooltip_text("Reply All")
+            .css_classes(["flat"])
             .build();
 
         let forward_button = gtk4::Button::builder()
             .icon_name("mail-forward-symbolic")
             .tooltip_text("Forward")
+            .css_classes(["flat"])
             .build();
 
         let archive_button = gtk4::Button::builder()
             .icon_name("folder-symbolic")
             .tooltip_text("Archive")
+            .css_classes(["flat"])
             .build();
 
         let delete_button = gtk4::Button::builder()
             .icon_name("user-trash-symbolic")
             .tooltip_text("Delete")
-            .css_classes(["destructive-action"])
+            .css_classes(["flat"])
             .build();
 
-        let spacer = gtk4::Box::builder()
-            .hexpand(true)
-            .build();
+        action_bar.append(&star_button);
+        action_bar.append(&action_spacer);
+        action_bar.append(&reply_button);
+        action_bar.append(&reply_all_button);
+        action_bar.append(&forward_button);
+        action_bar.append(&archive_button);
+        action_bar.append(&delete_button);
 
-        let star_button = gtk4::ToggleButton::builder()
-            .icon_name("starred-symbolic")
-            .tooltip_text("Star")
-            .build();
+        header_card.append(&action_bar);
 
-        let more_button = gtk4::MenuButton::builder()
-            .icon_name("view-more-symbolic")
-            .tooltip_text("More Actions")
-            .build();
-
-        toolbar.append(&reply_button);
-        toolbar.append(&reply_all_button);
-        toolbar.append(&forward_button);
-        toolbar.append(&archive_button);
-        toolbar.append(&delete_button);
-        toolbar.append(&spacer);
-        toolbar.append(&star_button);
-        toolbar.append(&more_button);
-
-        self.append(&toolbar);
-
-        // Separator
-        let separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
-        self.append(&separator);
-
-        // Header section
-        let header_box = gtk4::Box::builder()
+        // Header content (will be populated when message is shown)
+        let header_content = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
-            .spacing(6)
-            .margin_start(12)
-            .margin_end(12)
-            .margin_top(12)
-            .margin_bottom(12)
+            .spacing(8)
+            .css_classes(["message-header-card-inner"])
             .build();
 
-        self.append(&header_box);
-        imp.header_box.replace(Some(header_box));
+        header_card.append(&header_content);
+        main_box.append(&header_card);
 
-        // Another separator
-        let separator2 = gtk4::Separator::new(gtk4::Orientation::Horizontal);
-        self.append(&separator2);
+        imp.header_card.replace(Some(header_content));
+        imp.star_button.replace(Some(star_button));
 
-        // Content area (will contain WebKitWebView for HTML or TextView for plain text)
-        let content_scrolled = gtk4::ScrolledWindow::builder()
-            .vexpand(true)
-            .hexpand(true)
-            .css_classes(["view"])
-            .build();
-
+        // Content area
         let content_box = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
-            .margin_start(12)
-            .margin_end(12)
-            .margin_top(12)
-            .margin_bottom(12)
+            .css_classes(["message-content-area"])
+            .vexpand(true)
             .build();
 
         // Placeholder
@@ -159,10 +231,97 @@ impl MessageView {
             .build();
 
         content_box.append(&placeholder);
-        content_scrolled.set_child(Some(&content_box));
-        self.append(&content_scrolled);
+        main_box.append(&content_box);
+
+        scrolled.set_child(Some(&main_box));
+        self.append(&scrolled);
 
         imp.content_box.replace(Some(content_box));
+    }
+
+    /// Generate a color from a string (for avatar background)
+    fn string_to_color(s: &str) -> String {
+        let colors = [
+            "#4A90D9", "#E74C3C", "#2ECC71", "#9B59B6",
+            "#F39C12", "#1ABC9C", "#E91E63", "#3F51B5",
+            "#00BCD4", "#8BC34A", "#FF5722", "#607D8B",
+        ];
+
+        let hash: usize = s.bytes().fold(0, |acc, b| acc.wrapping_add(b as usize));
+        colors[hash % colors.len()].to_string()
+    }
+
+    /// Get initials from a name or email
+    fn get_initials(name: &str, email: &str) -> String {
+        // Try to get initials from name first
+        let display = if name.is_empty() || name == email {
+            email.split('@').next().unwrap_or("?")
+        } else {
+            name
+        };
+
+        let words: Vec<&str> = display.split_whitespace().collect();
+        match words.len() {
+            0 => "?".to_string(),
+            1 => words[0].chars().next().unwrap_or('?').to_uppercase().to_string(),
+            _ => {
+                let first = words[0].chars().next().unwrap_or('?');
+                let last = words[words.len() - 1].chars().next().unwrap_or('?');
+                format!("{}{}", first, last).to_uppercase()
+            }
+        }
+    }
+
+    /// Create an avatar widget
+    fn create_avatar(&self, name: &str, email: &str, _contact_photo: Option<&str>) -> gtk4::Widget {
+        // TODO: If contact_photo is available, use it instead of initials
+        let initials = Self::get_initials(name, email);
+        let color = Self::string_to_color(email);
+
+        let avatar_box = gtk4::Box::builder()
+            .width_request(40)
+            .height_request(40)
+            .halign(gtk4::Align::Center)
+            .valign(gtk4::Align::Center)
+            .build();
+
+        let drawing_area = gtk4::DrawingArea::builder()
+            .width_request(40)
+            .height_request(40)
+            .build();
+
+        let initials_clone = initials.clone();
+        let color_clone = color.clone();
+        drawing_area.set_draw_func(move |_, cr, width, height| {
+            // Parse color
+            let r = u8::from_str_radix(&color_clone[1..3], 16).unwrap_or(74) as f64 / 255.0;
+            let g = u8::from_str_radix(&color_clone[3..5], 16).unwrap_or(144) as f64 / 255.0;
+            let b = u8::from_str_radix(&color_clone[5..7], 16).unwrap_or(217) as f64 / 255.0;
+
+            // Draw circle
+            let radius = (width.min(height) as f64) / 2.0;
+            let cx = width as f64 / 2.0;
+            let cy = height as f64 / 2.0;
+
+            cr.arc(cx, cy, radius, 0.0, 2.0 * std::f64::consts::PI);
+            cr.set_source_rgb(r, g, b);
+            let _ = cr.fill();
+
+            // Draw text
+            cr.set_source_rgb(1.0, 1.0, 1.0);
+            cr.select_font_face("Sans", gtk4::cairo::FontSlant::Normal, gtk4::cairo::FontWeight::Bold);
+            cr.set_font_size(16.0);
+
+            let extents = cr.text_extents(&initials_clone).unwrap();
+            let x = cx - extents.width() / 2.0 - extents.x_bearing();
+            let y = cy - extents.height() / 2.0 - extents.y_bearing();
+
+            cr.move_to(x, y);
+            let _ = cr.show_text(&initials_clone);
+        });
+
+        avatar_box.append(&drawing_area);
+        avatar_box.upcast()
     }
 
     /// Display a message
@@ -170,83 +329,132 @@ impl MessageView {
         let imp = self.imp();
 
         // Update header
-        if let Some(header_box) = imp.header_box.borrow().as_ref() {
+        if let Some(header_box) = imp.header_card.borrow().as_ref() {
             // Clear existing content
             while let Some(child) = header_box.first_child() as Option<gtk4::Widget> {
                 header_box.remove(&child);
             }
 
+            // Top row: Avatar + Sender info + Date
+            let sender_row = gtk4::Box::builder()
+                .orientation(gtk4::Orientation::Horizontal)
+                .spacing(12)
+                .build();
+
+            // Avatar
+            let avatar = self.create_avatar(&message.from_name, &message.from_email, None);
+            sender_row.append(&avatar);
+
+            // Sender name and email
+            let sender_info = gtk4::Box::builder()
+                .orientation(gtk4::Orientation::Vertical)
+                .spacing(2)
+                .hexpand(true)
+                .valign(gtk4::Align::Center)
+                .build();
+
+            let sender_name = if message.from_name.is_empty() || message.from_name == message.from_email {
+                message.from_email.split('@').next().unwrap_or(&message.from_email).to_string()
+            } else {
+                message.from_name.clone()
+            };
+
+            let name_label = gtk4::Label::builder()
+                .label(&sender_name)
+                .xalign(0.0)
+                .css_classes(["message-sender-name"])
+                .build();
+
+            let email_label = gtk4::Label::builder()
+                .label(&format!("<{}>", message.from_email))
+                .xalign(0.0)
+                .css_classes(["message-sender-email"])
+                .build();
+
+            sender_info.append(&name_label);
+            sender_info.append(&email_label);
+            sender_row.append(&sender_info);
+
+            // Date on right
+            let date_label = gtk4::Label::builder()
+                .label(&message.date)
+                .css_classes(["message-date"])
+                .valign(gtk4::Align::Start)
+                .build();
+            sender_row.append(&date_label);
+
+            header_box.append(&sender_row);
+
             // Subject
             let subject_label = gtk4::Label::builder()
                 .label(&message.subject)
                 .xalign(0.0)
-                .css_classes(["title-2"])
+                .css_classes(["message-subject"])
                 .wrap(true)
+                .margin_top(8)
                 .build();
             header_box.append(&subject_label);
 
-            // From
-            let from_box = gtk4::Box::builder()
-                .orientation(gtk4::Orientation::Horizontal)
-                .spacing(6)
+            // Recipients section
+            let recipients_box = gtk4::Box::builder()
+                .orientation(gtk4::Orientation::Vertical)
+                .spacing(4)
+                .margin_top(8)
                 .build();
 
-            let from_label = gtk4::Label::builder()
-                .label("From:")
-                .css_classes(["dim-label"])
-                .build();
+            // To:
+            if !message.to.is_empty() {
+                let to_row = gtk4::Box::builder()
+                    .orientation(gtk4::Orientation::Horizontal)
+                    .spacing(6)
+                    .build();
 
-            let from_value = gtk4::Label::builder()
-                .label(&message.from)
-                .xalign(0.0)
-                .hexpand(true)
-                .build();
+                let to_label = gtk4::Label::builder()
+                    .label("To:")
+                    .css_classes(["message-recipients-label"])
+                    .xalign(0.0)
+                    .build();
 
-            from_box.append(&from_label);
-            from_box.append(&from_value);
-            header_box.append(&from_box);
+                let to_value = gtk4::Label::builder()
+                    .label(&message.to.join(", "))
+                    .css_classes(["message-recipients"])
+                    .xalign(0.0)
+                    .hexpand(true)
+                    .wrap(true)
+                    .build();
 
-            // To
-            let to_box = gtk4::Box::builder()
-                .orientation(gtk4::Orientation::Horizontal)
-                .spacing(6)
-                .build();
+                to_row.append(&to_label);
+                to_row.append(&to_value);
+                recipients_box.append(&to_row);
+            }
 
-            let to_label = gtk4::Label::builder()
-                .label("To:")
-                .css_classes(["dim-label"])
-                .build();
+            // Cc:
+            if !message.cc.is_empty() {
+                let cc_row = gtk4::Box::builder()
+                    .orientation(gtk4::Orientation::Horizontal)
+                    .spacing(6)
+                    .build();
 
-            let to_value = gtk4::Label::builder()
-                .label(&message.to.join(", "))
-                .xalign(0.0)
-                .hexpand(true)
-                .wrap(true)
-                .build();
+                let cc_label = gtk4::Label::builder()
+                    .label("Cc:")
+                    .css_classes(["message-recipients-label"])
+                    .xalign(0.0)
+                    .build();
 
-            to_box.append(&to_label);
-            to_box.append(&to_value);
-            header_box.append(&to_box);
+                let cc_value = gtk4::Label::builder()
+                    .label(&message.cc.join(", "))
+                    .css_classes(["message-recipients"])
+                    .xalign(0.0)
+                    .hexpand(true)
+                    .wrap(true)
+                    .build();
 
-            // Date
-            let date_box = gtk4::Box::builder()
-                .orientation(gtk4::Orientation::Horizontal)
-                .spacing(6)
-                .build();
+                cc_row.append(&cc_label);
+                cc_row.append(&cc_value);
+                recipients_box.append(&cc_row);
+            }
 
-            let date_label = gtk4::Label::builder()
-                .label("Date:")
-                .css_classes(["dim-label"])
-                .build();
-
-            let date_value = gtk4::Label::builder()
-                .label(&message.date)
-                .xalign(0.0)
-                .build();
-
-            date_box.append(&date_label);
-            date_box.append(&date_value);
-            header_box.append(&date_box);
+            header_box.append(&recipients_box);
         }
 
         // Update content
@@ -289,6 +497,7 @@ impl MessageView {
                     .editable(false)
                     .cursor_visible(false)
                     .wrap_mode(gtk4::WrapMode::Word)
+                    .vexpand(true)
                     .build();
 
                 text_view.buffer().set_text(&text);
@@ -307,7 +516,7 @@ impl MessageView {
     pub fn clear(&self) {
         let imp = self.imp();
 
-        if let Some(header_box) = imp.header_box.borrow().as_ref() {
+        if let Some(header_box) = imp.header_card.borrow().as_ref() {
             while let Some(child) = header_box.first_child() as Option<gtk4::Widget> {
                 header_box.remove(&child);
             }
@@ -473,7 +682,8 @@ pub struct MessageDetails {
     pub id: i64,
     pub uid: u32,
     pub subject: String,
-    pub from: String,
+    pub from_name: String,
+    pub from_email: String,
     pub to: Vec<String>,
     pub cc: Vec<String>,
     pub date: String,

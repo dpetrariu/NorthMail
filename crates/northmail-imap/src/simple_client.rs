@@ -1301,6 +1301,125 @@ impl SimpleImapClient {
         Ok(uid)
     }
 
+    /// Add or remove flags on a message by UID
+    /// `add` = true for +FLAGS, false for -FLAGS
+    pub async fn uid_store_flags(&mut self, uid: u32, flags: &str, add: bool) -> ImapResult<()> {
+        let tag = self.next_tag();
+        let op = if add { "+" } else { "-" };
+        let cmd = format!("{} UID STORE {} {}FLAGS ({})\r\n", tag, uid, op, flags);
+
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or(ImapError::NotConnected)?;
+
+        stream
+            .get_mut()
+            .write_all(cmd.as_bytes())
+            .await
+            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+        loop {
+            let mut line = String::new();
+            stream
+                .read_line(&mut line)
+                .await
+                .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+            debug!("UID STORE response: {}", line.trim());
+
+            if line.starts_with(&tag) {
+                if !line.contains("OK") {
+                    return Err(ImapError::ServerError(format!(
+                        "UID STORE failed: {}",
+                        line.trim()
+                    )));
+                }
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Copy a message to another folder by UID
+    pub async fn uid_copy(&mut self, uid: u32, dest_folder: &str) -> ImapResult<()> {
+        let tag = self.next_tag();
+        let cmd = format!("{} UID COPY {} \"{}\"\r\n", tag, uid, dest_folder);
+
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or(ImapError::NotConnected)?;
+
+        stream
+            .get_mut()
+            .write_all(cmd.as_bytes())
+            .await
+            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+        loop {
+            let mut line = String::new();
+            stream
+                .read_line(&mut line)
+                .await
+                .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+            debug!("UID COPY response: {}", line.trim());
+
+            if line.starts_with(&tag) {
+                if !line.contains("OK") {
+                    return Err(ImapError::ServerError(format!(
+                        "UID COPY failed: {}",
+                        line.trim()
+                    )));
+                }
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Expunge deleted messages from the current folder
+    pub async fn expunge(&mut self) -> ImapResult<()> {
+        let tag = self.next_tag();
+        let cmd = format!("{} EXPUNGE\r\n", tag);
+
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or(ImapError::NotConnected)?;
+
+        stream
+            .get_mut()
+            .write_all(cmd.as_bytes())
+            .await
+            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+        loop {
+            let mut line = String::new();
+            stream
+                .read_line(&mut line)
+                .await
+                .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+            debug!("EXPUNGE response: {}", line.trim());
+
+            if line.starts_with(&tag) {
+                if !line.contains("OK") {
+                    return Err(ImapError::ServerError(format!(
+                        "EXPUNGE failed: {}",
+                        line.trim()
+                    )));
+                }
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Set \Deleted flag on a message by UID and EXPUNGE it
     pub async fn uid_store_deleted_and_expunge(&mut self, uid: u32) -> ImapResult<()> {
         // Generate both tags before borrowing stream

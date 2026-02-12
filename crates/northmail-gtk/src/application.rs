@@ -302,6 +302,8 @@ pub struct ParsedAttachment {
     pub filename: String,
     pub mime_type: String,
     pub data: Vec<u8>,
+    pub size: usize,
+    pub content_id: Option<String>,
 }
 
 /// Parsed email body
@@ -1828,7 +1830,8 @@ impl NorthMailApplication {
                             subject: Some(msg.subject.clone()),
                             from_address: Some(msg.from_address.clone()),
                             from_name: Some(msg.from.clone()),
-                            to_addresses: None,
+                            to_addresses: if msg.to.is_empty() { None } else { Some(msg.to.clone()) },
+                            cc_addresses: if msg.cc.is_empty() { None } else { Some(msg.cc.clone()) },
                             date_sent: Some(msg.date.clone()),
                             date_epoch: msg.date_epoch,
                             snippet: msg.snippet.clone(),
@@ -1970,6 +1973,8 @@ impl NorthMailApplication {
                     if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
                         win.restore_message_list();
                         if let Some(message_list) = win.message_list() {
+                            // Set folder context for drag-and-drop
+                            message_list.set_folder_context(&account_id, &folder_path);
                             message_list.set_messages(cached_messages);
 
                             // Wire up "load more" from cache
@@ -2334,7 +2339,7 @@ impl NorthMailApplication {
                 let range = format!("{}:{}", initial_start, initial_end);
                 match client.fetch_headers(&range).await {
                     Ok(headers) => {
-                        let messages = Self::headers_to_message_info(&headers);
+                        let messages = Self::headers_to_message_info(&headers, 0);
 
                         // Prefetch bodies for first N messages
                         let uids_to_prefetch: Vec<u32> = messages
@@ -2401,7 +2406,7 @@ impl NorthMailApplication {
                             let range = format!("{}:{}", batch_lower, current_upper);
                             match client.uid_fetch_headers(&range).await {
                                 Ok(headers) => {
-                                    let messages = Self::headers_to_message_info(&headers);
+                                    let messages = Self::headers_to_message_info(&headers, 0);
                                     let batch_count = messages.len() as u32;
                                     synced += batch_count;
 
@@ -2456,7 +2461,7 @@ impl NorthMailApplication {
                             let range = format!("{}:{}", batch_start, current_end);
                             match client.fetch_headers(&range).await {
                                 Ok(headers) => {
-                                    let messages = Self::headers_to_message_info(&headers);
+                                    let messages = Self::headers_to_message_info(&headers, 0);
                                     let batch_count = messages.len() as u32;
                                     synced += batch_count;
 
@@ -2747,9 +2752,28 @@ impl NorthMailApplication {
                         // Otherwise we'd briefly show stale content before messages arrive
                         // The loading spinner should keep showing until Messages event
                     }
-                    FetchEvent::Messages(messages) => {
+                    FetchEvent::Messages(mut messages) => {
                         loaded_count += messages.len() as u32;
                         info!("Received batch of {} messages ({}/{})", messages.len(), loaded_count, total_count);
+
+                        // Look up folder_id and update messages (they come from IMAP with folder_id=0)
+                        if let Some(db) = app.database() {
+                            let db_clone = db.clone();
+                            let aid = account_id.to_string();
+                            let fpath = folder_path.to_string();
+                            let (sender, receiver) = std::sync::mpsc::channel();
+                            std::thread::spawn(move || {
+                                let rt = tokio::runtime::Runtime::new().unwrap();
+                                let result = rt.block_on(db_clone.get_or_create_folder_id(&aid, &fpath));
+                                let _ = sender.send(result);
+                            });
+                            if let Ok(Ok(folder_id)) = receiver.recv_timeout(std::time::Duration::from_millis(500)) {
+                                for msg in &mut messages {
+                                    msg.folder_id = folder_id;
+                                }
+                                debug!("Updated {} messages with folder_id={}", messages.len(), folder_id);
+                            }
+                        }
 
                         // Track UIDs for cache cleanup
                         synced_uids.extend(messages.iter().map(|m| m.uid as i64));
@@ -2814,6 +2838,8 @@ impl NorthMailApplication {
                                         } else {
                                             info!("Replacing message list with {} fresh messages from IMAP", messages.len());
                                             let msg_count = messages.len() as i64;
+                                            // Set folder context for drag-and-drop
+                                            message_list.set_folder_context(account_id, folder_path);
                                             message_list.set_messages(messages);
 
                                             // Wire up cache-based "load more" for IMAP path too
@@ -3077,6 +3103,9 @@ impl NorthMailApplication {
                             }
                         }
 
+                        // Start background body prefetch for recent messages (last 30 days)
+                        app.start_body_prefetch(&account_id, &folder_path);
+
                         return Ok(());
                     }
                     FetchEvent::Error(e) => {
@@ -3219,7 +3248,7 @@ impl NorthMailApplication {
 
                     match client.fetch_headers(&range).await {
                         Ok(headers) => {
-                            let messages = Self::headers_to_message_info(&headers);
+                            let messages = Self::headers_to_message_info(&headers, 0);
                             let _ = sender.send(FetchEvent::Messages(messages));
                             let _ = sender.send(FetchEvent::InitialBatchDone { lowest_seq: start });
                         }
@@ -3305,7 +3334,7 @@ impl NorthMailApplication {
     }
 
     /// Convert headers to MessageInfo
-    fn headers_to_message_info(headers: &[northmail_imap::MessageHeader]) -> Vec<MessageInfo> {
+    fn headers_to_message_info(headers: &[northmail_imap::MessageHeader], folder_id: i64) -> Vec<MessageInfo> {
         headers
             .iter()
             .rev()
@@ -3315,7 +3344,7 @@ impl NorthMailApplication {
                 MessageInfo {
                     id: h.uid as i64,
                     uid: h.uid,
-                    folder_id: 0,
+                    folder_id,
                     subject: decode_mime_header(&h.envelope.subject.clone().unwrap_or_default()),
                     from: h
                         .envelope
@@ -3331,6 +3360,16 @@ impl NorthMailApplication {
                         .unwrap_or_default(),
                     from_address: h.envelope.from.first().map(|a| a.address.clone()).unwrap_or_default(),
                     to: h.envelope.to.iter()
+                        .map(|a| {
+                            if let Some(name) = &a.name {
+                                decode_mime_header(name)
+                            } else {
+                                a.address.clone()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    cc: h.envelope.cc.iter()
                         .map(|a| {
                             if let Some(name) = &a.name {
                                 decode_mime_header(name)
@@ -3368,8 +3407,8 @@ impl NorthMailApplication {
             let _ = sender.send(result);
         });
 
-        // Short timeout - DB queries are usually fast, but don't block UI for too long
-        match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+        // Timeout for DB query - needs to be long enough for slow queries
+        match receiver.recv_timeout(std::time::Duration::from_millis(500)) {
             Ok(Ok(Some(folder))) => Some((folder.account_id, folder.full_path)),
             _ => None,
         }
@@ -3455,6 +3494,8 @@ impl NorthMailApplication {
                         if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
                             win.restore_message_list();
                             if let Some(message_list) = win.message_list() {
+                                // Unified inbox: set empty context (drag-and-drop not supported)
+                                message_list.set_folder_context("", "UNIFIED_INBOX");
                                 message_list.set_messages(message_infos);
 
                                 // Wire up "load more" from cache
@@ -3659,9 +3700,15 @@ impl NorthMailApplication {
                 None
             };
 
-            // Always fetch from IMAP to get attachments (parse_email_body extracts them)
-            // The pool reuses connections, so this is fast even on cache hit
-            info!("🌐 Fetching body from IMAP for message {} (cache={})", uid, cached_body.is_some());
+            // If we have cached body, return it immediately (attachments fetched lazily when needed)
+            if let Some(cached) = cached_body {
+                info!("📧 Using cached body for message {} (instant)", uid);
+                callback(Ok(cached));
+                return;
+            }
+
+            // No cache - fetch from IMAP
+            info!("🌐 Fetching body from IMAP for message {} (no cache)", uid);
 
             match AuthManager::new().await {
                 Ok(auth_manager) => {
@@ -3866,7 +3913,11 @@ impl NorthMailApplication {
             let rt = tokio::runtime::Runtime::new().unwrap();
             let result = rt.block_on(async {
                 let folder_id = db.get_or_create_folder_id(&account_id, &folder_path).await?;
-                db.get_message_body(folder_id, uid as i64).await
+                let body = db.get_message_body(folder_id, uid as i64).await?;
+                let attachments = db.get_message_attachments(folder_id, uid as i64).await?;
+                // Also get has_attachments flag to detect stale cache
+                let has_attachments = db.get_message_has_attachments(folder_id, uid as i64).await.unwrap_or(false);
+                Ok::<_, northmail_core::CoreError>((body, attachments, has_attachments))
             });
             let _ = sender.send(result);
         });
@@ -3876,20 +3927,38 @@ impl NorthMailApplication {
         let timeout = std::time::Duration::from_secs(1);
         loop {
             match receiver.try_recv() {
-                Ok(Ok(Some((body_text, body_html)))) => {
+                Ok(Ok((Some((body_text, body_html)), attachments, has_attachments))) => {
                     // Only return if we have at least one body part
                     if body_text.is_some() || body_html.is_some() {
-                        info!("📧 Body cache HIT: Found cached body for message {}", uid);
+                        // If message is marked as having attachments but we have none cached,
+                        // return None to force IMAP re-fetch (stale cache from before attachment caching)
+                        if has_attachments && attachments.is_empty() {
+                            info!("📭 Body cache STALE: message {} has_attachments=true but 0 cached, forcing re-fetch", uid);
+                            return None;
+                        }
+                        info!("📧 Body cache HIT: Found cached body for message {} ({} attachments)", uid, attachments.len());
+                        // Convert cached attachment metadata to ParsedAttachment
+                        let cached_attachments: Vec<ParsedAttachment> = attachments
+                            .into_iter()
+                            .map(|a| ParsedAttachment {
+                                filename: a.filename,
+                                mime_type: a.mime_type,
+                                data: Vec::new(), // Data fetched on demand from IMAP
+                                size: a.size as usize,
+                                content_id: a.content_id,
+                            })
+                            .collect();
                         return Some(ParsedEmailBody {
                             text: body_text,
                             html: body_html,
-                            attachments: Vec::new(),
+                            attachments: cached_attachments,
                         });
                     } else {
                         info!("📭 Body cache MISS: No cached body for message {}", uid);
                         return None;
                     }
                 }
+                Ok(Ok((_, _, _))) => return None,
                 Ok(_) => return None,
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     if start.elapsed() > timeout {
@@ -3916,11 +3985,24 @@ impl NorthMailApplication {
         let folder_path = folder_path.to_string();
         let body_text = body.text.clone();
         let body_html = body.html.clone();
+        // Convert attachments to AttachmentInfo for saving
+        let attachments: Vec<northmail_core::models::AttachmentInfo> = body
+            .attachments
+            .iter()
+            .map(|a| northmail_core::models::AttachmentInfo {
+                filename: a.filename.clone(),
+                mime_type: a.mime_type.clone(),
+                size: a.size,
+                content_id: a.content_id.clone(),
+                is_inline: a.content_id.is_some(),
+            })
+            .collect();
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
                 if let Ok(folder_id) = db.get_or_create_folder_id(&account_id, &folder_path).await {
+                    // Save body
                     if let Err(e) = db
                         .save_message_body(
                             folder_id,
@@ -3931,11 +4013,237 @@ impl NorthMailApplication {
                         .await
                     {
                         warn!("Failed to cache message body: {}", e);
-                    } else {
-                        info!("💾 Body cache SAVE: Cached body for message {}", uid);
                     }
+                    // Save attachment metadata
+                    if !attachments.is_empty() {
+                        if let Err(e) = db.save_message_attachments(folder_id, uid as i64, &attachments).await {
+                            warn!("Failed to cache attachments: {}", e);
+                        }
+                    }
+                    info!("💾 Body cache SAVE: Cached body + {} attachments for message {}", attachments.len(), uid);
                 }
             });
+        });
+    }
+
+    /// Start background body prefetch for recent messages (last 30 days)
+    /// Prioritizes unread messages and fetches in batches
+    pub fn start_body_prefetch(&self, account_id: &str, folder_path: &str) {
+        let db = match self.database() {
+            Some(db) => db.clone(),
+            None => {
+                info!("📭 Body prefetch skipped: no database");
+                return;
+            }
+        };
+
+        let accounts = self.imp().accounts.borrow().clone();
+        let account = match accounts.iter().find(|a| a.id == account_id) {
+            Some(a) => a.clone(),
+            None => {
+                warn!("Body prefetch: account {} not found", account_id);
+                return;
+            }
+        };
+
+        let pool = self.imap_pool();
+        let account_id = account_id.to_string();
+        let folder_path = folder_path.to_string();
+        let is_google = Self::is_google_account(&account);
+        let is_microsoft = Self::is_microsoft_account(&account);
+        let imap_host = account.imap_host.clone();
+        let imap_username = account.imap_username.clone();
+        let account_email = account.email.clone();
+
+        info!("📦 Starting body prefetch for {}/{}", account_id, folder_path);
+
+        glib::spawn_future_local(async move {
+            // Get folder_id first
+            let folder_id = {
+                let db_clone = db.clone();
+                let aid = account_id.clone();
+                let fp = folder_path.clone();
+                let (sender, receiver) = std::sync::mpsc::channel();
+
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    let result = rt.block_on(async {
+                        db_clone.get_or_create_folder_id(&aid, &fp).await
+                    });
+                    let _ = sender.send(result);
+                });
+
+                // Wait for folder_id with timeout
+                let start = std::time::Instant::now();
+                loop {
+                    match receiver.try_recv() {
+                        Ok(Ok(fid)) => break fid,
+                        Ok(Err(e)) => {
+                            warn!("Body prefetch: couldn't get folder_id: {}", e);
+                            return;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            if start.elapsed() > std::time::Duration::from_secs(5) {
+                                warn!("Body prefetch: timeout getting folder_id");
+                                return;
+                            }
+                            glib::timeout_future(std::time::Duration::from_millis(20)).await;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                    }
+                }
+            };
+
+            // Query messages needing body prefetch (last 30 days, limit 50)
+            let messages_to_fetch: Vec<(i64, bool)> = {
+                let db_clone = db.clone();
+                let (sender, receiver) = std::sync::mpsc::channel();
+
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    let result = rt.block_on(async {
+                        db_clone.get_messages_needing_body_prefetch(folder_id, 30, 50).await
+                    });
+                    let _ = sender.send(result);
+                });
+
+                let start = std::time::Instant::now();
+                loop {
+                    match receiver.try_recv() {
+                        Ok(Ok(msgs)) => break msgs,
+                        Ok(Err(e)) => {
+                            warn!("Body prefetch: query failed: {}", e);
+                            return;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            if start.elapsed() > std::time::Duration::from_secs(10) {
+                                warn!("Body prefetch: timeout querying messages");
+                                return;
+                            }
+                            glib::timeout_future(std::time::Duration::from_millis(20)).await;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                    }
+                }
+            };
+
+            if messages_to_fetch.is_empty() {
+                info!("📭 Body prefetch: no messages need prefetching for {}/{}", account_id, folder_path);
+                return;
+            }
+
+            info!("📦 Body prefetch: {} messages to fetch for {}/{}", messages_to_fetch.len(), account_id, folder_path);
+
+            // Get credentials
+            let auth_manager = match AuthManager::new().await {
+                Ok(am) => am,
+                Err(e) => {
+                    warn!("Body prefetch: auth manager error: {}", e);
+                    return;
+                }
+            };
+
+            let credentials = if is_google {
+                match auth_manager.get_xoauth2_token_for_goa(&account_id).await {
+                    Ok((email, access_token)) => {
+                        ImapCredentials::Gmail { email, access_token }
+                    }
+                    Err(e) => {
+                        warn!("Body prefetch: Gmail auth failed: {}", e);
+                        return;
+                    }
+                }
+            } else if is_microsoft {
+                match auth_manager.get_xoauth2_token_for_goa(&account_id).await {
+                    Ok((email, access_token)) => {
+                        ImapCredentials::Microsoft { email, access_token }
+                    }
+                    Err(e) => {
+                        warn!("Body prefetch: Microsoft auth failed: {}", e);
+                        return;
+                    }
+                }
+            } else {
+                let username = imap_username.unwrap_or(account_email);
+                let host = imap_host.unwrap_or_else(|| "imap.mail.me.com".to_string());
+                match auth_manager.get_goa_password(&account_id).await {
+                    Ok(password) => {
+                        ImapCredentials::Password {
+                            host,
+                            port: 993,
+                            username,
+                            password,
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Body prefetch: password auth failed: {}", e);
+                        return;
+                    }
+                }
+            };
+
+            // Fetch bodies in batches (with delay to avoid hammering server)
+            let mut fetched = 0;
+            let total_to_fetch = messages_to_fetch.len();
+            for (uid, is_unread) in messages_to_fetch {
+                let uid_u32 = uid as u32;
+
+                // Fetch body via pool
+                let result = Self::fetch_body_via_pool(&pool, credentials.clone(), &folder_path, uid_u32).await;
+
+                match result {
+                    Ok(body) => {
+                        // Save to cache (includes attachment metadata)
+                        let db_clone = db.clone();
+                        let aid = account_id.clone();
+                        let fp = folder_path.clone();
+                        let body_text = body.text.clone();
+                        let body_html = body.html.clone();
+                        let attachments: Vec<northmail_core::models::AttachmentInfo> = body
+                            .attachments
+                            .iter()
+                            .map(|a| northmail_core::models::AttachmentInfo {
+                                filename: a.filename.clone(),
+                                mime_type: a.mime_type.clone(),
+                                size: a.size,
+                                content_id: a.content_id.clone(),
+                                is_inline: a.content_id.is_some(),
+                            })
+                            .collect();
+
+                        // Fire and forget save
+                        std::thread::spawn(move || {
+                            let rt = tokio::runtime::Runtime::new().unwrap();
+                            rt.block_on(async {
+                                if let Ok(fid) = db_clone.get_or_create_folder_id(&aid, &fp).await {
+                                    let _ = db_clone.save_message_body(
+                                        fid,
+                                        uid,
+                                        body_text.as_deref(),
+                                        body_html.as_deref(),
+                                    ).await;
+                                    if !attachments.is_empty() {
+                                        let _ = db_clone.save_message_attachments(fid, uid, &attachments).await;
+                                    }
+                                }
+                            });
+                        });
+
+                        fetched += 1;
+                        let status = if is_unread { "unread" } else { "read" };
+                        debug!("📦 Prefetched body {}/{} ({}): uid {}", fetched, total_to_fetch, status, uid);
+                    }
+                    Err(e) => {
+                        debug!("📦 Prefetch failed for uid {}: {}", uid, e);
+                    }
+                }
+
+                // Small delay between fetches to be nice to the server
+                glib::timeout_future(std::time::Duration::from_millis(100)).await;
+            }
+
+            info!("📦 Body prefetch complete: fetched {}/{} messages for {}/{}",
+                fetched, total_to_fetch, account_id, folder_path);
         });
     }
 
@@ -4206,10 +4514,13 @@ impl NorthMailApplication {
                 .unwrap_or("attachment")
                 .to_string();
 
+            let size = data.len();
             result.attachments.push(ParsedAttachment {
                 filename,
                 mime_type,
                 data,
+                size,
+                content_id: None,
             });
         }
 
@@ -5653,6 +5964,464 @@ impl NorthMailApplication {
             .into_iter()
             .map(|email| (name.clone(), email))
             .collect()
+    }
+
+    /// Toggle the starred status of a message
+    pub fn set_message_starred(&self, message_id: i64, uid: u32, folder_id: i64, is_starred: bool) {
+        let db = match self.database() {
+            Some(db) => db.clone(),
+            None => {
+                warn!("set_message_starred: No database");
+                return;
+            }
+        };
+
+        // Update database in a thread with tokio runtime
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                if let Err(e) = db.set_message_starred(message_id, is_starred).await {
+                    error!("Failed to update starred status in database: {}", e);
+                } else {
+                    info!("Updated starred status for message {} to {}", uid, is_starred);
+                }
+            });
+        });
+
+        // Use passed folder_id if valid, otherwise fall back to current folder
+        let effective_folder_id = if folder_id > 0 {
+            folder_id
+        } else {
+            self.cache_folder_id()
+        };
+
+        // Sync to IMAP
+        if effective_folder_id > 0 {
+            self.sync_flag_to_imap(effective_folder_id, uid, "\\Flagged", is_starred);
+        } else {
+            warn!("set_message_starred: Invalid folder_id {}", effective_folder_id);
+        }
+    }
+
+    /// Toggle the read status of a message
+    pub fn set_message_read(&self, message_id: i64, uid: u32, folder_id: i64, is_read: bool) {
+        let db = match self.database() {
+            Some(db) => db.clone(),
+            None => {
+                warn!("set_message_read: No database");
+                return;
+            }
+        };
+
+        // Update database in a thread with tokio runtime
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                if let Err(e) = db.set_message_read(message_id, is_read).await {
+                    error!("Failed to update read status in database: {}", e);
+                } else {
+                    info!("Updated read status for message {} to {}", uid, is_read);
+                }
+            });
+        });
+
+        // Use passed folder_id if valid, otherwise fall back to current folder
+        let effective_folder_id = if folder_id > 0 {
+            folder_id
+        } else {
+            self.cache_folder_id()
+        };
+
+        // Sync to IMAP
+        if effective_folder_id > 0 {
+            self.sync_flag_to_imap(effective_folder_id, uid, "\\Seen", is_read);
+        } else {
+            warn!("set_message_read: Invalid folder_id {}", effective_folder_id);
+        }
+    }
+
+    /// Sync a flag change to IMAP server
+    fn sync_flag_to_imap(&self, folder_id: i64, uid: u32, flag: &str, add: bool) {
+        // Resolve folder info
+        let (account_id, folder_path) = match self.resolve_folder_info(folder_id) {
+            Some(info) => info,
+            None => {
+                warn!("sync_flag_to_imap: Could not resolve folder_id {}", folder_id);
+                return;
+            }
+        };
+
+        let accounts = self.imp().accounts.borrow().clone();
+        let account = match accounts.iter().find(|a| a.id == account_id) {
+            Some(a) => a.clone(),
+            None => {
+                warn!("sync_flag_to_imap: Account not found: {}", account_id);
+                return;
+            }
+        };
+
+        let pool = self.imap_pool();
+        let is_google = Self::is_google_account(&account);
+        let is_microsoft = Self::is_microsoft_account(&account);
+        let flag = flag.to_string();
+        let imap_host = account.imap_host.clone();
+        let imap_username = account.imap_username.clone();
+
+        glib::spawn_future_local(async move {
+            // Get credentials via AuthManager
+            let auth_manager = match AuthManager::new().await {
+                Ok(am) => am,
+                Err(e) => {
+                    error!("sync_flag_to_imap: Failed to create auth manager: {}", e);
+                    return;
+                }
+            };
+
+            let credentials = if is_google {
+                match auth_manager.get_xoauth2_token_for_goa(&account.id).await {
+                    Ok((email, access_token)) => ImapCredentials::Gmail { email, access_token },
+                    Err(e) => {
+                        error!("sync_flag_to_imap: Failed to get Google token: {}", e);
+                        return;
+                    }
+                }
+            } else if is_microsoft {
+                match auth_manager.get_xoauth2_token_for_goa(&account.id).await {
+                    Ok((email, access_token)) => ImapCredentials::Microsoft { email, access_token },
+                    Err(e) => {
+                        error!("sync_flag_to_imap: Failed to get Microsoft token: {}", e);
+                        return;
+                    }
+                }
+            } else {
+                // Password auth (e.g., iCloud)
+                let host = imap_host.unwrap_or_else(|| "imap.mail.me.com".to_string());
+                let username = imap_username.unwrap_or(account.email.clone());
+                match auth_manager.get_goa_password(&account.id).await {
+                    Ok(password) => ImapCredentials::Password {
+                        host,
+                        port: 993,
+                        username,
+                        password,
+                    },
+                    Err(e) => {
+                        error!("sync_flag_to_imap: Failed to get password: {}", e);
+                        return;
+                    }
+                }
+            };
+
+            // Send the flag change via pool
+            let worker = match pool.get_or_create(credentials) {
+                Ok(w) => w,
+                Err(e) => {
+                    error!("sync_flag_to_imap: Failed to get IMAP worker: {}", e);
+                    return;
+                }
+            };
+
+            let (response_tx, response_rx) = std::sync::mpsc::channel();
+            let add_flags = if add { vec![flag.clone()] } else { vec![] };
+            let remove_flags = if add { vec![] } else { vec![flag.clone()] };
+
+            if let Err(e) = worker.send(ImapCommand::StoreFlags {
+                folder: folder_path.clone(),
+                uid,
+                add_flags,
+                remove_flags,
+                response_tx,
+            }) {
+                error!("sync_flag_to_imap: Failed to send command: {}", e);
+                return;
+            }
+
+            // Wait for response (with timeout)
+            match response_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(ImapResponse::Ok) => {
+                    info!("sync_flag_to_imap: Successfully synced {} flag for uid {} in {}", flag, uid, folder_path);
+                }
+                Ok(ImapResponse::Error(e)) => {
+                    error!("sync_flag_to_imap: IMAP error: {}", e);
+                }
+                Ok(_) => {
+                    debug!("sync_flag_to_imap: Unexpected response");
+                }
+                Err(e) => {
+                    error!("sync_flag_to_imap: Timeout or channel error: {}", e);
+                }
+            }
+        });
+    }
+
+    /// Archive a message (move to Archive folder)
+    pub fn archive_message(&self, message_id: i64, uid: u32, folder_id: i64) {
+        info!("archive_message: uid={}, folder_id={}", uid, folder_id);
+
+        // Use passed folder_id if valid, otherwise fall back to current folder
+        let effective_folder_id = if folder_id > 0 {
+            folder_id
+        } else {
+            self.cache_folder_id()
+        };
+
+        if effective_folder_id <= 0 {
+            warn!("archive_message: Invalid folder_id {}", effective_folder_id);
+            return;
+        }
+
+        // Resolve account and folder info
+        let (account_id, source_folder) = match self.resolve_folder_info(effective_folder_id) {
+            Some(info) => info,
+            None => {
+                warn!("archive_message: Could not resolve folder_id {}", effective_folder_id);
+                return;
+            }
+        };
+
+        // Delete from local database
+        if let Some(db) = self.database() {
+            let db_clone = db.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    if let Err(e) = db_clone.delete_message(message_id).await {
+                        error!("archive_message: Failed to delete from database: {}", e);
+                    }
+                });
+            });
+        }
+
+        // Move on IMAP
+        self.move_message_imap(&account_id, &source_folder, uid, "Archive");
+    }
+
+    /// Delete a message (move to Trash folder)
+    pub fn delete_message(&self, message_id: i64, uid: u32, folder_id: i64) {
+        info!("delete_message: uid={}, folder_id={}", uid, folder_id);
+
+        // Use passed folder_id if valid, otherwise fall back to current folder
+        let effective_folder_id = if folder_id > 0 {
+            folder_id
+        } else {
+            self.cache_folder_id()
+        };
+
+        if effective_folder_id <= 0 {
+            warn!("delete_message: Invalid folder_id {}", effective_folder_id);
+            return;
+        }
+
+        // Resolve account and folder info
+        let (account_id, source_folder) = match self.resolve_folder_info(effective_folder_id) {
+            Some(info) => info,
+            None => {
+                warn!("delete_message: Could not resolve folder_id {}", effective_folder_id);
+                return;
+            }
+        };
+
+        // Delete from local database
+        if let Some(db) = self.database() {
+            let db_clone = db.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    if let Err(e) = db_clone.delete_message(message_id).await {
+                        error!("delete_message: Failed to delete from database: {}", e);
+                    }
+                });
+            });
+        }
+
+        // Move on IMAP (use [Gmail]/Trash for Gmail, Trash or Deleted Items for others)
+        self.move_message_imap(&account_id, &source_folder, uid, "Trash");
+    }
+
+    /// Move a message to a specific folder (drag-and-drop)
+    /// Returns false if the move cannot be performed (e.g., cross-account move)
+    pub fn move_message_to_folder(
+        &self,
+        message_id: i64,
+        uid: u32,
+        source_account_id: &str,
+        source_folder_path: &str,
+        target_account_id: &str,
+        dest_folder_path: &str,
+    ) -> bool {
+        info!(
+            "move_message_to_folder: uid={}, msg_id={}, from {}/{}, to {}/{}",
+            uid, message_id, source_account_id, source_folder_path, target_account_id, dest_folder_path
+        );
+
+        // Check if source folder context is valid
+        if source_account_id.is_empty() || source_folder_path.is_empty() {
+            warn!("move_message_to_folder: Invalid source folder context (account='{}', folder='{}')",
+                source_account_id, source_folder_path);
+            return false;
+        }
+
+        // Check if source and target accounts match
+        if source_account_id != target_account_id {
+            warn!(
+                "move_message_to_folder: Cross-account move not supported (from '{}' to '{}')",
+                source_account_id, target_account_id
+            );
+            return false;
+        }
+
+        // Delete from local database (it will be re-synced in the new folder)
+        if let Some(db) = self.database() {
+            let db_clone = db.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    if let Err(e) = db_clone.delete_message(message_id).await {
+                        error!("move_message_to_folder: Failed to delete from database: {}", e);
+                    }
+                });
+            });
+        }
+
+        // Move on IMAP
+        self.move_message_imap(source_account_id, source_folder_path, uid, dest_folder_path);
+        true
+    }
+
+    /// Move a message to another folder on IMAP
+    fn move_message_imap(&self, account_id: &str, source_folder: &str, uid: u32, dest_folder_hint: &str) {
+        let account_id = account_id.to_string();
+        let source_folder = source_folder.to_string();
+
+        let accounts = self.imp().accounts.borrow().clone();
+        let account = match accounts.iter().find(|a| a.id == account_id) {
+            Some(a) => a.clone(),
+            None => {
+                warn!("move_message_imap: Account not found: {}", account_id);
+                return;
+            }
+        };
+
+        let pool = self.imap_pool();
+        let is_google = Self::is_google_account(&account);
+        let is_microsoft = Self::is_microsoft_account(&account);
+        let imap_host = account.imap_host.clone();
+        let imap_username = account.imap_username.clone();
+
+        // Determine destination folder based on provider
+        let dest_folder = if is_google {
+            match dest_folder_hint {
+                "Archive" => "[Gmail]/All Mail".to_string(),
+                "Trash" => "[Gmail]/Trash".to_string(),
+                _ => dest_folder_hint.to_string(),
+            }
+        } else if is_microsoft {
+            match dest_folder_hint {
+                "Archive" => "Archive".to_string(),
+                "Trash" => "Deleted".to_string(),
+                _ => dest_folder_hint.to_string(),
+            }
+        } else {
+            // Generic IMAP (iCloud, etc.)
+            match dest_folder_hint {
+                "Archive" => "Archive".to_string(),
+                "Trash" => "Deleted Messages".to_string(),
+                _ => dest_folder_hint.to_string(),
+            }
+        };
+
+        glib::spawn_future_local(async move {
+            // Get credentials via AuthManager
+            let auth_manager = match AuthManager::new().await {
+                Ok(am) => am,
+                Err(e) => {
+                    error!("move_message_imap: Failed to create auth manager: {}", e);
+                    return;
+                }
+            };
+
+            let credentials = if is_google {
+                match auth_manager.get_xoauth2_token_for_goa(&account.id).await {
+                    Ok((email, access_token)) => ImapCredentials::Gmail { email, access_token },
+                    Err(e) => {
+                        error!("move_message_imap: Failed to get Google token: {}", e);
+                        return;
+                    }
+                }
+            } else if is_microsoft {
+                match auth_manager.get_xoauth2_token_for_goa(&account.id).await {
+                    Ok((email, access_token)) => ImapCredentials::Microsoft { email, access_token },
+                    Err(e) => {
+                        error!("move_message_imap: Failed to get Microsoft token: {}", e);
+                        return;
+                    }
+                }
+            } else {
+                let host = imap_host.unwrap_or_else(|| "imap.mail.me.com".to_string());
+                let username = imap_username.unwrap_or(account.email.clone());
+                match auth_manager.get_goa_password(&account.id).await {
+                    Ok(password) => ImapCredentials::Password {
+                        host,
+                        port: 993,
+                        username,
+                        password,
+                    },
+                    Err(e) => {
+                        error!("move_message_imap: Failed to get password: {}", e);
+                        return;
+                    }
+                }
+            };
+
+            let worker = match pool.get_or_create(credentials) {
+                Ok(w) => w,
+                Err(e) => {
+                    error!("move_message_imap: Failed to get IMAP worker: {}", e);
+                    return;
+                }
+            };
+
+            let (response_tx, response_rx) = std::sync::mpsc::channel();
+
+            if let Err(e) = worker.send(ImapCommand::MoveMessage {
+                source_folder: source_folder.clone(),
+                dest_folder: dest_folder.clone(),
+                uid,
+                response_tx,
+            }) {
+                error!("move_message_imap: Failed to send command: {}", e);
+                return;
+            }
+
+            // Non-blocking poll with yield to GTK main loop
+            let timeout = std::time::Duration::from_secs(30);
+            let start = std::time::Instant::now();
+            loop {
+                match response_rx.try_recv() {
+                    Ok(ImapResponse::Ok) => {
+                        info!("move_message_imap: Successfully moved uid {} from {} to {}", uid, source_folder, dest_folder);
+                        break;
+                    }
+                    Ok(ImapResponse::Error(e)) => {
+                        error!("move_message_imap: IMAP error: {}", e);
+                        break;
+                    }
+                    Ok(_) => {
+                        debug!("move_message_imap: Unexpected response");
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        if start.elapsed() > timeout {
+                            error!("move_message_imap: Timeout waiting for response");
+                            break;
+                        }
+                        glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        error!("move_message_imap: Channel disconnected");
+                        break;
+                    }
+                }
+            }
+        });
     }
 }
 

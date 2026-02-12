@@ -26,6 +26,23 @@ pub enum ImapCommand {
         uid: u32,
         response_tx: mpsc::Sender<ImapResponse>,
     },
+    /// Set or remove flags on a message
+    StoreFlags {
+        folder: String,
+        uid: u32,
+        /// Flags to add (e.g., "\\Seen", "\\Flagged")
+        add_flags: Vec<String>,
+        /// Flags to remove
+        remove_flags: Vec<String>,
+        response_tx: mpsc::Sender<ImapResponse>,
+    },
+    /// Move a message to another folder (COPY + DELETE)
+    MoveMessage {
+        source_folder: String,
+        dest_folder: String,
+        uid: u32,
+        response_tx: mpsc::Sender<ImapResponse>,
+    },
     /// Check connection health
     Noop {
         response_tx: mpsc::Sender<ImapResponse>,
@@ -266,6 +283,25 @@ impl ImapPool {
                                 Self::handle_fetch_body(&mut client, &folder, uid, &response_tx, &mut current_folder)
                                     .await;
                             }
+                            ImapCommand::StoreFlags {
+                                folder,
+                                uid,
+                                add_flags,
+                                remove_flags,
+                                response_tx,
+                            } => {
+                                Self::handle_store_flags(&mut client, &folder, uid, &add_flags, &remove_flags, &response_tx, &mut current_folder)
+                                    .await;
+                            }
+                            ImapCommand::MoveMessage {
+                                source_folder,
+                                dest_folder,
+                                uid,
+                                response_tx,
+                            } => {
+                                Self::handle_move_message(&mut client, &source_folder, &dest_folder, uid, &response_tx, &mut current_folder)
+                                    .await;
+                            }
                         }
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -373,6 +409,131 @@ impl ImapPool {
         }
     }
 
+    /// Handle StoreFlags command (set/remove flags on a message)
+    async fn handle_store_flags(
+        client: &mut SimpleImapClient,
+        folder: &str,
+        uid: u32,
+        add_flags: &[String],
+        remove_flags: &[String],
+        response_tx: &mpsc::Sender<ImapResponse>,
+        current_folder: &mut Option<String>,
+    ) {
+        // Select folder if needed
+        if current_folder.as_deref() != Some(folder) {
+            debug!("handle_store_flags: selecting folder {}", folder);
+            match client.select(folder).await {
+                Ok(_) => {
+                    *current_folder = Some(folder.to_string());
+                }
+                Err(e) => {
+                    error!("handle_store_flags: failed to select folder: {}", e);
+                    *current_folder = None;
+                    let _ = response_tx.send(ImapResponse::Error(format!(
+                        "Failed to select folder: {}",
+                        e
+                    )));
+                    return;
+                }
+            }
+        }
+
+        // Add flags
+        if !add_flags.is_empty() {
+            let flags_str = add_flags.join(" ");
+            debug!("handle_store_flags: adding flags {} to uid {}", flags_str, uid);
+            if let Err(e) = client.uid_store_flags(uid, &flags_str, true).await {
+                error!("handle_store_flags: failed to add flags: {}", e);
+                let _ = response_tx.send(ImapResponse::Error(format!(
+                    "Failed to add flags: {}",
+                    e
+                )));
+                return;
+            }
+        }
+
+        // Remove flags
+        if !remove_flags.is_empty() {
+            let flags_str = remove_flags.join(" ");
+            debug!("handle_store_flags: removing flags {} from uid {}", flags_str, uid);
+            if let Err(e) = client.uid_store_flags(uid, &flags_str, false).await {
+                error!("handle_store_flags: failed to remove flags: {}", e);
+                let _ = response_tx.send(ImapResponse::Error(format!(
+                    "Failed to remove flags: {}",
+                    e
+                )));
+                return;
+            }
+        }
+
+        let _ = response_tx.send(ImapResponse::Ok);
+    }
+
+    /// Handle MoveMessage command (COPY to dest folder, then mark \Deleted in source)
+    async fn handle_move_message(
+        client: &mut SimpleImapClient,
+        source_folder: &str,
+        dest_folder: &str,
+        uid: u32,
+        response_tx: &mpsc::Sender<ImapResponse>,
+        current_folder: &mut Option<String>,
+    ) {
+        // Select source folder if needed
+        if current_folder.as_deref() != Some(source_folder) {
+            debug!("handle_move_message: selecting source folder {}", source_folder);
+            match client.select(source_folder).await {
+                Ok(_) => {
+                    *current_folder = Some(source_folder.to_string());
+                }
+                Err(e) => {
+                    error!("handle_move_message: failed to select source folder: {}", e);
+                    *current_folder = None;
+                    let _ = response_tx.send(ImapResponse::Error(format!(
+                        "Failed to select source folder: {}",
+                        e
+                    )));
+                    return;
+                }
+            }
+        }
+
+        // Copy to destination folder
+        debug!("handle_move_message: copying uid {} to {}", uid, dest_folder);
+        if let Err(e) = client.uid_copy(uid, dest_folder).await {
+            error!("handle_move_message: failed to copy message: {}", e);
+            let _ = response_tx.send(ImapResponse::Error(format!(
+                "Failed to copy message: {}",
+                e
+            )));
+            return;
+        }
+
+        // Mark as deleted in source folder
+        debug!("handle_move_message: marking uid {} as deleted", uid);
+        if let Err(e) = client.uid_store_flags(uid, "\\Deleted", true).await {
+            error!("handle_move_message: failed to mark as deleted: {}", e);
+            let _ = response_tx.send(ImapResponse::Error(format!(
+                "Failed to mark as deleted: {}",
+                e
+            )));
+            return;
+        }
+
+        // Expunge to permanently remove from source
+        debug!("handle_move_message: expunging");
+        if let Err(e) = client.expunge().await {
+            error!("handle_move_message: failed to expunge: {}", e);
+            let _ = response_tx.send(ImapResponse::Error(format!(
+                "Failed to expunge: {}",
+                e
+            )));
+            return;
+        }
+
+        info!("handle_move_message: moved uid {} from {} to {}", uid, source_folder, dest_folder);
+        let _ = response_tx.send(ImapResponse::Ok);
+    }
+
     /// Send an error response for a command
     fn send_error_response(cmd: &ImapCommand, error: &str) {
         match cmd {
@@ -380,6 +541,12 @@ impl ImapPool {
                 let _ = response_tx.send(ImapResponse::Error(error.to_string()));
             }
             ImapCommand::FetchBody { response_tx, .. } => {
+                let _ = response_tx.send(ImapResponse::Error(error.to_string()));
+            }
+            ImapCommand::StoreFlags { response_tx, .. } => {
+                let _ = response_tx.send(ImapResponse::Error(error.to_string()));
+            }
+            ImapCommand::MoveMessage { response_tx, .. } => {
                 let _ = response_tx.send(ImapResponse::Error(error.to_string()));
             }
             ImapCommand::Noop { response_tx } => {
