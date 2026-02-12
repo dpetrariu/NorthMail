@@ -119,10 +119,10 @@ mod imp {
                                             </object>
                                         </child>
                                         <child type="end">
-                                            <object class="GtkMenuButton" id="primary_menu_button">
-                                                <property name="icon-name">open-menu-symbolic</property>
-                                                <property name="tooltip-text">Main Menu</property>
-                                                <property name="menu-model">primary_menu</property>
+                                            <object class="GtkButton" id="settings_button">
+                                                <property name="icon-name">emblem-system-symbolic</property>
+                                                <property name="tooltip-text">Settings</property>
+                                                <property name="action-name">app.show-settings</property>
                                             </object>
                                         </child>
                                         <child type="end">
@@ -135,40 +135,36 @@ mod imp {
                                     </object>
                                 </child>
                                 <property name="content">
-                                    <object class="AdwOverlaySplitView" id="outer_split">
-                                        <property name="sidebar-position">start</property>
-                                        <property name="collapsed">false</property>
-                                        <property name="max-sidebar-width">280</property>
-                                        <property name="min-sidebar-width">200</property>
-                                        <property name="sidebar">
+                                    <object class="GtkPaned" id="outer_paned">
+                                        <property name="orientation">horizontal</property>
+                                        <property name="shrink-start-child">true</property>
+                                        <property name="shrink-end-child">false</property>
+                                        <property name="resize-start-child">true</property>
+                                        <property name="resize-end-child">true</property>
+                                        <property name="position">240</property>
+                                        <property name="start-child">
                                             <object class="GtkBox" id="sidebar_box">
                                                 <property name="orientation">vertical</property>
-                                                <property name="width-request">200</property>
                                             </object>
                                         </property>
-                                        <property name="content">
-                                            <object class="AdwNavigationSplitView" id="inner_split">
-                                                <property name="sidebar-width-fraction">0.4</property>
-                                                <property name="min-sidebar-width">300</property>
-                                                <property name="max-sidebar-width">600</property>
-                                                <property name="sidebar">
-                                                    <object class="AdwNavigationPage">
-                                                        <property name="title">Messages</property>
-                                                        <property name="child">
-                                                            <object class="GtkBox" id="message_list_box">
-                                                                <property name="orientation">vertical</property>
-                                                            </object>
-                                                        </property>
+                                        <property name="end-child">
+                                            <object class="GtkPaned" id="inner_paned">
+                                                <property name="orientation">horizontal</property>
+                                                <property name="shrink-start-child">false</property>
+                                                <property name="shrink-end-child">false</property>
+                                                <property name="resize-start-child">true</property>
+                                                <property name="resize-end-child">true</property>
+                                                <property name="position">400</property>
+                                                <property name="start-child">
+                                                    <object class="GtkBox" id="message_list_box">
+                                                        <property name="orientation">vertical</property>
+                                                        <property name="width-request">300</property>
                                                     </object>
                                                 </property>
-                                                <property name="content">
-                                                    <object class="AdwNavigationPage">
-                                                        <property name="title">Message</property>
-                                                        <property name="child">
-                                                            <object class="GtkBox" id="message_view_box">
-                                                                <property name="orientation">vertical</property>
-                                                            </object>
-                                                        </property>
+                                                <property name="end-child">
+                                                    <object class="GtkBox" id="message_view_box">
+                                                        <property name="orientation">vertical</property>
+                                                        <property name="width-request">300</property>
                                                     </object>
                                                 </property>
                                             </object>
@@ -180,28 +176,6 @@ mod imp {
                     </object>
                 </property>
             </template>
-            <menu id="primary_menu">
-                <section>
-                    <item>
-                        <attribute name="label" translatable="yes">Add Account</attribute>
-                        <attribute name="action">app.add-account</attribute>
-                    </item>
-                </section>
-                <section>
-                    <item>
-                        <attribute name="label" translatable="yes">Preferences</attribute>
-                        <attribute name="action">app.preferences</attribute>
-                    </item>
-                    <item>
-                        <attribute name="label" translatable="yes">Keyboard Shortcuts</attribute>
-                        <attribute name="action">win.show-help-overlay</attribute>
-                    </item>
-                    <item>
-                        <attribute name="label" translatable="yes">About NorthMail</attribute>
-                        <attribute name="action">app.about</attribute>
-                    </item>
-                </section>
-            </menu>
         </interface>
     "#)]
     pub struct NorthMailWindow {
@@ -210,11 +184,11 @@ mod imp {
         #[template_child]
         pub header_bar: TemplateChild<adw::HeaderBar>,
         #[template_child]
-        pub outer_split: TemplateChild<adw::OverlaySplitView>,
+        pub outer_paned: TemplateChild<gtk4::Paned>,
         /// Sidebar toggle button (created in setup_widgets)
         pub sidebar_toggle: std::cell::RefCell<Option<gtk4::ToggleButton>>,
         #[template_child]
-        pub inner_split: TemplateChild<adw::NavigationSplitView>,
+        pub inner_paned: TemplateChild<gtk4::Paned>,
         #[template_child]
         pub sidebar_box: TemplateChild<gtk4::Box>,
         #[template_child]
@@ -305,12 +279,30 @@ impl NorthMailWindow {
              }
              .header-button-animated {
                  transition: margin 200ms ease-out;
+             }
+             #message_list_box, #message_view_box {
+                 background-color: @view_bg_color;
+             }
+             /* Hide paned separators */
+             paned > separator {
+                 min-width: 1px;
+                 min-height: 1px;
+                 background: none;
+                 background-color: transparent;
+                 border: none;
+                 box-shadow: none;
+                 opacity: 0;
+             }
+             .sidebar-pane {
+                 border-right: none;
+                 border: none;
+                 box-shadow: none;
              }"
         );
         gtk4::style_context_add_provider_for_display(
             &gtk4::gdk::Display::default().unwrap(),
             &css_provider,
-            gtk4::STYLE_PROVIDER_PRIORITY_USER,
+            gtk4::STYLE_PROVIDER_PRIORITY_USER + 1,
         );
 
         // Create sidebar toggle button and add to header bar
@@ -319,7 +311,7 @@ impl NorthMailWindow {
             .icon_name("dock-left-symbolic")
             .tooltip_text("Toggle Sidebar")
             .active(true)
-            .margin_start(126)  // Push to align with sidebar right edge (when visible)
+            .margin_start(92)  // Initial position, updated dynamically based on paned
             .build();
         sidebar_toggle.add_css_class("flat");
         sidebar_toggle.add_css_class("sidebar-toggle-flat");
@@ -338,30 +330,87 @@ impl NorthMailWindow {
         compose_button.set_action_name(Some("win.compose"));
         imp.header_bar.pack_start(&compose_button);
 
-        // Adjust button positions when sidebar visibility changes
-        let toggle_for_signal = sidebar_toggle.clone();
-        let compose_for_signal = compose_button.clone();
-        let inner_split_for_signal = imp.inner_split.clone();
-        imp.outer_split.connect_notify_local(Some("show-sidebar"), move |split, _| {
-            if split.shows_sidebar() {
-                // Sidebar visible: push buttons to align with columns
-                toggle_for_signal.set_margin_start(126);
-                compose_for_signal.set_margin_start(0);
+        // Sidebar toggle functionality using paned position
+        let outer_paned = imp.outer_paned.clone();
+        let saved_position = std::rc::Rc::new(std::cell::Cell::new(240i32));
+        let is_toggling = std::rc::Rc::new(std::cell::Cell::new(false));
+        let saved_pos_clone = saved_position.clone();
+        let is_toggling_clone = is_toggling.clone();
+        sidebar_toggle.connect_toggled(move |toggle| {
+            is_toggling_clone.set(true);
+            if toggle.is_active() {
+                // Show sidebar: restore saved position
+                outer_paned.set_position(saved_pos_clone.get().max(200));
             } else {
-                // Sidebar hidden: toggle next to title, compose above message view
-                toggle_for_signal.set_margin_start(8);
-                // Position compose button at the message list/view boundary
-                // Message list is ~40% of width, with min 300px
-                // Calculate dynamically based on current inner_split width
-                let list_width = inner_split_for_signal.sidebar_width_fraction();
-                let total_width = inner_split_for_signal.width() as f64;
-                // Account for: title box (~104px) + toggle button (~50px)
-                let header_offset = 154.0;
-                let target_pos = total_width * list_width;
-                let margin = (target_pos - header_offset).max(8.0) as i32;
-                compose_for_signal.set_margin_start(margin);
+                // Hide sidebar: save current position and set to 0
+                let pos = outer_paned.position();
+                if pos > 0 {
+                    saved_pos_clone.set(pos);
+                }
+                outer_paned.set_position(0);
             }
+            is_toggling_clone.set(false);
         });
+
+        // Helper function to calculate button positions
+        let calc_toggle_margin = |outer_pos: i32| -> i32 {
+            // Position toggle button at right edge of sidebar
+            // Account for: icon+title (~100px), button width (~32px), padding (~16px)
+            let header_title_width = 100;
+            let button_width = 32;
+            let padding = 16;
+            outer_pos.saturating_sub(header_title_width + button_width + padding).max(8)
+        };
+
+        let calc_compose_margin = |inner_pos: i32| -> i32 {
+            // Position compose button at left edge of message view
+            // Only depends on inner_pos (message list width), not sidebar width
+            // The toggle button already moves with sidebar, compose follows after it
+            let offset = 56; // small offset to align with divider
+            inner_pos.saturating_sub(offset).max(8)
+        };
+
+        // Update button positions when outer paned position changes
+        let toggle_for_signal = sidebar_toggle.clone();
+        let is_toggling_for_signal = is_toggling.clone();
+        let saved_pos_for_signal = saved_position.clone();
+        imp.outer_paned.connect_notify_local(Some("position"), move |paned, _| {
+            let pos = paned.position();
+
+            // Enforce minimum width of 200 when user is dragging (not toggling)
+            if !is_toggling_for_signal.get() && pos > 0 && pos < 200 {
+                paned.set_position(200);
+                return;
+            }
+
+            // Save position if it's a valid sidebar width
+            if pos >= 200 {
+                saved_pos_for_signal.set(pos);
+            }
+
+            // Update toggle state based on position
+            if pos == 0 && toggle_for_signal.is_active() {
+                toggle_for_signal.set_active(false);
+            } else if pos > 0 && !toggle_for_signal.is_active() {
+                toggle_for_signal.set_active(true);
+            }
+
+            toggle_for_signal.set_margin_start(calc_toggle_margin(pos));
+            // Compose button only moves with inner paned, not outer
+        });
+
+        // Update compose button position when inner paned position changes
+        let compose_for_inner = compose_button.clone();
+        imp.inner_paned.connect_notify_local(Some("position"), move |paned, _| {
+            let inner_pos = paned.position();
+            compose_for_inner.set_margin_start(calc_compose_margin(inner_pos));
+        });
+
+        // Set initial button positions
+        let initial_outer_pos = imp.outer_paned.position();
+        let initial_inner_pos = imp.inner_paned.position();
+        sidebar_toggle.set_margin_start(calc_toggle_margin(initial_outer_pos));
+        compose_button.set_margin_start(calc_compose_margin(initial_inner_pos));
 
         // Create and add folder sidebar
         let folder_sidebar = FolderSidebar::new();
@@ -1055,16 +1104,7 @@ impl NorthMailWindow {
     }
 
     fn setup_bindings(&self) {
-        let imp = self.imp();
-
-        // Bind sidebar toggle to split view
-        if let Some(ref toggle) = *imp.sidebar_toggle.borrow() {
-            toggle
-                .bind_property("active", &*imp.outer_split, "show-sidebar")
-                .sync_create()
-                .bidirectional()
-                .build();
-        }
+        // Sidebar toggle is now handled directly in setup_widgets via connect_toggled
     }
 
     fn show_welcome_state(&self) {
@@ -1108,7 +1148,7 @@ impl NorthMailWindow {
             .compose-entry { background: transparent; border: none; outline: none; box-shadow: none; min-height: 20px; padding: 0; margin: 0; font-size: 0.9em; }
             .compose-entry:focus { background: transparent; border: none; outline: none; box-shadow: none; }
             .compose-entry > text { background: transparent; border: none; outline: none; box-shadow: none; padding: 0; margin: 0; font-size: 0.9em; }
-            .compose-chip { background: @accent_bg_color; border-radius: 8px; padding: 0 0 0 6px; margin: 0; min-height: 0; }
+            .compose-chip { background: @accent_bg_color; border-radius: 14px; padding: 0 0 0 8px; margin: 0; min-height: 0; }
             .compose-chip label { font-size: 0.9em; margin: 0; padding: 2px 0; color: @accent_fg_color; }
             .chip-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0 2px 0 4px; -gtk-icon-size: 12px; }
             .chip-close image { color: white; -gtk-icon-style: symbolic; }
@@ -1116,7 +1156,7 @@ impl NorthMailWindow {
             .compose-field-label { font-size: 0.9em; min-width: 52px; color: alpha(@view_fg_color, 0.55); }
             .compose-separator { background: alpha(@view_fg_color, 0.15); min-height: 1px; }
             .compose-body { background: @view_bg_color; }
-            .attachment-pill { background: alpha(currentColor, 0.1); border-radius: 6px; padding: 1px 2px 1px 5px; }
+            .attachment-pill { background: alpha(currentColor, 0.1); border-radius: 14px; padding: 1px 4px 1px 8px; }
             .attachment-pill:hover { background: alpha(currentColor, 0.15); }
             .attachment-pill label { font-size: 0.8em; }
             .attachment-pill button { min-width: 16px; min-height: 16px; padding: 0; margin: 0 0 0 2px; }
@@ -2973,7 +3013,9 @@ impl NorthMailWindow {
                     if let Some(window) = app_clone.active_window() {
                         if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
                             if let Some(message_list) = win.message_list() {
-                                message_list.set_messages(infos);
+                                // Use set_search_results to skip local search filtering
+                                // (FTS already searched body text which isn't in snippet)
+                                message_list.set_search_results(infos);
                                 message_list.set_can_load_more(false);
                             }
                         }

@@ -39,8 +39,12 @@ mod imp {
 
     #[derive(Default)]
     pub struct FolderSidebar {
-        /// The single ListBox that contains every row.
-        pub list_box: RefCell<Option<gtk4::ListBox>>,
+        /// ListBox for the inboxes section (unified + per-account inboxes)
+        pub inboxes_list_box: RefCell<Option<gtk4::ListBox>>,
+        /// Container for the inboxes section (to toggle active/inactive style)
+        pub inboxes_container: RefCell<Option<gtk4::Box>>,
+        /// ListBox for the folders section (collapsible per-account folders)
+        pub folders_list_box: RefCell<Option<gtk4::ListBox>>,
         pub accounts: RefCell<Vec<super::AccountFolders>>,
         /// Persisted expand/collapse state per account id.
         pub expanded_states: RefCell<HashMap<String, bool>>,
@@ -122,20 +126,130 @@ impl FolderSidebar {
     fn setup_ui(&self) {
         let imp = self.imp();
 
-        // Scrolled area
-        let scrolled = gtk4::ScrolledWindow::builder()
-            .vexpand(true)
-            .hscrollbar_policy(gtk4::PolicyType::Never)
+        // Add CSS for sidebar styling
+        let css_provider = gtk4::CssProvider::new();
+        css_provider.load_from_string(
+            "
+            /* Inboxes section - accent background with white text */
+            .inboxes-container {
+                background-color: @accent_bg_color;
+                border-radius: 12px;
+                margin: 8px;
+                padding: 4px;
+                transition: background-color 150ms ease;
+            }
+            /* Inactive state when folder is selected */
+            .inboxes-container.inactive {
+                background-color: alpha(black, 0.08);
+            }
+            .inboxes-container.inactive .inboxes-list > row {
+                color: @view_fg_color;
+            }
+            .inboxes-container.inactive .inboxes-list > row * {
+                color: @view_fg_color;
+            }
+            .inboxes-container.inactive .inboxes-list > row .dim-label {
+                color: alpha(@view_fg_color, 0.7);
+            }
+            .inboxes-container.inactive .inboxes-list separator {
+                background-color: alpha(@view_fg_color, 0.2);
+            }
+            .inboxes-list {
+                background: transparent;
+            }
+            .inboxes-list > row {
+                border-radius: 8px;
+                margin: 2px 4px;
+                color: @accent_fg_color;
+            }
+            .inboxes-list > row * {
+                color: @accent_fg_color;
+            }
+            .inboxes-list > row .dim-label {
+                color: alpha(@accent_fg_color, 0.85);
+            }
+            /* Selected inbox: inverted (white bg, accent text) */
+            .inboxes-list > row:selected {
+                background-color: white;
+                color: @accent_bg_color;
+            }
+            .inboxes-list > row:selected * {
+                color: @accent_bg_color;
+            }
+            .inboxes-list > row:selected .dim-label {
+                color: alpha(@accent_bg_color, 0.85);
+            }
+            /* Separator inside inboxes list */
+            .inboxes-list separator {
+                background-color: alpha(white, 0.4);
+                min-height: 1px;
+                margin-left: 8px;
+                margin-right: 8px;
+                margin-top: 4px;
+                margin-bottom: 4px;
+            }
+
+            /* Folders section - transparent background */
+            .folders-list {
+                background: transparent;
+            }
+            .folders-list > row {
+                background: transparent;
+                border-radius: 8px;
+                margin: 3px 6px;
+            }
+            .folders-list > row:selected {
+                background-color: @accent_bg_color;
+                color: @accent_fg_color;
+                border-radius: 8px;
+            }
+            .folders-list > row:selected * {
+                color: @accent_fg_color;
+            }
+            .folders-list > row:selected .dim-label,
+            .folders-list > row:selected .caption {
+                color: alpha(@accent_fg_color, 0.85);
+            }
+            /* Section header styling - smaller, non-bold */
+            .folders-list .section-header-label {
+                font-weight: normal;
+                font-size: 0.9em;
+            }
+            /* Folder entries - smaller */
+            .folders-list .folder-entry {
+                font-size: 0.9em;
+            }
+            .folders-list .folder-entry-row {
+                min-height: 0;
+            }
+            /* Separators in folders list - add margins */
+            .folders-list separator {
+                margin-left: 12px;
+                margin-right: 12px;
+                margin-top: 4px;
+                margin-bottom: 4px;
+            }
+            "
+        );
+        gtk4::style_context_add_provider_for_display(
+            &gtk4::gdk::Display::default().unwrap(),
+            &css_provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_USER + 1,
+        );
+
+        // ── Inboxes section (styled container) - fixed at top ──
+        let inboxes_container = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .css_classes(["inboxes-container"])
             .build();
 
-        // Single flat ListBox
-        let list_box = gtk4::ListBox::builder()
+        let inboxes_list_box = gtk4::ListBox::builder()
             .selection_mode(gtk4::SelectionMode::Single)
-            .css_classes(["navigation-sidebar"])
+            .css_classes(["inboxes-list"])
             .build();
 
-        // Header func: auto-insert separators between sections
-        list_box.set_header_func(|row, before| {
+        // Header func for separators between unified and per-account inboxes
+        inboxes_list_box.set_header_func(|row, before| {
             let row_section = decode_row_name(&row.widget_name()).0;
             if let Some(before) = before {
                 let before_section = decode_row_name(&before.widget_name()).0;
@@ -150,11 +264,25 @@ impl FolderSidebar {
             }
         });
 
-        // Row activation handler (connected once, persists across rebuilds)
+        // Shared references for cross-list coordination
+        let folders_list_cell = std::rc::Rc::new(RefCell::new(None::<gtk4::ListBox>));
+        let inboxes_container_cell = std::rc::Rc::new(RefCell::new(inboxes_container.clone()));
+
+        // Inboxes row activation handler
         let sidebar = self.clone();
-        list_box.connect_row_activated(move |list_box, row| {
+        let folders_list_cell_clone = folders_list_cell.clone();
+        let inboxes_container_for_inboxes = inboxes_container_cell.clone();
+        inboxes_list_box.connect_row_activated(move |_list_box, row| {
             let name = row.widget_name();
-            let (_section, kind, account_id, folder_path) = decode_row_name(&name);
+            let (_section, kind, account_id, _folder_path) = decode_row_name(&name);
+
+            // Deselect folders list when inbox is selected
+            if let Some(ref folders_list) = *folders_list_cell_clone.borrow() {
+                folders_list.unselect_all();
+            }
+
+            // Set inboxes container to active (accent color)
+            inboxes_container_for_inboxes.borrow().remove_css_class("inactive");
 
             match kind {
                 "unified" => {
@@ -169,13 +297,60 @@ impl FolderSidebar {
                         &[&account_id, &"INBOX", &false],
                     );
                 }
+                _ => {}
+            }
+        });
+
+        inboxes_container.append(&inboxes_list_box);
+        self.append(&inboxes_container);
+
+        // ── Folders section (collapsible per-account folders) ──
+        let folders_list_box = gtk4::ListBox::builder()
+            .selection_mode(gtk4::SelectionMode::Single)
+            .css_classes(["folders-list"])
+            .build();
+
+        // Store reference for inboxes handler to deselect
+        folders_list_cell.replace(Some(folders_list_box.clone()));
+
+        // Header func for separators between account sections
+        folders_list_box.set_header_func(|row, before| {
+            let row_section = decode_row_name(&row.widget_name()).0;
+            if let Some(before) = before {
+                let before_section = decode_row_name(&before.widget_name()).0;
+                if row_section != before_section {
+                    let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+                    row.set_header(Some(&sep));
+                } else {
+                    row.set_header(None::<&gtk4::Widget>);
+                }
+            } else {
+                row.set_header(None::<&gtk4::Widget>);
+            }
+        });
+
+        // Folders row activation handler
+        let sidebar2 = self.clone();
+        let inboxes_list_for_folders = inboxes_list_box.clone();
+        let inboxes_container_for_folders = inboxes_container_cell.clone();
+        folders_list_box.connect_row_activated(move |list_box, row| {
+            let name = row.widget_name();
+            let (_section, kind, account_id, folder_path) = decode_row_name(&name);
+
+            match kind {
                 "header" => {
                     // Toggle expansion — don't select header rows
                     list_box.unselect_row(row);
-                    sidebar.toggle_account_expansion(account_id);
+                    sidebar2.toggle_account_expansion(account_id);
                 }
                 "folder" => {
-                    sidebar.emit_by_name::<()>(
+                    // Deselect inboxes list when folder is selected
+                    inboxes_list_for_folders.unselect_all();
+
+                    // Set inboxes container to inactive (grey)
+                    inboxes_container_for_folders.borrow().add_css_class("inactive");
+
+                    sidebar2.emit_by_name::<()>(
                         "folder-selected",
                         &[&account_id, &folder_path, &false],
                     );
@@ -184,20 +359,13 @@ impl FolderSidebar {
             }
         });
 
-        // Placeholder
-        let placeholder = gtk4::Label::builder()
-            .label("Loading accounts...")
-            .css_classes(["dim-label"])
-            .margin_top(24)
-            .margin_bottom(24)
+        // Scrolled area for folders section only
+        let scrolled = gtk4::ScrolledWindow::builder()
+            .vexpand(true)
+            .hscrollbar_policy(gtk4::PolicyType::Never)
             .build();
-        list_box.append(&gtk4::ListBoxRow::builder()
-            .child(&placeholder)
-            .selectable(false)
-            .activatable(false)
-            .build());
 
-        scrolled.set_child(Some(&list_box));
+        scrolled.set_child(Some(&folders_list_box));
         self.append(&scrolled);
 
         // ── Bottom section (sync status + settings) ──
@@ -255,50 +423,12 @@ impl FolderSidebar {
         sync_status_box.append(&sync_detail_label);
 
         bottom_box.append(&sync_status_box);
-
-        let separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
-        bottom_box.append(&separator);
-
-        // Settings button
-        let settings_button = gtk4::Button::builder()
-            .child(
-                &gtk4::Box::builder()
-                    .orientation(gtk4::Orientation::Horizontal)
-                    .spacing(12)
-                    .margin_start(12)
-                    .margin_end(12)
-                    .margin_top(8)
-                    .margin_bottom(8)
-                    .build(),
-            )
-            .css_classes(["flat"])
-            .build();
-
-        let button_content = settings_button
-            .child()
-            .unwrap()
-            .downcast::<gtk4::Box>()
-            .unwrap();
-        button_content.append(&gtk4::Image::from_icon_name("emblem-system-symbolic"));
-        button_content.append(
-            &gtk4::Label::builder()
-                .label("Settings")
-                .xalign(0.0)
-                .hexpand(true)
-                .build(),
-        );
-
-        settings_button.connect_clicked(|_| {
-            if let Some(app) = gtk4::gio::Application::default() {
-                app.activate_action("show-settings", None);
-            }
-        });
-
-        bottom_box.append(&settings_button);
         self.append(&bottom_box);
 
         // Store references
-        imp.list_box.replace(Some(list_box));
+        imp.inboxes_list_box.replace(Some(inboxes_list_box));
+        imp.inboxes_container.replace(Some(inboxes_container));
+        imp.folders_list_box.replace(Some(folders_list_box));
         imp.sync_status_box.replace(Some(sync_status_box));
         imp.sync_spinner.replace(Some(sync_spinner));
         imp.sync_label.replace(Some(sync_label));
@@ -313,18 +443,26 @@ impl FolderSidebar {
         let imp = self.imp();
         imp.accounts.replace(accounts.clone());
 
-        let list_box = match imp.list_box.borrow().as_ref() {
+        let inboxes_list = match imp.inboxes_list_box.borrow().as_ref() {
+            Some(lb) => lb.clone(),
+            None => return,
+        };
+        let folders_list = match imp.folders_list_box.borrow().as_ref() {
             Some(lb) => lb.clone(),
             None => return,
         };
 
         // Remember the currently selected row so we can restore it after rebuild
-        let selected_name = list_box.selected_row()
-            .map(|row| row.widget_name().to_string());
+        let selected_name = inboxes_list.selected_row()
+            .map(|row| row.widget_name().to_string())
+            .or_else(|| folders_list.selected_row().map(|row| row.widget_name().to_string()));
 
-        // Clear all rows
-        while let Some(row) = list_box.row_at_index(0) {
-            list_box.remove(&row);
+        // Clear all rows from both lists
+        while let Some(row) = inboxes_list.row_at_index(0) {
+            inboxes_list.remove(&row);
+        }
+        while let Some(row) = folders_list.row_at_index(0) {
+            folders_list.remove(&row);
         }
 
         if accounts.is_empty() {
@@ -335,25 +473,24 @@ impl FolderSidebar {
         let saved = self.load_expander_states();
         let mut expanded_states = HashMap::new();
 
-        // ── Section 0: Unified Inbox ──
+        // ── Section 0: Unified Inbox (in inboxes list) ──
         let total_unread: u32 = accounts.iter().filter_map(|a| a.inbox_unread).sum();
-        let row = self.create_folder_row("mail-inbox-symbolic", "All Inboxes", Some(total_unread), false);
+        let row = self.create_inbox_row("mail-inbox-symbolic", "All Inboxes", Some(total_unread));
         row.set_widget_name(&encode_row_name(0, "unified", "", ""));
-        list_box.append(&row);
+        inboxes_list.append(&row);
 
-        // ── Section 1: Per-account inboxes ──
+        // ── Section 1: Per-account inboxes (in inboxes list) ──
         for account in &accounts {
-            let row = self.create_folder_row(
+            let row = self.create_inbox_row(
                 "mail-inbox-symbolic",
                 &account.email,
                 account.inbox_unread,
-                false,
             );
             row.set_widget_name(&encode_row_name(1, "inbox", &account.id, ""));
-            list_box.append(&row);
+            inboxes_list.append(&row);
         }
 
-        // ── Section 2+: Per-account folder groups ──
+        // ── Section 2+: Per-account folder groups (in folders list) ──
         for (i, account) in accounts.iter().enumerate() {
             let section = i + 2;
             let expanded = saved.get(&account.id).copied().unwrap_or(false);
@@ -362,7 +499,7 @@ impl FolderSidebar {
             // Section header row (not selectable, just toggles expansion)
             let header = self.create_section_header_row(&account.email, expanded);
             header.set_widget_name(&encode_row_name(section, "header", &account.id, ""));
-            list_box.append(&header);
+            folders_list.append(&header);
 
             // Folder rows (hidden when collapsed)
             for folder in &account.folders {
@@ -379,7 +516,7 @@ impl FolderSidebar {
                     &folder.full_path,
                 ));
                 row.set_visible(expanded);
-                list_box.append(&row);
+                folders_list.append(&row);
             }
         }
 
@@ -387,25 +524,39 @@ impl FolderSidebar {
 
         // Restore the previously selected row
         if let Some(ref name) = selected_name {
+            // Try inboxes list first
             let mut idx = 0;
-            while let Some(row) = list_box.row_at_index(idx) {
+            let mut found = false;
+            while let Some(row) = inboxes_list.row_at_index(idx) {
                 if row.widget_name() == name.as_str() {
-                    list_box.select_row(Some(&row));
+                    inboxes_list.select_row(Some(&row));
+                    found = true;
                     break;
                 }
                 idx += 1;
+            }
+            // Try folders list if not found
+            if !found {
+                idx = 0;
+                while let Some(row) = folders_list.row_at_index(idx) {
+                    if row.widget_name() == name.as_str() {
+                        folders_list.select_row(Some(&row));
+                        break;
+                    }
+                    idx += 1;
+                }
             }
         }
     }
 
     // ── Row factories ────────────────────────────────────────────────
 
-    fn create_folder_row(
+    /// Create a row for the inboxes section (white text on accent background)
+    fn create_inbox_row(
         &self,
         icon_name: &str,
         label: &str,
         unread_count: Option<u32>,
-        indent: bool,
     ) -> gtk4::ListBoxRow {
         let row = gtk4::ListBoxRow::builder()
             .selectable(true)
@@ -415,10 +566,10 @@ impl FolderSidebar {
         let content = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
             .spacing(12)
-            .margin_start(if indent { 32 } else { 12 })
-            .margin_end(12)
-            .margin_top(6)
-            .margin_bottom(6)
+            .margin_start(8)
+            .margin_end(8)
+            .margin_top(8)
+            .margin_bottom(8)
             .build();
 
         content.append(&gtk4::Image::from_icon_name(icon_name));
@@ -429,6 +580,57 @@ impl FolderSidebar {
                 .xalign(0.0)
                 .hexpand(true)
                 .ellipsize(gtk4::pango::EllipsizeMode::End)
+                .build(),
+        );
+
+        if let Some(count) = unread_count {
+            if count > 0 {
+                content.append(
+                    &gtk4::Label::builder()
+                        .label(&count.to_string())
+                        .css_classes(["dim-label"])
+                        .build(),
+                );
+            }
+        }
+
+        row.set_child(Some(&content));
+        row
+    }
+
+    /// Create a row for the folders section (normal styling)
+    fn create_folder_row(
+        &self,
+        icon_name: &str,
+        label: &str,
+        unread_count: Option<u32>,
+        indent: bool,
+    ) -> gtk4::ListBoxRow {
+        let row = gtk4::ListBoxRow::builder()
+            .selectable(true)
+            .activatable(true)
+            .css_classes(["folder-entry-row"])
+            .build();
+
+        let content = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(10)
+            .margin_start(if indent { 32 } else { 12 })
+            .margin_end(12)
+            .margin_top(4)
+            .margin_bottom(4)
+            .css_classes(["folder-entry"])
+            .build();
+
+        content.append(&gtk4::Image::from_icon_name(icon_name));
+
+        content.append(
+            &gtk4::Label::builder()
+                .label(label)
+                .xalign(0.0)
+                .hexpand(true)
+                .ellipsize(gtk4::pango::EllipsizeMode::End)
+                .css_classes(["folder-entry"])
                 .build(),
         );
 
@@ -458,8 +660,8 @@ impl FolderSidebar {
             .spacing(8)
             .margin_start(12)
             .margin_end(12)
-            .margin_top(4)
-            .margin_bottom(4)
+            .margin_top(6)
+            .margin_bottom(6)
             .build();
 
         // Disclosure indicator
@@ -475,15 +677,13 @@ impl FolderSidebar {
         arrow.set_widget_name("disclosure-arrow");
         content.append(&arrow);
 
-        content.append(&gtk4::Image::from_icon_name("avatar-default-symbolic"));
-
         content.append(
             &gtk4::Label::builder()
                 .label(email)
                 .xalign(0.0)
                 .hexpand(true)
                 .ellipsize(gtk4::pango::EllipsizeMode::End)
-                .css_classes(["heading"])
+                .css_classes(["section-header-label"])
                 .build(),
         );
 
@@ -504,14 +704,14 @@ impl FolderSidebar {
         drop(states);
         self.save_expander_state(account_id, new_state);
 
-        // Update row visibility + disclosure arrow
-        let list_box = match imp.list_box.borrow().as_ref() {
+        // Update row visibility + disclosure arrow in folders list
+        let folders_list = match imp.folders_list_box.borrow().as_ref() {
             Some(lb) => lb.clone(),
             None => return,
         };
 
         let mut idx = 0;
-        while let Some(row) = list_box.row_at_index(idx) {
+        while let Some(row) = folders_list.row_at_index(idx) {
             let name = row.widget_name();
             let (_section, kind, aid, _path) = decode_row_name(&name);
             if aid == account_id {
@@ -545,19 +745,22 @@ impl FolderSidebar {
     /// Programmatically select the unified inbox row
     pub fn select_unified_inbox(&self) {
         let imp = self.imp();
-        let list_box = match imp.list_box.borrow().as_ref() {
+        let inboxes_list = match imp.inboxes_list_box.borrow().as_ref() {
             Some(lb) => lb.clone(),
             None => return,
         };
 
-        list_box.unselect_all();
+        // Deselect folders list
+        if let Some(folders_list) = imp.folders_list_box.borrow().as_ref() {
+            folders_list.unselect_all();
+        }
 
         let mut idx = 0;
-        while let Some(row) = list_box.row_at_index(idx) {
+        while let Some(row) = inboxes_list.row_at_index(idx) {
             let name = row.widget_name();
             let (_section, kind, _aid, _path) = decode_row_name(&name);
             if kind == "unified" {
-                list_box.select_row(Some(&row));
+                inboxes_list.select_row(Some(&row));
                 break;
             }
             idx += 1;
@@ -567,30 +770,44 @@ impl FolderSidebar {
     /// Programmatically select a folder (used on startup to highlight restored folder)
     pub fn select_folder(&self, account_id: &str, folder_path: &str) {
         let imp = self.imp();
-        let list_box = match imp.list_box.borrow().as_ref() {
+        let inboxes_list = match imp.inboxes_list_box.borrow().as_ref() {
+            Some(lb) => lb.clone(),
+            None => return,
+        };
+        let folders_list = match imp.folders_list_box.borrow().as_ref() {
             Some(lb) => lb.clone(),
             None => return,
         };
 
-        list_box.unselect_all();
+        inboxes_list.unselect_all();
+        folders_list.unselect_all();
 
+        // Check if it's an inbox (in inboxes list)
+        if folder_path.eq_ignore_ascii_case("INBOX") {
+            let mut idx = 0;
+            while let Some(row) = inboxes_list.row_at_index(idx) {
+                let name = row.widget_name();
+                let (_section, kind, aid, _path) = decode_row_name(&name);
+                if kind == "inbox" && aid == account_id {
+                    inboxes_list.select_row(Some(&row));
+                    return;
+                }
+                idx += 1;
+            }
+        }
+
+        // Otherwise check folders list
         let mut idx = 0;
-        while let Some(row) = list_box.row_at_index(idx) {
+        while let Some(row) = folders_list.row_at_index(idx) {
             let name = row.widget_name();
             let (_section, kind, aid, path) = decode_row_name(&name);
 
-            let matches = match kind {
-                "inbox" if folder_path.eq_ignore_ascii_case("INBOX") => aid == account_id,
-                "folder" => aid == account_id && path == folder_path,
-                _ => false,
-            };
-
-            if matches {
+            if kind == "folder" && aid == account_id && path == folder_path {
                 // Ensure the row is visible (expand section if needed)
-                if kind == "folder" && !row.is_visible() {
+                if !row.is_visible() {
                     self.toggle_account_expansion(account_id);
                 }
-                list_box.select_row(Some(&row));
+                folders_list.select_row(Some(&row));
                 break;
             }
             idx += 1;

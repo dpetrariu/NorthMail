@@ -144,6 +144,8 @@ mod imp {
         pub filter_state: RefCell<FilterState>,
         /// Current text search query (as-you-type)
         pub search_query: RefCell<String>,
+        /// Currently selected message UID (to preserve selection across rebuilds)
+        pub selected_uid: Cell<Option<u32>>,
     }
 
     #[glib::object_subclass]
@@ -175,6 +177,7 @@ mod imp {
             obj.set_orientation(gtk4::Orientation::Vertical);
             obj.set_vexpand(true);
             obj.set_hexpand(true);
+            obj.add_css_class("message-list-container");
 
             obj.setup_ui();
         }
@@ -206,6 +209,7 @@ impl MessageList {
             .margin_end(12)
             .margin_top(6)
             .margin_bottom(6)
+            .css_classes(["search-bar-container"])
             .build();
 
         let search_entry = gtk4::SearchEntry::builder()
@@ -234,14 +238,70 @@ impl MessageList {
         let scrolled = gtk4::ScrolledWindow::builder()
             .vexpand(true)
             .hexpand(true)
+            .css_classes(["view"])
             .build();
 
         let list_box = gtk4::ListBox::builder()
             .selection_mode(gtk4::SelectionMode::Single)
+            .css_classes(["message-list"])
             .build();
 
-        // Remove default styling for cleaner look
-        list_box.add_css_class("navigation-sidebar");
+        // Add separator between rows
+        list_box.set_header_func(|row, before| {
+            if before.is_some() {
+                let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+                sep.add_css_class("message-separator");
+                row.set_header(Some(&sep));
+            } else {
+                row.set_header(None::<&gtk4::Widget>);
+            }
+        });
+
+        // Add CSS for message list selection styling
+        let css_provider = gtk4::CssProvider::new();
+        css_provider.load_from_string(
+            "
+            .message-list > row {
+                border-radius: 8px;
+                margin: 2px 6px;
+            }
+            .message-separator {
+                margin-left: 12px;
+                margin-right: 12px;
+                background-color: alpha(@view_fg_color, 0.1);
+            }
+            .message-list > row:selected {
+                background-color: @accent_bg_color;
+                color: @accent_fg_color;
+                border-radius: 8px;
+            }
+            .message-list > row:selected * {
+                color: @accent_fg_color;
+            }
+            .message-list > row:selected .dim-label,
+            .message-list > row:selected .caption {
+                color: alpha(@accent_fg_color, 0.85);
+            }
+            .unread-dot {
+                background-color: @accent_color;
+                border-radius: 4px;
+            }
+            .message-list > row:selected .unread-dot {
+                background-color: @accent_fg_color;
+            }
+            .message-list-container {
+                background-color: white;
+            }
+            .search-bar-container {
+                background-color: white;
+            }
+            "
+        );
+        gtk4::style_context_add_provider_for_display(
+            &gtk4::gdk::Display::default().unwrap(),
+            &css_provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_USER + 1,
+        );
 
         // Placeholder content - initially empty, will be populated when folder is selected
         let placeholder = adw::StatusPage::builder()
@@ -664,6 +724,11 @@ impl MessageList {
 
     /// Check if a message passes all active filters and search query
     fn message_matches(&self, msg: &MessageInfo) -> bool {
+        self.message_matches_with_options(msg, false)
+    }
+
+    /// Check if a message passes filters, optionally skipping search query filter
+    fn message_matches_with_options(&self, msg: &MessageInfo, skip_search_filter: bool) -> bool {
         let state = self.imp().filter_state.borrow();
         let query = self.imp().search_query.borrow();
 
@@ -702,8 +767,8 @@ impl MessageList {
             }
         }
 
-        // Text search (subject + from substring)
-        if !query.is_empty() {
+        // Text search (subject + from substring) - skip if showing FTS results
+        if !skip_search_filter && !query.is_empty() {
             let q = query.to_lowercase();
             let in_subject = msg.subject.to_lowercase().contains(&q);
             let in_from = msg.from.to_lowercase().contains(&q);
@@ -722,6 +787,15 @@ impl MessageList {
 
     /// Clear and set initial messages
     pub fn set_messages(&self, messages: Vec<MessageInfo>) {
+        self.set_messages_inner(messages, false);
+    }
+
+    /// Set messages from FTS search results (skip local search filtering since DB already filtered)
+    pub fn set_search_results(&self, messages: Vec<MessageInfo>) {
+        self.set_messages_inner(messages, true);
+    }
+
+    fn set_messages_inner(&self, messages: Vec<MessageInfo>, is_search_results: bool) {
         let imp = self.imp();
 
         let scrolled = imp.scrolled.borrow();
@@ -732,15 +806,19 @@ impl MessageList {
         imp.messages.replace(messages.clone());
 
         if let (Some(scrolled), Some(list_box)) = (scrolled.as_ref(), list_box.as_ref()) {
+            // Remember selected UID before clearing
+            let selected_uid = imp.selected_uid.get();
+
             // Clear existing rows
             while let Some(child) = list_box.first_child() {
                 list_box.remove(&child);
             }
             imp.load_more_row.replace(None);
 
-            // Apply all filters + search to decide which messages to show
+            // Apply filters to decide which messages to show
+            // For search results, skip the text search filter (DB already did FTS)
             let visible: Vec<&MessageInfo> = messages.iter()
-                .filter(|m| self.message_matches(m))
+                .filter(|m| self.message_matches_with_options(m, is_search_results))
                 .collect();
 
             if visible.is_empty() {
@@ -778,6 +856,8 @@ impl MessageList {
                             .collect();
                         if let Some(msg) = filtered.get(index) {
                             tracing::debug!("Row activated: index={}, uid={}", index, msg.uid);
+                            // Store selected UID for preservation across rebuilds
+                            imp.selected_uid.set(Some(msg.uid));
                             widget.emit_by_name::<()>("message-selected", &[&msg.uid]);
                         } else {
                             tracing::warn!("Row activated but no message at index {}", index);
@@ -785,6 +865,18 @@ impl MessageList {
                     });
                     imp.row_handler_connected.set(true);
                     tracing::debug!("Row activation handler connected");
+                }
+
+                // Restore selection if we had one
+                if let Some(uid) = selected_uid {
+                    for (idx, msg) in visible.iter().enumerate() {
+                        if msg.uid == uid {
+                            if let Some(row) = list_box.row_at_index(idx as i32) {
+                                list_box.select_row(Some(&row));
+                            }
+                            break;
+                        }
+                    }
                 }
 
                 scrolled.set_child(Some(list_box));
@@ -874,7 +966,7 @@ impl MessageList {
             .margin_bottom(8)
             .build();
 
-        // Unread indicator (blue dot)
+        // Unread indicator (blue dot, becomes white when selected)
         let unread_indicator = gtk4::Box::builder()
             .width_request(8)
             .valign(gtk4::Align::Start)
@@ -882,15 +974,11 @@ impl MessageList {
             .build();
 
         if !msg.is_read {
-            let dot = gtk4::DrawingArea::builder()
+            let dot = gtk4::Box::builder()
                 .width_request(8)
                 .height_request(8)
+                .css_classes(["unread-dot"])
                 .build();
-            dot.set_draw_func(|_, cr, width, height| {
-                cr.set_source_rgb(0.2, 0.5, 1.0); // Blue
-                cr.arc(width as f64 / 2.0, height as f64 / 2.0, 4.0, 0.0, 2.0 * std::f64::consts::PI);
-                let _ = cr.fill();
-            });
             unread_indicator.append(&dot);
         }
         hbox.append(&unread_indicator);

@@ -139,6 +139,7 @@ impl MessageView {
         let content_scrolled = gtk4::ScrolledWindow::builder()
             .vexpand(true)
             .hexpand(true)
+            .css_classes(["view"])
             .build();
 
         let content_box = gtk4::Box::builder()
