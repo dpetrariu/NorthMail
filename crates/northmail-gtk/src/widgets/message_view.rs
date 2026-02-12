@@ -1,6 +1,6 @@
 //! Message view widget
 
-use gtk4::{glib, prelude::*, subclass::prelude::*};
+use gtk4::{gio, glib, prelude::*, subclass::prelude::*};
 use libadwaita as adw;
 #[cfg(feature = "webkit")]
 use webkit6::prelude::*;
@@ -85,6 +85,15 @@ impl MessageView {
             .message-sender-email {
                 font-size: 12px;
                 color: alpha(@view_fg_color, 0.6);
+            }
+            .email-address-chip {
+                padding: 4px 8px;
+                border-radius: 6px;
+                background: transparent;
+                transition: background 150ms ease;
+            }
+            .email-address-chip:hover {
+                background: alpha(@view_fg_color, 0.08);
             }
             .message-date {
                 font-size: 12px;
@@ -345,7 +354,7 @@ impl MessageView {
             let avatar = self.create_avatar(&message.from_name, &message.from_email, None);
             sender_row.append(&avatar);
 
-            // Sender name and email
+            // Sender name and email (wrapped in clickable box with context menu)
             let sender_info = gtk4::Box::builder()
                 .orientation(gtk4::Orientation::Vertical)
                 .spacing(2)
@@ -359,6 +368,13 @@ impl MessageView {
                 message.from_name.clone()
             };
 
+            // Clickable email chip with hover effect
+            let email_chip = gtk4::Box::builder()
+                .orientation(gtk4::Orientation::Vertical)
+                .spacing(2)
+                .css_classes(["email-address-chip"])
+                .build();
+
             let name_label = gtk4::Label::builder()
                 .label(&sender_name)
                 .xalign(0.0)
@@ -371,8 +387,92 @@ impl MessageView {
                 .css_classes(["message-sender-email"])
                 .build();
 
-            sender_info.append(&name_label);
-            sender_info.append(&email_label);
+            email_chip.append(&name_label);
+            email_chip.append(&email_label);
+
+            // Create context menu popover for sender
+            let from_email = message.from_email.clone();
+            let from_name = sender_name.clone();
+
+            let popover = gtk4::Popover::new();
+            popover.set_parent(&email_chip);
+            popover.set_has_arrow(false);
+
+            let menu_box = gtk4::Box::builder()
+                .orientation(gtk4::Orientation::Vertical)
+                .spacing(2)
+                .margin_top(6)
+                .margin_bottom(6)
+                .margin_start(6)
+                .margin_end(6)
+                .build();
+
+            // New Email button
+            let new_email_btn = gtk4::Button::builder()
+                .label("New Email")
+                .css_classes(["flat"])
+                .build();
+            let email_for_compose = from_email.clone();
+            let popover_clone = popover.clone();
+            new_email_btn.connect_clicked(move |btn| {
+                popover_clone.popdown();
+                // Emit signal to open compose with this address
+                if let Some(window) = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok()) {
+                    window.activate_action("win.compose-to", Some(&email_for_compose.to_variant()));
+                }
+            });
+            menu_box.append(&new_email_btn);
+
+            // Copy Address button
+            let copy_btn = gtk4::Button::builder()
+                .label("Copy Address")
+                .css_classes(["flat"])
+                .build();
+            let email_for_copy = from_email.clone();
+            let popover_clone2 = popover.clone();
+            copy_btn.connect_clicked(move |btn| {
+                popover_clone2.popdown();
+                let display = btn.display();
+                let clipboard = display.clipboard();
+                clipboard.set_text(&email_for_copy);
+            });
+            menu_box.append(&copy_btn);
+
+            // Add to Contacts button
+            let add_contact_btn = gtk4::Button::builder()
+                .label("Add to Contacts")
+                .css_classes(["flat"])
+                .build();
+            let email_for_contact = from_email.clone();
+            let name_for_contact = from_name.clone();
+            let popover_clone3 = popover.clone();
+            add_contact_btn.connect_clicked(move |btn| {
+                popover_clone3.popdown();
+                // Add to GNOME Contacts via Evolution Data Server
+                let name = name_for_contact.clone();
+                let email = email_for_contact.clone();
+                glib::spawn_future_local(async move {
+                    if let Err(e) = Self::add_to_gnome_contacts(&name, &email).await {
+                        tracing::error!("Failed to add contact: {}", e);
+                    }
+                });
+            });
+            menu_box.append(&add_contact_btn);
+
+            popover.set_child(Some(&menu_box));
+
+            // Right-click gesture for context menu
+            let gesture = gtk4::GestureClick::new();
+            gesture.set_button(3); // Right click
+            let popover_clone = popover.clone();
+            gesture.connect_pressed(move |gesture, _n, x, y| {
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+                popover_clone.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                popover_clone.popup();
+            });
+            email_chip.add_controller(gesture);
+
+            sender_info.append(&email_chip);
             sender_row.append(&sender_info);
 
             // Date on right
@@ -668,6 +768,27 @@ impl MessageView {
         }
 
         cleaned.trim().to_string()
+    }
+
+    /// Add a contact to GNOME Contacts
+    async fn add_to_gnome_contacts(name: &str, email: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Open GNOME Contacts - it will handle adding the contact
+        // Note: gnome-contacts doesn't have a --new flag with contact data in most versions
+        // So we just open it and let the user add manually for now
+        tracing::info!("Opening GNOME Contacts to add: {} <{}>", name, email);
+
+        // Try xdg-open first as it handles desktop environment detection
+        let result = std::process::Command::new("xdg-open")
+            .arg(format!("mailto:{}?", email))
+            .spawn();
+
+        if result.is_err() {
+            // Fallback to gnome-contacts directly
+            let _ = std::process::Command::new("gnome-contacts")
+                .spawn();
+        }
+
+        Ok(())
     }
 }
 

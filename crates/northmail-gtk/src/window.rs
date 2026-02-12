@@ -1594,6 +1594,19 @@ impl NorthMailWindow {
             .build();
 
         self.add_action_entries([compose_action, refresh_action, search_action]);
+
+        // Compose-to action (with email parameter)
+        let compose_to_action = gio::SimpleAction::new("compose-to", Some(glib::VariantTy::STRING));
+        compose_to_action.connect_activate(glib::clone!(
+            #[weak(rename_to = win)]
+            self,
+            move |_, param| {
+                if let Some(email) = param.and_then(|p| p.str()) {
+                    win.show_compose_dialog_to(email);
+                }
+            }
+        ));
+        self.add_action(&compose_to_action);
     }
 
     fn setup_bindings(&self) {
@@ -1628,6 +1641,12 @@ impl NorthMailWindow {
 
     fn show_compose_dialog(&self) {
         self.show_compose_dialog_with_mode(ComposeMode::New { to: None });
+    }
+
+    fn show_compose_dialog_to(&self, email: &str) {
+        self.show_compose_dialog_with_mode(ComposeMode::New {
+            to: Some((email.to_string(), email.to_string()))
+        });
     }
 
     fn show_compose_dialog_with_mode(&self, mode: ComposeMode) {

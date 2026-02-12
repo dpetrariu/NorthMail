@@ -355,6 +355,8 @@ mod imp {
         pub(super) idle_manager: OnceCell<Arc<IdleManager>>,
         /// Receiver for IDLE manager events
         pub(super) idle_event_receiver: RefCell<Option<std::sync::mpsc::Receiver<IdleManagerEvent>>>,
+        /// Accounts currently being synced (prevents duplicate concurrent syncs)
+        pub(super) syncing_accounts: RefCell<std::collections::HashSet<String>>,
     }
 
     #[glib::object_subclass]
@@ -866,11 +868,15 @@ impl NorthMailApplication {
         // otherwise D-Bus connection closes before notification is displayed
         let summary_clone = summary.clone();
         let body_clone = body.clone();
+
+        // Find the app icon path for the notification
+        let icon_path = Self::find_app_icon_path();
+
         std::thread::spawn(move || {
             let notification = notify_rust::Notification::new()
                 .summary(&summary_clone)
                 .body(&body_clone)
-                .icon("org.northmail.NorthMail")
+                .icon(&icon_path)
                 .appname("NorthMail")
                 .hint(notify_rust::Hint::Category("email.arrived".to_string()))
                 .urgency(notify_rust::Urgency::Normal)
@@ -887,6 +893,52 @@ impl NorthMailApplication {
             }
         });
         info!("Showed notification: {}", summary);
+    }
+
+    /// Find the app icon path for notifications
+    fn find_app_icon_path() -> String {
+        // Try development path first (running from target/debug or target/release)
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(target_dir) = exe.parent() {
+                if let Some(project_root) = target_dir.parent().and_then(|p| p.parent()) {
+                    let dev_icon = project_root
+                        .join("data")
+                        .join("icons")
+                        .join("hicolor")
+                        .join("128x128")
+                        .join("apps")
+                        .join("org.northmail.NorthMail.png");
+                    if dev_icon.exists() {
+                        return dev_icon.to_string_lossy().to_string();
+                    }
+                }
+            }
+        }
+
+        // Try installed paths
+        let installed_paths = [
+            "/usr/share/icons/hicolor/128x128/apps/org.northmail.NorthMail.png",
+            "/usr/local/share/icons/hicolor/128x128/apps/org.northmail.NorthMail.png",
+        ];
+        for path in &installed_paths {
+            if std::path::Path::new(path).exists() {
+                return path.to_string();
+            }
+        }
+
+        // Try home directory
+        if let Ok(home) = std::env::var("HOME") {
+            let home_icon = format!(
+                "{}/.local/share/icons/hicolor/128x128/apps/org.northmail.NorthMail.png",
+                home
+            );
+            if std::path::Path::new(&home_icon).exists() {
+                return home_icon;
+            }
+        }
+
+        // Fallback to icon name (may not show the colored icon)
+        "org.northmail.NorthMail".to_string()
     }
 
     /// Get sender and subject of the latest inbox message for an account
@@ -3266,6 +3318,16 @@ impl NorthMailApplication {
     async fn stream_inbox_to_cache(&self, account: &northmail_auth::GoaAccount) {
         let account_id = account.id.clone();
         let email = account.email.clone();
+
+        // Prevent duplicate concurrent syncs for the same account
+        {
+            let mut syncing = self.imp().syncing_accounts.borrow_mut();
+            if syncing.contains(&account_id) {
+                info!("Skipping sync for {} - already in progress", email);
+                return;
+            }
+            syncing.insert(account_id.clone());
+        }
         let is_google = Self::is_google_account(account);
         let is_microsoft = Self::is_microsoft_account(account);
         let is_password = Self::is_password_account(account);
@@ -3399,21 +3461,27 @@ impl NorthMailApplication {
                         // Phase 2 sends to fail, stopping background sync early.
                         // We only need the initial batch for unified inbox display.
                         drop(receiver);
+                        self.imp().syncing_accounts.borrow_mut().remove(&account_id);
                         return;
                     }
                     FetchEvent::FullSyncDone { .. } => {
                         info!("Background streaming {}: complete", email);
+                        self.imp().syncing_accounts.borrow_mut().remove(&account_id);
                         return;
                     }
                     FetchEvent::Error(e) => {
                         warn!("Background streaming {} error: {}", email, e);
+                        self.imp().syncing_accounts.borrow_mut().remove(&account_id);
                         return;
                     }
                 },
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     glib::timeout_future(std::time::Duration::from_millis(10)).await;
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.imp().syncing_accounts.borrow_mut().remove(&account_id);
+                    return;
+                }
             }
         }
     }
