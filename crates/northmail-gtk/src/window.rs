@@ -14,15 +14,16 @@ pub enum ComposeMode {
     #[default]
     New,
     Reply {
-        to: String,
+        to: String,           // email address
+        to_display: String,   // display name (for chip UI)
         subject: String,
         quoted_body: String,
         in_reply_to: Option<String>,
         references: Vec<String>,
     },
     ReplyAll {
-        to: Vec<String>,
-        cc: Vec<String>,
+        to: Vec<(String, String)>,   // (email, display_name) pairs
+        cc: Vec<(String, String)>,   // (email, display_name) pairs
         subject: String,
         quoted_body: String,
         in_reply_to: Option<String>,
@@ -32,6 +33,14 @@ pub enum ComposeMode {
         subject: String,
         quoted_body: String,
         attachments: Vec<(String, String, Vec<u8>)>, // (filename, mime_type, data)
+    },
+    EditDraft {
+        to: Vec<String>,       // recipient emails
+        cc: Vec<String>,       // cc emails
+        subject: String,
+        body: String,
+        draft_uid: u32,        // UID of draft to delete after sending
+        account_index: u32,    // Account the draft belongs to
     },
 }
 
@@ -220,6 +229,8 @@ mod imp {
         pub loading_label: std::cell::RefCell<Option<gtk4::Label>>,
         /// Loading progress label (e.g., "24 of 150 messages")
         pub loading_progress_label: std::cell::RefCell<Option<gtk4::Label>>,
+        /// Currently displayed message UID (to avoid reloading the same message)
+        pub current_message_uid: std::cell::RefCell<Option<u32>>,
     }
 
     #[glib::object_subclass]
@@ -400,12 +411,21 @@ impl NorthMailWindow {
     fn show_message(&self, message_list: &MessageList, uid: u32) {
         let imp = self.imp();
 
+        // Skip if already showing this message
+        if *imp.current_message_uid.borrow() == Some(uid) {
+            debug!("Message UID {} already displayed, skipping reload", uid);
+            return;
+        }
+
         // Find the message in the list
         let messages = message_list.imp().messages.borrow();
         let msg = messages.iter().find(|m| m.uid == uid).cloned();
         drop(messages); // Release borrow
 
         if let Some(msg) = msg {
+            // Track the currently displayed message
+            *imp.current_message_uid.borrow_mut() = Some(uid);
+
             // Clear current content
             while let Some(child) = imp.message_view_box.first_child() {
                 imp.message_view_box.remove(&child);
@@ -452,8 +472,16 @@ impl NorthMailWindow {
                 let msg_clone = msg.clone();
                 let body_text = body_text.clone();
                 reply_button.connect_clicked(move |_| {
-                    let body = body_text.borrow().clone().unwrap_or_default();
-                    let reply_to = extract_email_address(&msg_clone.from);
+                    let body = body_text.borrow().clone().unwrap_or_else(|| {
+                        "(Message body is still loading...)".to_string()
+                    });
+                    // Use from_address if it looks like an email, otherwise extract from 'from'
+                    let reply_to_email = if !msg_clone.from_address.is_empty() && msg_clone.from_address.contains('@') {
+                        msg_clone.from_address.clone()
+                    } else {
+                        extract_email_address(&msg_clone.from)
+                    };
+                    let reply_to_display = msg_clone.from.clone();
                     let subject = if msg_clone.subject.to_lowercase().starts_with("re:") {
                         msg_clone.subject.clone()
                     } else {
@@ -461,7 +489,8 @@ impl NorthMailWindow {
                     };
                     let quoted = format_quoted_body(&msg_clone.from, &msg_clone.date, &body);
                     let mode = ComposeMode::Reply {
-                        to: reply_to,
+                        to: reply_to_email,
+                        to_display: reply_to_display,
                         subject,
                         quoted_body: quoted,
                         in_reply_to: None,
@@ -477,15 +506,26 @@ impl NorthMailWindow {
                 let msg_clone = msg.clone();
                 let body_text = body_text.clone();
                 reply_all_button.connect_clicked(move |_| {
-                    let body = body_text.borrow().clone().unwrap_or_default();
-                    let reply_to = extract_email_address(&msg_clone.from);
-                    // For reply-all, include all To recipients
-                    let to_addrs = vec![reply_to];
+                    let body = body_text.borrow().clone().unwrap_or_else(|| {
+                        "(Message body is still loading...)".to_string()
+                    });
+                    // Use from_address if it looks like an email, otherwise extract from 'from'
+                    let reply_to_email = if !msg_clone.from_address.is_empty() && msg_clone.from_address.contains('@') {
+                        msg_clone.from_address.clone()
+                    } else {
+                        extract_email_address(&msg_clone.from)
+                    };
+                    let reply_to_display = msg_clone.from.clone();
+                    // For reply-all, include the sender as primary To
+                    let to_addrs = vec![(reply_to_email.clone(), reply_to_display)];
                     // Parse additional recipients from the To field (comma-separated)
-                    let cc_addrs: Vec<String> = msg_clone.to
+                    let cc_addrs: Vec<(String, String)> = msg_clone.to
                         .split(',')
-                        .map(|s| extract_email_address(s.trim()))
-                        .filter(|e| !to_addrs.contains(e))
+                        .map(|s| {
+                            let email = extract_email_address(s.trim());
+                            (email.clone(), email) // email as both display and address
+                        })
+                        .filter(|(e, _)| e != &reply_to_email)
                         .collect();
 
                     let subject = if msg_clone.subject.to_lowercase().starts_with("re:") {
@@ -512,7 +552,9 @@ impl NorthMailWindow {
                 let msg_clone = msg.clone();
                 let body_text = body_text.clone();
                 forward_button.connect_clicked(move |_| {
-                    let body = body_text.borrow().clone().unwrap_or_default();
+                    let body = body_text.borrow().clone().unwrap_or_else(|| {
+                        "(Message body is still loading...)".to_string()
+                    });
                     let subject = if msg_clone.subject.to_lowercase().starts_with("fwd:") {
                         msg_clone.subject.clone()
                     } else {
@@ -542,6 +584,72 @@ impl NorthMailWindow {
                 .tooltip_text("Delete")
                 .build();
 
+            // Edit button (only visible for drafts) - blue accent color
+            let edit_button = gtk4::Button::builder()
+                .label("Edit")
+                .css_classes(["suggested-action"])
+                .build();
+
+            // Check if we're viewing drafts folder
+            let is_drafts = if let Some(app) = self.application() {
+                if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                    app.current_folder_type() == "drafts"
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            edit_button.set_visible(is_drafts);
+
+            // Connect edit button
+            if is_drafts {
+                let window = self.clone();
+                let msg_clone = msg.clone();
+                let body_text = body_text.clone();
+                edit_button.connect_clicked(move |_| {
+                    // Check if body is loaded yet
+                    let body = match body_text.borrow().clone() {
+                        Some(b) => b,
+                        None => {
+                            window.add_toast(adw::Toast::new("Please wait for the message to load"));
+                            return;
+                        }
+                    };
+
+                    // Parse To addresses, removing placeholder (sender's own email)
+                    let sender_email = if let Some(app) = window.application() {
+                        if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                            let accs = app.imp().accounts.borrow();
+                            accs.first().map(|a| a.email.clone()).unwrap_or_default()
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    };
+
+                    let to: Vec<String> = msg_clone.to
+                        .split(',')
+                        .map(|s| extract_email_address(s.trim()))
+                        .filter(|e| !e.is_empty() && e != &sender_email)
+                        .collect();
+
+                    // For now, CC is not stored in message view - would need to parse from raw headers
+                    let cc: Vec<String> = Vec::new();
+
+                    let mode = ComposeMode::EditDraft {
+                        to,
+                        cc,
+                        subject: msg_clone.subject.clone(),
+                        body,
+                        draft_uid: msg_clone.uid,
+                        account_index: 0, // TODO: get correct account index
+                    };
+                    window.show_compose_dialog_with_mode(mode);
+                });
+            }
+
             let spacer = gtk4::Box::builder()
                 .hexpand(true)
                 .build();
@@ -552,6 +660,10 @@ impl NorthMailWindow {
                 .active(msg.is_starred)
                 .build();
 
+            // For drafts, show Edit first; for others, show Reply/Forward
+            if is_drafts {
+                toolbar.append(&edit_button);
+            }
             toolbar.append(&reply_button);
             toolbar.append(&reply_all_button);
             toolbar.append(&forward_button);
@@ -995,16 +1107,18 @@ impl NorthMailWindow {
             .compose-entry { background: transparent; border: none; outline: none; box-shadow: none; min-height: 28px; }
             .compose-entry:focus { background: transparent; border: none; outline: none; box-shadow: none; }
             .compose-entry > text { background: transparent; border: none; outline: none; box-shadow: none; }
-            .compose-chip { background: alpha(currentColor, 0.08); border-radius: 12px; padding: 0px 2px 0px 8px; margin: 0; }
-            .compose-chip label { font-size: 0.9em; }
-            .compose-chip button { min-width: 18px; min-height: 18px; padding: 0; margin: 0; }
+            .compose-chip { background: alpha(currentColor, 0.08); border-radius: 10px; padding: 0px 2px 0px 8px; margin: 0; }
+            .compose-chip label { font-size: 0.85em; margin: 0; padding: 0; }
+            .compose-chip button { min-width: 16px; min-height: 16px; padding: 0; margin: 0; }
             .compose-field-label { font-size: 0.9em; min-width: 52px; }
-            .attachment-pill { background: alpha(currentColor, 0.08); border-radius: 12px; padding: 2px 4px 2px 8px; }
-            .attachment-pill:hover { background: alpha(currentColor, 0.12); }
-            .attachment-pill label { font-size: 0.85em; }
-            .attachment-pill image { margin-right: 2px; }
-            .attachment-pill button { min-width: 16px; min-height: 16px; padding: 0; margin: 0; }
+            .attachment-pill { background: alpha(currentColor, 0.1); border-radius: 6px; padding: 1px 2px 1px 5px; }
+            .attachment-pill:hover { background: alpha(currentColor, 0.15); }
+            .attachment-pill label { font-size: 0.8em; }
+            .attachment-pill button { min-width: 16px; min-height: 16px; padding: 0; margin: 0 0 0 2px; }
+            .more-badge { background: alpha(@accent_color, 0.15); color: @accent_color; border-radius: 6px; padding: 1px 8px; font-size: 0.8em; font-weight: 500; }
+            .more-badge:hover { background: alpha(@accent_color, 0.25); }
             .warning { color: @warning_color; }
+            .compose-send { min-height: 24px; padding-top: 2px; padding-bottom: 2px; }
             ",
         );
         gtk4::style_context_add_provider_for_display(
@@ -1021,20 +1135,15 @@ impl NorthMailWindow {
 
         let toolbar_view = adw::ToolbarView::new();
 
-        // Header bar — Send on right, draft status on left
-        let header = adw::HeaderBar::new();
+        // Toast overlay for in-window notifications (created early for closure capture)
+        let toast_overlay = adw::ToastOverlay::new();
 
-        // Draft status label (hidden by default)
-        let draft_label = gtk4::Label::builder()
-            .label("Saved as Draft")
-            .css_classes(["dim-label"])
-            .visible(false)
-            .build();
-        header.pack_start(&draft_label);
+        // Header bar — From dropdown on left, Send on right
+        let header = adw::HeaderBar::new();
 
         let send_button = gtk4::Button::builder()
             .label("Send")
-            .css_classes(["suggested-action", "pill"])
+            .css_classes(["suggested-action", "pill", "compose-send"])
             .build();
 
         header.pack_end(&send_button);
@@ -1046,32 +1155,7 @@ impl NorthMailWindow {
             .spacing(0)
             .build();
 
-        // --- Header fields (From, To, Cc, Subject) ---
-        let fields_box = gtk4::Box::builder()
-            .orientation(gtk4::Orientation::Vertical)
-            .spacing(0)
-            .margin_start(12)
-            .margin_end(12)
-            .build();
-
-        // Label width for alignment
-        let label_width = 56;
-
-        // From selector
-        let from_box = gtk4::Box::builder()
-            .orientation(gtk4::Orientation::Horizontal)
-            .spacing(6)
-            .margin_top(6)
-            .margin_bottom(6)
-            .build();
-
-        let from_label = gtk4::Label::builder()
-            .label("From")
-            .xalign(1.0)
-            .width_request(label_width)
-            .css_classes(["dim-label", "compose-field-label"])
-            .build();
-
+        // --- From dropdown in header ---
         // Track which accounts can send (Microsoft consumer OAuth2 accounts cannot)
         let mut sendable_accounts: Vec<bool> = Vec::new();
         let from_model = gtk4::StringList::new(&[]);
@@ -1090,7 +1174,6 @@ impl NorthMailWindow {
 
         let from_dropdown = gtk4::DropDown::builder()
             .model(&from_model)
-            .hexpand(true)
             .css_classes(["flat"])
             .build();
 
@@ -1102,25 +1185,66 @@ impl NorthMailWindow {
             .visible(false)
             .build();
 
-        from_box.append(&from_label);
-        from_box.append(&from_dropdown);
-        from_box.append(&warning_button);
-        fields_box.append(&from_box);
-        fields_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+        // Add from dropdown and warning to header
+        header.pack_start(&from_dropdown);
+        header.pack_start(&warning_button);
 
-        // To / Cc chip rows
+        // --- Header fields (To, Cc, Subject) ---
+        let fields_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .spacing(0)
+            .margin_start(12)
+            .margin_end(12)
+            .build();
+
+        // Label width for alignment
+        let label_width = 56;
+
+        // To / Cc / Bcc chip rows
         let to_chips: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
             std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let cc_chips: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
             std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let bcc_chips: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
 
         let (to_row, to_add_chip) = Self::build_chip_row("To", to_chips.clone(), self, label_width);
         let (cc_row, cc_add_chip) = Self::build_chip_row("Cc", cc_chips.clone(), self, label_width);
+        let (bcc_row, _bcc_add_chip) = Self::build_chip_row("Bcc", bcc_chips.clone(), self, label_width);
+
+        // Bcc row starts hidden
+        bcc_row.set_visible(false);
+        let bcc_separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        bcc_separator.set_visible(false);
+
+        // Bcc button (shown on Cc row, like attach button on Subject)
+        let bcc_button = gtk4::Button::builder()
+            .label("Bcc")
+            .css_classes(["flat"])
+            .tooltip_text("Add Bcc recipients")
+            .valign(gtk4::Align::Center)
+            .build();
+
+        // Add Bcc button to Cc row
+        cc_row.append(&bcc_button);
+
+        // Wire Bcc button click
+        {
+            let bcc_row_ref = bcc_row.clone();
+            let bcc_separator_ref = bcc_separator.clone();
+            bcc_button.connect_clicked(move |btn| {
+                btn.set_visible(false);
+                bcc_row_ref.set_visible(true);
+                bcc_separator_ref.set_visible(true);
+            });
+        }
 
         fields_box.append(&to_row);
         fields_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
         fields_box.append(&cc_row);
         fields_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+        fields_box.append(&bcc_row);
+        fields_box.append(&bcc_separator);
 
         // Subject
         let subject_box = gtk4::Box::builder()
@@ -1155,9 +1279,10 @@ impl NorthMailWindow {
         subject_box.append(&subject_entry);
         subject_box.append(&attach_button);
         fields_box.append(&subject_box);
-        fields_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
         content.append(&fields_box);
+        // Full-width separator below subject (outside fields_box margins)
+        content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
         // Attachments storage (UI added at bottom after body)
         let attachments: std::rc::Rc<std::cell::RefCell<Vec<(String, String, Vec<u8>, Option<std::path::PathBuf>)>>> =
@@ -1174,30 +1299,52 @@ impl NorthMailWindow {
             .bottom_margin(12)
             .build();
 
-        let scrolled = gtk4::ScrolledWindow::builder()
+        let text_scrolled = gtk4::ScrolledWindow::builder()
             .child(&text_view)
             .vexpand(true)
             .build();
 
-        content.append(&scrolled);
+        // Attachments bar - compact horizontal row at bottom
+        let attachments_bar = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(6)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(6)
+            .margin_bottom(6)
+            .build();
+
+        let attachments_scroll = gtk4::ScrolledWindow::builder()
+            .child(&attachments_bar)
+            .hscrollbar_policy(gtk4::PolicyType::Automatic)
+            .vscrollbar_policy(gtk4::PolicyType::Never)
+            .propagate_natural_width(true)
+            .build();
+
+        let attachments_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .build();
+        attachments_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+        attachments_box.append(&attachments_scroll);
+        attachments_box.set_visible(false);
+
+        content.append(&text_scrolled);
+        content.append(&attachments_box);
 
         // Pre-fill fields based on compose mode
         match &mode {
             ComposeMode::New => {}
-            ComposeMode::Reply { to, subject, quoted_body, .. } => {
-                // Add the recipient chip (closure handles both UI and data)
-                to_add_chip(to, to);
+            ComposeMode::Reply { to, to_display, subject, quoted_body, .. } => {
+                to_add_chip(to_display, to);
                 subject_entry.set_text(subject);
                 text_view.buffer().set_text(quoted_body);
             }
             ComposeMode::ReplyAll { to, cc, subject, quoted_body, .. } => {
-                // Add To recipients
-                for addr in to {
-                    to_add_chip(addr, addr);
+                for (email, display) in to {
+                    to_add_chip(display, email);
                 }
-                // Add Cc recipients
-                for addr in cc {
-                    cc_add_chip(addr, addr);
+                for (email, display) in cc {
+                    cc_add_chip(display, email);
                 }
                 subject_entry.set_text(subject);
                 text_view.buffer().set_text(quoted_body);
@@ -1205,7 +1352,6 @@ impl NorthMailWindow {
             ComposeMode::Forward { subject, quoted_body, attachments: fwd_attachments } => {
                 subject_entry.set_text(subject);
                 text_view.buffer().set_text(quoted_body);
-                // Add forwarded attachments
                 for (filename, mime_type, data) in fwd_attachments {
                     attachments.borrow_mut().push((
                         filename.clone(),
@@ -1215,114 +1361,131 @@ impl NorthMailWindow {
                     ));
                 }
             }
+            ComposeMode::EditDraft { to, cc, subject, body, .. } => {
+                for email in to {
+                    to_add_chip(email, email);
+                }
+                for email in cc {
+                    cc_add_chip(email, email);
+                }
+                subject_entry.set_text(subject);
+                text_view.buffer().set_text(body);
+            }
         }
 
-        // Attachments area at bottom (hidden until files are added)
-        let attachments_box = gtk4::Box::builder()
-            .orientation(gtk4::Orientation::Horizontal)
-            .spacing(6)
-            .margin_start(12)
-            .margin_end(12)
-            .margin_top(6)
-            .margin_bottom(8)
-            .build();
-
-        let attachments_flow = gtk4::FlowBox::builder()
-            .selection_mode(gtk4::SelectionMode::None)
-            .homogeneous(false)
-            .row_spacing(4)
-            .column_spacing(6)
-            .max_children_per_line(20)
-            .build();
-
-        attachments_box.append(&attachments_flow);
-        attachments_box.set_visible(false);
-        content.append(&attachments_box);
-
         toolbar_view.set_content(Some(&content));
-        compose_window.set_content(Some(&toolbar_view));
 
-        // --- Attachment button handler ---
-        let add_attachment_to_ui = {
+        // Set up toast overlay with toolbar content
+        toast_overlay.set_child(Some(&toolbar_view));
+        compose_window.set_content(Some(&toast_overlay));
+
+        // --- Attachment UI rebuild function ---
+        let rebuild_attachments_ui: Rc<dyn Fn()> = {
             let attachments = attachments.clone();
-            let attachments_flow = attachments_flow.clone();
+            let attachments_bar = attachments_bar.clone();
             let attachments_box = attachments_box.clone();
 
-            move |filename: String, mime_type: String, data: Vec<u8>, temp_path: Option<std::path::PathBuf>| {
-                attachments.borrow_mut().push((filename.clone(), mime_type, data, temp_path.clone()));
-                let filename_for_remove = filename.clone();
+            Rc::new(move || {
+                // Clear bar
+                while let Some(child) = attachments_bar.first_child() {
+                    attachments_bar.remove(&child);
+                }
 
-                // Create pill widget - natural width based on filename
-                let pill = gtk4::Box::builder()
-                    .orientation(gtk4::Orientation::Horizontal)
-                    .spacing(4)
-                    .css_classes(["attachment-pill"])
-                    .build();
+                let atts = attachments.borrow();
 
-                let icon = gtk4::Image::builder()
-                    .icon_name("mail-attachment-symbolic")
-                    .pixel_size(14)
-                    .build();
+                if atts.is_empty() {
+                    attachments_box.set_visible(false);
+                    return;
+                }
 
-                let label = gtk4::Label::builder()
-                    .label(&filename)
-                    .ellipsize(gtk4::pango::EllipsizeMode::Middle)
-                    .max_width_chars(25)
-                    .build();
+                attachments_box.set_visible(true);
 
-                let remove_btn = gtk4::Button::builder()
-                    .icon_name("window-close-symbolic")
-                    .css_classes(["flat", "circular"])
-                    .tooltip_text("Remove attachment")
-                    .build();
+                // Create compact pill for each attachment
+                for (filename, _mime, _data, temp_path) in atts.iter() {
+                    let pill = gtk4::Box::builder()
+                        .orientation(gtk4::Orientation::Horizontal)
+                        .spacing(2)
+                        .css_classes(["attachment-pill"])
+                        .build();
 
-                pill.append(&icon);
-                pill.append(&label);
-                pill.append(&remove_btn);
+                    // Use content-type icon based on filename (like Files app)
+                    // content_type_guess derives the type from filename extension
+                    let (content_type, _uncertain) = gtk4::gio::content_type_guess(Some(filename), &[]);
+                    let gicon = gtk4::gio::content_type_get_icon(&content_type);
+                    let icon = gtk4::Image::builder()
+                        .gicon(&gicon)
+                        .icon_size(gtk4::IconSize::Normal) // Use normal size for colored icons
+                        .build();
 
-                // Click on pill to open the file
-                let gesture = gtk4::GestureClick::new();
-                let temp_path_open = temp_path.clone();
-                let filename_open = filename.clone();
-                gesture.connect_released(move |_, _, _, _| {
-                    if let Some(ref path) = temp_path_open {
-                        let _ = std::process::Command::new("xdg-open")
-                            .arg(path)
-                            .spawn();
+                    // Truncate filename for display, keep extension visible
+                    let display_name = if filename.len() > 25 {
+                        let ext_pos = filename.rfind('.').unwrap_or(filename.len());
+                        let ext = &filename[ext_pos..];
+                        let name_part = &filename[..ext_pos];
+                        if name_part.len() > 20 {
+                            format!("{}...{}", &name_part[..17], ext)
+                        } else {
+                            filename.clone()
+                        }
                     } else {
-                        debug!("No temp path for attachment {}", filename_open);
-                    }
-                });
-                pill.add_controller(gesture);
+                        filename.clone()
+                    };
+                    let label = gtk4::Label::new(Some(&display_name));
 
-                // Remove button handler
-                let attachments_remove = attachments.clone();
-                let attachments_box_remove = attachments_box.clone();
-                let attachments_flow_remove = attachments_flow.clone();
-                let pill_weak = pill.downgrade();
-                let filename_to_remove = filename_for_remove.clone();
-                remove_btn.connect_clicked(move |_| {
-                    // Find and remove from list by filename
-                    let mut atts = attachments_remove.borrow_mut();
-                    if let Some(pos) = atts.iter().position(|(f, _, _, _)| f == &filename_to_remove) {
-                        atts.remove(pos);
+                    let remove_btn = gtk4::Button::builder()
+                        .icon_name("window-close-symbolic")
+                        .css_classes(["flat", "circular"])
+                        .tooltip_text("Remove attachment")
+                        .build();
+
+                    pill.append(&icon);
+                    pill.append(&label);
+                    pill.append(&remove_btn);
+
+                    // Click to open file
+                    if let Some(path) = temp_path.clone() {
+                        let gesture = gtk4::GestureClick::new();
+                        gesture.connect_released(move |_, _, _, _| {
+                            let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+                        });
+                        pill.add_controller(gesture);
                     }
-                    // Remove pill from flow
-                    if let Some(pill) = pill_weak.upgrade() {
-                        if let Some(parent) = pill.parent() {
-                            if let Some(flow_child) = parent.downcast_ref::<gtk4::FlowBoxChild>() {
-                                attachments_flow_remove.remove(flow_child);
+
+                    // Remove button
+                    let filename_to_remove = filename.clone();
+                    let attachments_for_remove = attachments.clone();
+                    let attachments_bar_for_rebuild = attachments_bar.clone();
+                    let attachments_box_for_rebuild = attachments_box.clone();
+
+                    remove_btn.connect_clicked(move |_| {
+                        {
+                            let mut atts = attachments_for_remove.borrow_mut();
+                            if let Some(pos) = atts.iter().position(|(f, _, _, _)| f == &filename_to_remove) {
+                                atts.remove(pos);
                             }
                         }
-                    }
-                    // Hide box if no attachments left
-                    if attachments_remove.borrow().is_empty() {
-                        attachments_box_remove.set_visible(false);
-                    }
-                });
+                        // Clear and check if empty
+                        while let Some(child) = attachments_bar_for_rebuild.first_child() {
+                            attachments_bar_for_rebuild.remove(&child);
+                        }
+                        if attachments_for_remove.borrow().is_empty() {
+                            attachments_box_for_rebuild.set_visible(false);
+                        }
+                    });
 
-                attachments_flow.append(&pill);
-                attachments_box.set_visible(true);
+                    attachments_bar.append(&pill);
+                }
+            })
+        };
+
+        // --- Attachment add handler ---
+        let add_attachment_to_ui = {
+            let attachments = attachments.clone();
+            let rebuild = rebuild_attachments_ui.clone();
+
+            move |filename: String, mime_type: String, data: Vec<u8>, temp_path: Option<std::path::PathBuf>| {
+                attachments.borrow_mut().push((filename, mime_type, data, temp_path));
+                rebuild();
             }
         };
 
@@ -1357,22 +1520,27 @@ impl NorthMailWindow {
         }
 
         // Drag-and-drop support - add directly to TextView to intercept before its built-in handler
-        let drop_target = gtk4::DropTarget::new(gtk4::gio::File::static_type(), gtk4::gdk::DragAction::COPY);
+        // Use FileList to support multiple files at once
+        let drop_target = gtk4::DropTarget::new(gtk4::gdk::FileList::static_type(), gtk4::gdk::DragAction::COPY);
         {
             let add_attachment = add_attachment_to_ui.clone();
             drop_target.connect_drop(move |_, value, _, _| {
-                if let Ok(file) = value.get::<gtk4::gio::File>() {
-                    if let Some(path) = file.path() {
-                        if let Ok(data) = std::fs::read(&path) {
-                            let filename = path.file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_else(|| "attachment".to_string());
+                if let Ok(file_list) = value.get::<gtk4::gdk::FileList>() {
+                    let mut added_any = false;
+                    for file in file_list.files() {
+                        if let Some(path) = file.path() {
+                            if let Ok(data) = std::fs::read(&path) {
+                                let filename = path.file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "attachment".to_string());
 
-                            let mime_type = Self::guess_mime_type(&filename);
-                            add_attachment(filename, mime_type, data, Some(path));
-                            return true;
+                                let mime_type = Self::guess_mime_type(&filename);
+                                add_attachment(filename, mime_type, data, Some(path));
+                                added_any = true;
+                            }
                         }
                     }
+                    return added_any;
                 }
                 false
             });
@@ -1380,22 +1548,26 @@ impl NorthMailWindow {
         text_view.add_controller(drop_target);
 
         // Also add drop target on the header fields area
-        let drop_target2 = gtk4::DropTarget::new(gtk4::gio::File::static_type(), gtk4::gdk::DragAction::COPY);
+        let drop_target2 = gtk4::DropTarget::new(gtk4::gdk::FileList::static_type(), gtk4::gdk::DragAction::COPY);
         {
             let add_attachment = add_attachment_to_ui.clone();
             drop_target2.connect_drop(move |_, value, _, _| {
-                if let Ok(file) = value.get::<gtk4::gio::File>() {
-                    if let Some(path) = file.path() {
-                        if let Ok(data) = std::fs::read(&path) {
-                            let filename = path.file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_else(|| "attachment".to_string());
+                if let Ok(file_list) = value.get::<gtk4::gdk::FileList>() {
+                    let mut added_any = false;
+                    for file in file_list.files() {
+                        if let Some(path) = file.path() {
+                            if let Ok(data) = std::fs::read(&path) {
+                                let filename = path.file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "attachment".to_string());
 
-                            let mime_type = Self::guess_mime_type(&filename);
-                            add_attachment(filename, mime_type, data, Some(path));
-                            return true;
+                                let mime_type = Self::guess_mime_type(&filename);
+                                add_attachment(filename, mime_type, data, Some(path));
+                                added_any = true;
+                            }
                         }
                     }
+                    return added_any;
                 }
                 false
             });
@@ -1404,11 +1576,16 @@ impl NorthMailWindow {
 
         // --- Draft auto-save state ---
         // Track the saved draft: (account_index, uid)
+        // If editing an existing draft, initialize with its info so we update it instead of creating new
+        let initial_draft_state = match &mode {
+            ComposeMode::EditDraft { draft_uid, account_index, .. } => Some((*account_index, *draft_uid)),
+            _ => None,
+        };
         let draft_state: std::rc::Rc<std::cell::RefCell<Option<(u32, u32)>>> =
-            std::rc::Rc::new(std::cell::RefCell::new(None));
-        // Track the auto-save timer source ID so we can cancel/reset it
-        let timer_source: std::rc::Rc<std::cell::Cell<Option<glib::SourceId>>> =
-            std::rc::Rc::new(std::cell::Cell::new(None));
+            std::rc::Rc::new(std::cell::RefCell::new(initial_draft_state));
+        // Generation counter for auto-save timer (avoid SourceId::remove panic)
+        let timer_generation: std::rc::Rc<std::cell::Cell<u32>> =
+            std::rc::Rc::new(std::cell::Cell::new(0));
         // Whether the message was sent (skip close confirmation)
         let was_sent: std::rc::Rc<std::cell::Cell<bool>> =
             std::rc::Rc::new(std::cell::Cell::new(false));
@@ -1418,7 +1595,7 @@ impl NorthMailWindow {
 
         // --- Auto-save helper: resets timer on any edit ---
         let setup_auto_save_timer = {
-            let timer_source = timer_source.clone();
+            let timer_generation = timer_generation.clone();
             let draft_state = draft_state.clone();
             let save_in_progress = save_in_progress.clone();
             let to_chips_save = to_chips.clone();
@@ -1427,15 +1604,13 @@ impl NorthMailWindow {
             let text_view_save = text_view.clone();
             let from_dropdown_save = from_dropdown.clone();
             let main_window = self.clone();
-            let draft_label_save = draft_label.clone();
+            let toast_overlay_save = toast_overlay.clone();
 
             move || {
                 eprintln!("[draft] Reset timer called - scheduling 5s auto-save");
-                // Cancel any existing timer
-                if let Some(source_id) = timer_source.take() {
-                    eprintln!("[draft] Cancelled previous timer");
-                    source_id.remove();
-                }
+                // Increment generation to invalidate any pending timer
+                let current_gen = timer_generation.get().wrapping_add(1);
+                timer_generation.set(current_gen);
 
                 // Don't schedule if a save is already in progress
                 if save_in_progress.get() {
@@ -1443,6 +1618,7 @@ impl NorthMailWindow {
                     return;
                 }
 
+                let timer_generation_check = timer_generation.clone();
                 let draft_state_timer = draft_state.clone();
                 let save_in_progress_timer = save_in_progress.clone();
                 let to_chips_timer = to_chips_save.clone();
@@ -1451,9 +1627,14 @@ impl NorthMailWindow {
                 let text_view_timer = text_view_save.clone();
                 let from_dropdown_timer = from_dropdown_save.clone();
                 let main_window_timer = main_window.clone();
-                let draft_label_timer = draft_label_save.clone();
+                let toast_overlay_timer = toast_overlay_save.clone();
 
-                let source_id = glib::timeout_add_seconds_local_once(5, move || {
+                glib::timeout_add_seconds_local_once(5, move || {
+                    // Check if this timer is still valid (not superseded)
+                    if timer_generation_check.get() != current_gen {
+                        eprintln!("[draft] Timer generation mismatch, ignoring");
+                        return;
+                    }
                     eprintln!("[draft] Auto-save timer fired");
                     let subject = subject_entry_timer.text().to_string();
                     let body = {
@@ -1468,10 +1649,6 @@ impl NorthMailWindow {
                         return;
                     }
                     eprintln!("[draft] Saving draft: subject='{}' body_len={}", subject, body.len());
-
-                    // Show immediate visual feedback that save is starting
-                    draft_label_timer.set_label("Saving...");
-                    draft_label_timer.set_visible(true);
 
                     let to_list = to_chips_timer.borrow().clone();
                     let cc_list = cc_chips_timer.borrow().clone();
@@ -1500,11 +1677,17 @@ impl NorthMailWindow {
                     if let Some(name) = from_name {
                         msg = msg.from_name(name);
                     }
-                    for addr in &to_list {
-                        msg = msg.to(addr);
-                    }
-                    for addr in &cc_list {
-                        msg = msg.cc(addr);
+                    // For drafts without recipients, add sender as placeholder
+                    // (lettre requires at least one recipient)
+                    if to_list.is_empty() && cc_list.is_empty() {
+                        msg = msg.to(&email);
+                    } else {
+                        for addr in &to_list {
+                            msg = msg.to(addr);
+                        }
+                        for addr in &cc_list {
+                            msg = msg.cc(addr);
+                        }
                     }
                     msg = msg.text(&body);
 
@@ -1518,11 +1701,13 @@ impl NorthMailWindow {
                     if let Some((old_acct, old_uid)) = old_state {
                         let app_delete = app.clone();
                         let app_save = app.clone();
-                        let draft_label_cb = draft_label_timer.clone();
+                        let app_refresh = app.clone();
+                        let toast_cb = toast_overlay_timer.clone();
                         eprintln!("[draft] Deleting old draft uid={} then saving new", old_uid);
                         app_delete.delete_draft(old_acct, old_uid, move |_| {
                             // Ignore delete errors — old draft may already be gone
-                            let draft_label_inner = draft_label_cb.clone();
+                            let toast_inner = toast_cb.clone();
+                            let app_refresh_inner = app_refresh.clone();
                             eprintln!("[draft] Calling save_draft (after delete) for account {}", account_index);
                             app_save.save_draft(account_index, msg, move |result| {
                                 save_in_progress_cb.set(false);
@@ -1530,23 +1715,26 @@ impl NorthMailWindow {
                                     Ok(Some(uid)) => {
                                         eprintln!("[draft] Saved! uid={}", uid);
                                         *draft_state_cb.borrow_mut() = Some((account_index, uid));
-                                        draft_label_inner.set_label("Saved as Draft");
+                                        toast_inner.add_toast(adw::Toast::new("Draft saved"));
+                                        app_refresh_inner.refresh_if_viewing_drafts();
                                     }
                                     Ok(None) => {
                                         eprintln!("[draft] Saved (no uid returned)");
                                         *draft_state_cb.borrow_mut() = None;
-                                        draft_label_inner.set_label("Saved as Draft");
+                                        toast_inner.add_toast(adw::Toast::new("Draft saved"));
+                                        app_refresh_inner.refresh_if_viewing_drafts();
                                     }
                                     Err(e) => {
                                         eprintln!("[draft] Save FAILED: {}", e);
-                                        draft_label_inner.set_label("Save failed");
+                                        toast_inner.add_toast(adw::Toast::new("Failed to save draft"));
                                     }
                                 }
                             });
                         });
                     } else {
                         let app_save = app.clone();
-                        let draft_label_cb = draft_label_timer.clone();
+                        let app_refresh = app.clone();
+                        let toast_cb = toast_overlay_timer.clone();
                         eprintln!("[draft] Calling save_draft for account {}", account_index);
                         app_save.save_draft(account_index, msg, move |result| {
                             save_in_progress_cb.set(false);
@@ -1554,23 +1742,23 @@ impl NorthMailWindow {
                                 Ok(Some(uid)) => {
                                     eprintln!("[draft] Saved! uid={}", uid);
                                     *draft_state_cb.borrow_mut() = Some((account_index, uid));
-                                    draft_label_cb.set_label("Saved as Draft");
+                                    toast_cb.add_toast(adw::Toast::new("Draft saved"));
+                                    app_refresh.refresh_if_viewing_drafts();
                                 }
                                 Ok(None) => {
                                     eprintln!("[draft] Saved (no uid returned)");
                                     *draft_state_cb.borrow_mut() = None;
-                                    draft_label_cb.set_label("Saved as Draft");
+                                    toast_cb.add_toast(adw::Toast::new("Draft saved"));
+                                    app_refresh.refresh_if_viewing_drafts();
                                 }
                                 Err(e) => {
                                     eprintln!("[draft] Save FAILED: {}", e);
-                                    draft_label_cb.set_label("Save failed");
+                                    toast_cb.add_toast(adw::Toast::new("Failed to save draft"));
                                 }
                             }
                         });
                     }
                 });
-
-                timer_source.set(Some(source_id));
             }
         };
 
@@ -1638,11 +1826,13 @@ impl NorthMailWindow {
         let send_btn_ref = send_button.clone();
         let was_sent_send = was_sent.clone();
         let draft_state_send = draft_state.clone();
-        let timer_source_send = timer_source.clone();
+        let timer_generation_send = timer_generation.clone();
         let attachments_send = attachments.clone();
+        let bcc_chips_send = bcc_chips.clone();
         send_button.connect_clicked(move |_| {
             let to_list = to_chips.borrow().clone();
             let cc_list = cc_chips.borrow().clone();
+            let bcc_list = bcc_chips_send.borrow().clone();
             let subject = subject_entry.text().to_string();
             let body = {
                 let buf = text_view.buffer();
@@ -1666,10 +1856,8 @@ impl NorthMailWindow {
 
             let account_index = from_dropdown.selected();
 
-            // Cancel auto-save timer
-            if let Some(source_id) = timer_source_send.take() {
-                source_id.remove();
-            }
+            // Invalidate any pending auto-save timer
+            timer_generation_send.set(timer_generation_send.get().wrapping_add(1));
 
             send_btn_ref.set_sensitive(false);
             send_btn_ref.set_label("Sending…");
@@ -1686,6 +1874,7 @@ impl NorthMailWindow {
                         account_index,
                         to_list,
                         cc_list,
+                        bcc_list,
                         subject,
                         body,
                         att_list,
@@ -1722,12 +1911,10 @@ impl NorthMailWindow {
         let main_window_close = self.clone();
         let was_sent_close = was_sent;
         let draft_state_close = draft_state;
-        let timer_source_close = timer_source;
+        let timer_generation_close = timer_generation;
         compose_window.connect_close_request(move |win| {
-            // Cancel any pending auto-save timer
-            if let Some(source_id) = timer_source_close.take() {
-                source_id.remove();
-            }
+            // Invalidate any pending auto-save timer
+            timer_generation_close.set(timer_generation_close.get().wrapping_add(1));
 
             // If already sent, just close
             if was_sent_close.get() {
@@ -1836,20 +2023,23 @@ impl NorthMailWindow {
             .css_classes(["dim-label", "compose-field-label"])
             .build();
 
-        // FlowBox wraps chips + entry to the next line when space runs out.
-        // Wrapped in a ScrolledWindow (no horizontal scroll) to constrain
-        // width so the FlowBox actually triggers line wrapping.
-        let chip_flow = gtk4::FlowBox::builder()
-            .selection_mode(gtk4::SelectionMode::None)
-            .homogeneous(false)
-            .max_children_per_line(100)
-            .min_children_per_line(1)
+        // Content box holds chips + entry. Entry is outside FlowBox so it can expand.
+        let content_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(0) // No spacing - chips have their own margin
             .hexpand(true)
-            .row_spacing(4)
-            .column_spacing(4)
             .build();
 
-        // Inline entry (no frame, blends into the row)
+        // Box for chips - use regular Box instead of FlowBox for proper sizing
+        let chip_flow = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(4)
+            .hexpand(false) // Don't expand - only take natural size
+            .valign(gtk4::Align::Center)
+            .margin_end(4) // Space between chips and entry
+            .build();
+
+        // Inline entry (no frame, blends into the row) - OUTSIDE FlowBox so it expands
         let entry = gtk4::Entry::builder()
             .hexpand(true)
             .has_frame(false)
@@ -1857,17 +2047,14 @@ impl NorthMailWindow {
             .css_classes(["compose-entry"])
             .build();
 
-        chip_flow.append(&entry);
+        // Start hidden - will show when first chip is added
+        chip_flow.set_visible(false);
 
-        let chip_scroll = gtk4::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk4::PolicyType::Never)
-            .vscrollbar_policy(gtk4::PolicyType::Never)
-            .hexpand(true)
-            .child(&chip_flow)
-            .build();
+        content_box.append(&chip_flow);
+        content_box.append(&entry);
 
         row.append(&label);
-        row.append(&chip_scroll);
+        row.append(&content_box);
 
         // Autocomplete popover — appears directly below the entry
         let popover = gtk4::Popover::builder()
@@ -1910,6 +2097,7 @@ impl NorthMailWindow {
                     .orientation(gtk4::Orientation::Horizontal)
                     .spacing(2)
                     .css_classes(["compose-chip"])
+                    .tooltip_text(email) // Show email on hover
                     .build();
 
                 let chip_label = gtk4::Label::builder()
@@ -1927,27 +2115,22 @@ impl NorthMailWindow {
                 chip.append(&chip_label);
                 chip.append(&remove_btn);
 
-                // Count children to find position before the entry (which is always last)
-                let mut count = 0;
-                let mut child = chip_flow.first_child();
-                while let Some(c) = child {
-                    count += 1;
-                    child = c.next_sibling();
-                }
-                // Insert chip before the entry's FlowBoxChild (entry is at position count-1)
-                chip_flow.insert(&chip, count as i32 - 1);
+                // Append chip to chip box
+                chip_flow.append(&chip);
+                chip_flow.set_visible(true); // Show chip box when chips exist
 
-                // Remove handler — remove the FlowBoxChild wrapper
-                let chip_flow_ref = chip_flow.clone();
+                // Remove handler — remove chip directly from Box
+                let chip_box_ref = chip_flow.clone();
                 let chips_ref = chips.clone();
                 let email_owned = email.to_string();
                 let chip_ref = chip.clone();
                 remove_btn.connect_clicked(move |_| {
-                    // chip_ref's parent is the FlowBoxChild wrapper
-                    if let Some(flow_child) = chip_ref.parent() {
-                        chip_flow_ref.remove(&flow_child);
-                    }
+                    chip_box_ref.remove(&chip_ref);
                     chips_ref.borrow_mut().retain(|e| e != &email_owned);
+                    // Hide chip box if no more chips
+                    if chip_box_ref.first_child().is_none() {
+                        chip_box_ref.set_visible(false);
+                    }
                 });
 
                 entry.set_text("");
@@ -1988,7 +2171,8 @@ impl NorthMailWindow {
         // Instant autocomplete — filter preloaded contacts on every keystroke
         let window_clone = window.clone();
         let popover_change = popover.clone();
-        let suggestion_list_ref = suggestion_list;
+        let suggestion_list_ref = suggestion_list.clone();
+        let suggestion_list_key = suggestion_list; // For key handler below
         entry.connect_changed(move |entry| {
             let text = entry.text().to_string();
 
@@ -2054,6 +2238,78 @@ impl NorthMailWindow {
                 popover_cb.popup();
             });
         });
+
+        // Keyboard navigation for suggestions (Down/Up/Enter/Escape)
+        // Use CAPTURE phase so we process before entry's default activate
+        let key_controller = gtk4::EventControllerKey::new();
+        key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let popover_key = popover.clone();
+        let list_key = suggestion_list_key;
+        let add_chip_key = add_chip.clone();
+        let entry_key = entry.clone();
+        key_controller.connect_key_pressed(move |_, keyval, _, _| {
+            use gtk4::gdk::Key;
+
+            if !popover_key.is_visible() {
+                return gtk4::glib::Propagation::Proceed;
+            }
+
+            match keyval {
+                k if k == Key::Down => {
+                    // Move selection down (or select first if none selected)
+                    let selected = list_key.selected_row();
+                    if let Some(row) = selected {
+                        let idx = row.index();
+                        if let Some(next) = list_key.row_at_index(idx + 1) {
+                            list_key.select_row(Some(&next));
+                        }
+                    } else if let Some(first) = list_key.row_at_index(0) {
+                        list_key.select_row(Some(&first));
+                    }
+                    gtk4::glib::Propagation::Stop
+                }
+                k if k == Key::Up => {
+                    // Move selection up
+                    if let Some(row) = list_key.selected_row() {
+                        let idx = row.index();
+                        if idx > 0 {
+                            if let Some(prev) = list_key.row_at_index(idx - 1) {
+                                list_key.select_row(Some(&prev));
+                            }
+                        } else {
+                            // At top, deselect and stay in entry
+                            list_key.unselect_all();
+                        }
+                    }
+                    gtk4::glib::Propagation::Stop
+                }
+                k if k == Key::Return || k == Key::KP_Enter => {
+                    // If a row is selected, activate it
+                    if let Some(row) = list_key.selected_row() {
+                        if let Some(tooltip) = row.tooltip_text() {
+                            let parts: Vec<&str> = tooltip.splitn(2, '\t').collect();
+                            if parts.len() == 2 {
+                                add_chip_key(parts[0], parts[1]);
+                            } else {
+                                add_chip_key("", &tooltip);
+                            }
+                        }
+                        popover_key.popdown();
+                        entry_key.set_text("");
+                        return gtk4::glib::Propagation::Stop;
+                    }
+                    gtk4::glib::Propagation::Proceed
+                }
+                k if k == Key::Escape => {
+                    // Close popover and deselect
+                    list_key.unselect_all();
+                    popover_key.popdown();
+                    gtk4::glib::Propagation::Stop
+                }
+                _ => gtk4::glib::Propagation::Proceed,
+            }
+        });
+        entry.add_controller(key_controller);
 
         (row, add_chip_return)
     }
@@ -2210,6 +2466,11 @@ impl NorthMailWindow {
     /// Get the message view widget
     pub fn message_view(&self) -> Option<&MessageView> {
         self.imp().message_view.get()
+    }
+
+    /// Clear the currently displayed message tracking (called when switching folders)
+    pub fn clear_current_message(&self) {
+        *self.imp().current_message_uid.borrow_mut() = None;
     }
 
     /// Show loading spinner in the message list area

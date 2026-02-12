@@ -1037,6 +1037,7 @@ pub struct MessageInfo {
     pub folder_id: i64,
     pub subject: String,
     pub from: String,
+    pub from_address: String,
     pub to: String,
     pub date: String,
     pub date_epoch: Option<i64>,
@@ -1058,6 +1059,7 @@ impl From<&northmail_core::models::DbMessage> for MessageInfo {
                 .clone()
                 .or_else(|| db_msg.from_address.clone())
                 .unwrap_or_else(|| "Unknown".to_string()),
+            from_address: db_msg.from_address.clone().unwrap_or_default(),
             to: db_msg.to_addresses.clone().unwrap_or_default(),
             date: db_msg.date_sent.clone().unwrap_or_default(),
             date_epoch: db_msg.date_epoch,

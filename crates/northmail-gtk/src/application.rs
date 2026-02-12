@@ -337,6 +337,8 @@ mod imp {
         pub(super) cache_offset: std::cell::Cell<i64>,
         /// Current folder ID in the database (for cache-based pagination)
         pub(super) cache_folder_id: std::cell::Cell<i64>,
+        /// Current folder type (inbox, drafts, sent, etc.) for UI behavior
+        pub(super) current_folder_type: RefCell<String>,
         /// Cached contacts from EDS (preloaded at startup)
         pub(super) contacts_cache: RefCell<Vec<(String, String)>>,
     }
@@ -492,6 +494,27 @@ impl NorthMailApplication {
     /// Get the current cache folder ID
     pub fn cache_folder_id(&self) -> i64 {
         self.imp().cache_folder_id.get()
+    }
+
+    /// Get the current folder type (inbox, drafts, sent, etc.)
+    pub fn current_folder_type(&self) -> String {
+        self.imp().current_folder_type.borrow().clone()
+    }
+
+    /// Refresh the current folder if we're viewing drafts
+    /// Called after saving a draft to update the message list
+    pub fn refresh_if_viewing_drafts(&self) {
+        if self.current_folder_type() != "drafts" {
+            return;
+        }
+        // Get current folder info from state
+        let state = self.imp().state.borrow();
+        if let Some((account_id, folder_path)) = &state.last_folder {
+            let account_id = account_id.clone();
+            let folder_path = folder_path.clone();
+            drop(state); // Release borrow before calling fetch_folder
+            self.fetch_folder(&account_id, &folder_path);
+        }
     }
 
     /// Set the cache offset
@@ -714,6 +737,26 @@ impl NorthMailApplication {
         }
     }
 
+    /// Guess folder type from path (inbox, sent, drafts, trash, spam, archive, other)
+    fn guess_folder_type(folder_path: &str) -> String {
+        let lower = folder_path.to_lowercase();
+        if lower == "inbox" {
+            "inbox".to_string()
+        } else if lower.contains("sent") {
+            "sent".to_string()
+        } else if lower.contains("draft") {
+            "drafts".to_string()
+        } else if lower.contains("trash") || lower.contains("deleted") {
+            "trash".to_string()
+        } else if lower.contains("spam") || lower.contains("junk") {
+            "spam".to_string()
+        } else if lower.contains("archive") || lower.contains("all mail") {
+            "archive".to_string()
+        } else {
+            "other".to_string()
+        }
+    }
+
     /// Restore last selected folder on startup
     fn restore_last_folder(&self) {
         // Load saved state
@@ -897,6 +940,7 @@ impl NorthMailApplication {
         let cached_folders: Option<Vec<(String, String, String)>> = if let Some(db) = self.database() {
             let db = db.clone();
             let acct_id = account_id.to_string();
+            let email_for_log = account.email.clone();
             let (sender, receiver) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
@@ -905,17 +949,30 @@ impl NorthMailApplication {
                 });
                 let _ = sender.send(result);
             });
-            match receiver.recv_timeout(std::time::Duration::from_secs(2)) {
-                Ok(Ok(folders)) if folders.len() > 1 => {
-                    let cached: Vec<(String, String, String)> = folders
-                        .iter()
-                        .map(|f| (f.full_path.clone(), f.name.clone(), f.folder_type.clone()))
-                        .collect();
-                    info!("Using {} cached folders for {}, skipping list_folders()", cached.len(), account.email);
-                    Some(cached)
+            // Non-blocking polling to avoid freezing UI
+            let start = std::time::Instant::now();
+            let timeout = std::time::Duration::from_secs(2);
+            let mut result = None;
+            loop {
+                match receiver.try_recv() {
+                    Ok(Ok(folders)) if folders.len() > 1 => {
+                        let cached: Vec<(String, String, String)> = folders
+                            .iter()
+                            .map(|f| (f.full_path.clone(), f.name.clone(), f.folder_type.clone()))
+                            .collect();
+                        info!("Using {} cached folders for {}, skipping list_folders()", cached.len(), email_for_log);
+                        result = Some(cached);
+                        break;
+                    }
+                    Ok(_) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        if start.elapsed() > timeout { break; }
+                        glib::timeout_future(std::time::Duration::from_millis(5)).await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                 }
-                _ => None,
             }
+            result
         } else {
             None
         };
@@ -1027,14 +1084,26 @@ impl NorthMailApplication {
                         let _ = sender.send(result);
                     });
 
-                    // Wait for DB writes (short timeout)
+                    // Wait for DB writes (non-blocking polling)
+                    let start = std::time::Instant::now();
                     let timeout = std::time::Duration::from_secs(3);
-                    match receiver.recv_timeout(timeout) {
-                        Ok(_) => {
-                            info!("Saved {} folders for {}", folder_count, account.email);
-                        }
-                        Err(_) => {
-                            warn!("Timed out saving folders for {}", account.email);
+                    loop {
+                        match receiver.try_recv() {
+                            Ok(_) => {
+                                info!("Saved {} folders for {}", folder_count, account.email);
+                                break;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                if start.elapsed() > timeout {
+                                    warn!("Timed out saving folders for {}", account.email);
+                                    break;
+                                }
+                                glib::timeout_future(std::time::Duration::from_millis(5)).await;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                warn!("Channel disconnected saving folders for {}", account.email);
+                                break;
+                            }
                         }
                     }
                 }
@@ -1520,38 +1589,48 @@ impl NorthMailApplication {
             let _ = sender.send(result);
         });
 
-        // Wait for result with timeout
+        // Non-blocking poll with yield to GTK main loop
+        let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(2);
-        match receiver.recv_timeout(timeout) {
-            Ok(Ok((folder_id, messages))) => {
-                if messages.is_empty() {
-                    info!("📭 Cache MISS: No cached messages for {}/{}", account_id, folder_path);
-                    None
-                } else {
-                    info!(
-                        "📬 Cache HIT: Loaded {} cached messages for {}/{}",
-                        messages.len(),
-                        account_id,
-                        folder_path
-                    );
-                    let message_infos: Vec<MessageInfo> =
-                        messages.iter().map(MessageInfo::from).collect();
-                    Some((folder_id, message_infos))
+        loop {
+            match receiver.try_recv() {
+                Ok(Ok((folder_id, messages))) => {
+                    if messages.is_empty() {
+                        info!("📭 Cache MISS: No cached messages for {}/{}", account_id, folder_path);
+                        return None;
+                    } else {
+                        info!(
+                            "📬 Cache HIT: Loaded {} cached messages for {}/{}",
+                            messages.len(),
+                            account_id,
+                            folder_path
+                        );
+                        let message_infos: Vec<MessageInfo> =
+                            messages.iter().map(MessageInfo::from).collect();
+                        return Some((folder_id, message_infos));
+                    }
                 }
-            }
-            Ok(Err(e)) => {
-                warn!("Failed to load cached messages: {}", e);
-                None
-            }
-            Err(_) => {
-                warn!("Cache load timed out");
-                None
+                Ok(Err(e)) => {
+                    warn!("Failed to load cached messages: {}", e);
+                    return None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if start.elapsed() > timeout {
+                        warn!("Cache load timed out");
+                        return None;
+                    }
+                    glib::timeout_future(std::time::Duration::from_millis(5)).await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    warn!("Cache load thread disconnected");
+                    return None;
+                }
             }
         }
     }
 
     /// Check if cache has more messages beyond what's loaded
-    fn check_cache_has_more(&self, folder_id: i64, loaded_count: i64) -> bool {
+    async fn check_cache_has_more(&self, folder_id: i64, loaded_count: i64) -> bool {
         let db = match self.database() {
             Some(db) => db.clone(),
             None => return false,
@@ -1568,12 +1647,24 @@ impl NorthMailApplication {
             let _ = sender.send(result);
         });
 
-        match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
-            Ok(Ok(total)) => {
-                debug!("Cache has {} total messages, loaded {}", total, loaded_count);
-                total > loaded_count
+        // Non-blocking poll with yield to GTK main loop
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(500);
+        loop {
+            match receiver.try_recv() {
+                Ok(Ok(total)) => {
+                    debug!("Cache has {} total messages, loaded {}", total, loaded_count);
+                    return total > loaded_count;
+                }
+                Ok(Err(_)) => return false,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if start.elapsed() > timeout {
+                        return false;
+                    }
+                    glib::timeout_future(std::time::Duration::from_millis(5)).await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
             }
-            _ => false,
         }
     }
 
@@ -1735,8 +1826,8 @@ impl NorthMailApplication {
                             uid: msg.uid as i64,
                             message_id: None,
                             subject: Some(msg.subject.clone()),
-                            from_address: Some(msg.from.clone()),
-                            from_name: None,
+                            from_address: Some(msg.from_address.clone()),
+                            from_name: Some(msg.from.clone()),
                             to_addresses: None,
                             date_sent: Some(msg.date.clone()),
                             date_epoch: msg.date_epoch,
@@ -1810,12 +1901,18 @@ impl NorthMailApplication {
         // Save state to disk
         self.imp().state.borrow().save();
 
+        // Track folder type for UI behavior (e.g., show Edit button for drafts)
+        let folder_type = Self::guess_folder_type(&folder_path);
+        *self.imp().current_folder_type.borrow_mut() = folder_type;
+
         // Highlight the selected folder in the sidebar and update window title
         if let Some(window) = self.active_window() {
             if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
                 if let Some(sidebar) = win.folder_sidebar() {
                     sidebar.select_folder(&account_id, &folder_path);
                 }
+                // Clear tracked message when switching folders
+                win.clear_current_message();
             }
             // Update window title with friendly folder name
             let folder_name = Self::friendly_folder_name(&folder_path);
@@ -1882,7 +1979,7 @@ impl NorthMailApplication {
                             });
 
                             // Check if there are more messages in cache
-                            let has_more = app.check_cache_has_more(folder_id, loaded_count);
+                            let has_more = app.check_cache_has_more(folder_id, loaded_count).await;
                             message_list.set_can_load_more(has_more);
                         }
                     }
@@ -1913,14 +2010,26 @@ impl NorthMailApplication {
                             let result = rt.block_on(db.get_min_uid(cache_fid));
                             let _ = s.send(result);
                         });
-                        match r.recv_timeout(std::time::Duration::from_secs(1)) {
-                            Ok(Ok(uid)) => {
-                                if uid.is_some() {
-                                    info!("Resume sync: min_cached_uid={:?} for {}/{}", uid, account_email, folder_path);
+                        // Non-blocking poll
+                        let start = std::time::Instant::now();
+                        let timeout = std::time::Duration::from_millis(500);
+                        loop {
+                            match r.try_recv() {
+                                Ok(Ok(uid)) => {
+                                    if uid.is_some() {
+                                        info!("Resume sync: min_cached_uid={:?} for {}/{}", uid, account_email, folder_path);
+                                    }
+                                    break uid;
                                 }
-                                uid
+                                Ok(Err(_)) => break None,
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                    if start.elapsed() > timeout {
+                                        break None;
+                                    }
+                                    glib::timeout_future(std::time::Duration::from_millis(5)).await;
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => break None,
                             }
-                            _ => None,
                         }
                     } else {
                         None
@@ -2728,8 +2837,24 @@ impl NorthMailApplication {
                                                         let result = rt.block_on(db.get_or_create_folder_id(&aid, &fp));
                                                         let _ = s.send(result);
                                                     });
-                                                    if let Ok(Ok(fid)) = r.recv_timeout(std::time::Duration::from_secs(1)) {
-                                                        app.imp().cache_folder_id.set(fid);
+                                                    // Non-blocking poll
+                                                    let start = std::time::Instant::now();
+                                                    let timeout = std::time::Duration::from_millis(500);
+                                                    loop {
+                                                        match r.try_recv() {
+                                                            Ok(Ok(fid)) => {
+                                                                app.imp().cache_folder_id.set(fid);
+                                                                break;
+                                                            }
+                                                            Ok(Err(_)) => break,
+                                                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                                                if start.elapsed() > timeout {
+                                                                    break;
+                                                                }
+                                                                glib::timeout_future(std::time::Duration::from_millis(5)).await;
+                                                            }
+                                                            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                                                        }
                                                     }
                                                 }
                                             }
@@ -2855,8 +2980,24 @@ impl NorthMailApplication {
                                 let result = rt.block_on(db.get_or_create_folder_id(&aid, &fp));
                                 let _ = sender.send(result);
                             });
-                            if let Ok(Ok(fid)) = receiver.recv_timeout(std::time::Duration::from_secs(1)) {
-                                app.imp().cache_folder_id.set(fid);
+                            // Non-blocking poll
+                            let start = std::time::Instant::now();
+                            let timeout = std::time::Duration::from_millis(500);
+                            loop {
+                                match receiver.try_recv() {
+                                    Ok(Ok(fid)) => {
+                                        app.imp().cache_folder_id.set(fid);
+                                        break;
+                                    }
+                                    Ok(Err(_)) => break,
+                                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                        if start.elapsed() > timeout {
+                                            break;
+                                        }
+                                        glib::timeout_future(std::time::Duration::from_millis(5)).await;
+                                    }
+                                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                                }
                             }
                         }
 
@@ -2864,7 +3005,7 @@ impl NorthMailApplication {
                         let cache_folder_id = app.imp().cache_folder_id.get();
                         let cache_offset = app.imp().cache_offset.get();
                         if cache_folder_id > 0 {
-                            let has_more = app.check_cache_has_more(cache_folder_id, cache_offset);
+                            let has_more = app.check_cache_has_more(cache_folder_id, cache_offset).await;
                             if let Some(window) = app.active_window() {
                                 if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
                                     if let Some(message_list) = win.message_list() {
@@ -2926,7 +3067,7 @@ impl NorthMailApplication {
                         let cache_folder_id = app.imp().cache_folder_id.get();
                         let cache_offset = app.imp().cache_offset.get();
                         if cache_folder_id > 0 {
-                            let has_more = app.check_cache_has_more(cache_folder_id, cache_offset);
+                            let has_more = app.check_cache_has_more(cache_folder_id, cache_offset).await;
                             if let Some(window) = app.active_window() {
                                 if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
                                     if let Some(message_list) = win.message_list() {
@@ -3188,6 +3329,7 @@ impl NorthMailApplication {
                             }
                         })
                         .unwrap_or_default(),
+                    from_address: h.envelope.from.first().map(|a| a.address.clone()).unwrap_or_default(),
                     to: h.envelope.to.iter()
                         .map(|a| {
                             if let Some(name) = &a.name {
@@ -3244,6 +3386,9 @@ impl NorthMailApplication {
             state.last_folder = None;
             state.save();
         }
+
+        // Track folder type as inbox for unified inbox
+        *self.imp().current_folder_type.borrow_mut() = "inbox".to_string();
 
         // Update window title
         if let Some(window) = self.active_window() {
@@ -4715,6 +4860,7 @@ impl NorthMailApplication {
         account_index: u32,
         to: Vec<String>,
         cc: Vec<String>,
+        bcc: Vec<String>,
         subject: String,
         body: String,
         attachments: Vec<(String, String, Vec<u8>)>, // (filename, mime_type, data)
@@ -4753,7 +4899,7 @@ impl NorthMailApplication {
         };
 
         eprintln!("[send] account: {} ({}) smtp: {} auth: {:?}", email, account.provider_type, smtp_host, auth_type);
-        eprintln!("[send] to: {:?}, cc: {:?}, subject: {:?}", to, cc, subject);
+        eprintln!("[send] to: {:?}, cc: {:?}, bcc: {:?}, subject: {:?}", to, cc, bcc, subject);
         if let Some(ref name) = from_name {
             eprintln!("[send] from_name: {:?}", name);
         }
@@ -4768,6 +4914,9 @@ impl NorthMailApplication {
         }
         for addr in &cc {
             msg = msg.cc(addr);
+        }
+        for addr in &bcc {
+            msg = msg.bcc(addr);
         }
         msg = msg.text(&body);
         for (filename, mime_type, data) in attachments {
