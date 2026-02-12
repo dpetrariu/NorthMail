@@ -1104,13 +1104,18 @@ impl NorthMailWindow {
         let css_provider = gtk4::CssProvider::new();
         css_provider.load_from_string(
             "
-            .compose-entry { background: transparent; border: none; outline: none; box-shadow: none; min-height: 28px; }
+            .compose-fields { background: @view_bg_color; }
+            .compose-entry { background: transparent; border: none; outline: none; box-shadow: none; min-height: 20px; padding: 0; margin: 0; }
             .compose-entry:focus { background: transparent; border: none; outline: none; box-shadow: none; }
-            .compose-entry > text { background: transparent; border: none; outline: none; box-shadow: none; }
-            .compose-chip { background: alpha(currentColor, 0.08); border-radius: 10px; padding: 0px 2px 0px 8px; margin: 0; }
-            .compose-chip label { font-size: 0.85em; margin: 0; padding: 0; }
-            .compose-chip button { min-width: 16px; min-height: 16px; padding: 0; margin: 0; }
-            .compose-field-label { font-size: 0.9em; min-width: 52px; }
+            .compose-entry > text { background: transparent; border: none; outline: none; box-shadow: none; padding: 0; margin: 0; }
+            .compose-chip { background: @accent_bg_color; border-radius: 8px; padding: 0 0 0 6px; margin: 0; min-height: 0; }
+            .compose-chip label { font-size: 0.9em; margin: 0; padding: 2px 0; color: @accent_fg_color; }
+            .chip-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0 2px 0 4px; -gtk-icon-size: 12px; }
+            .chip-close image { color: white; -gtk-icon-style: symbolic; }
+            .chip-close:hover { background: alpha(white, 0.2); border-radius: 4px; }
+            .compose-field-label { font-size: 0.9em; min-width: 52px; color: alpha(@view_fg_color, 0.55); }
+            .compose-separator { background: alpha(@view_fg_color, 0.15); min-height: 1px; }
+            .compose-body { background: @view_bg_color; }
             .attachment-pill { background: alpha(currentColor, 0.1); border-radius: 6px; padding: 1px 2px 1px 5px; }
             .attachment-pill:hover { background: alpha(currentColor, 0.15); }
             .attachment-pill label { font-size: 0.8em; }
@@ -1193,8 +1198,7 @@ impl NorthMailWindow {
         let fields_box = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
             .spacing(0)
-            .margin_start(12)
-            .margin_end(12)
+            .css_classes(["compose-fields"])
             .build();
 
         // Label width for alignment
@@ -1208,9 +1212,10 @@ impl NorthMailWindow {
         let bcc_chips: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
             std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
 
-        let (to_row, to_add_chip) = Self::build_chip_row("To", to_chips.clone(), self, label_width);
-        let (cc_row, cc_add_chip) = Self::build_chip_row("Cc", cc_chips.clone(), self, label_width);
-        let (bcc_row, _bcc_add_chip) = Self::build_chip_row("Bcc", bcc_chips.clone(), self, label_width);
+        let all_chips = vec![to_chips.clone(), cc_chips.clone(), bcc_chips.clone()];
+        let (to_row, to_add_chip) = Self::build_chip_row("To", to_chips.clone(), all_chips.clone(), self, label_width);
+        let (cc_row, cc_add_chip) = Self::build_chip_row("Cc", cc_chips.clone(), all_chips.clone(), self, label_width);
+        let (bcc_row, _bcc_add_chip) = Self::build_chip_row("Bcc", bcc_chips.clone(), all_chips.clone(), self, label_width);
 
         // Bcc row starts hidden
         bcc_row.set_visible(false);
@@ -1228,21 +1233,39 @@ impl NorthMailWindow {
         // Add Bcc button to Cc row
         cc_row.append(&bcc_button);
 
-        // Wire Bcc button click
+        let separator1 = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        separator1.add_css_class("compose-separator");
+        separator1.set_margin_start(12);
+        separator1.set_margin_end(12);
+
+        // Separator between Cc and Bcc (hidden initially, shown with Bcc)
+        let separator2 = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        separator2.add_css_class("compose-separator");
+        separator2.set_margin_start(12);
+        separator2.set_margin_end(12);
+        separator2.set_visible(false);
+
+        // Separator before Subject (always visible - between Cc/Bcc and Subject)
+        bcc_separator.add_css_class("compose-separator");
+        bcc_separator.set_margin_start(12);
+        bcc_separator.set_margin_end(12);
+        bcc_separator.set_visible(true); // Always visible
+
+        // Wire Bcc button click (after separators created so we can reference separator2)
         {
             let bcc_row_ref = bcc_row.clone();
-            let bcc_separator_ref = bcc_separator.clone();
+            let separator2_ref = separator2.clone();
             bcc_button.connect_clicked(move |btn| {
                 btn.set_visible(false);
                 bcc_row_ref.set_visible(true);
-                bcc_separator_ref.set_visible(true);
+                separator2_ref.set_visible(true);
             });
         }
 
         fields_box.append(&to_row);
-        fields_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+        fields_box.append(&separator1);
         fields_box.append(&cc_row);
-        fields_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+        fields_box.append(&separator2);
         fields_box.append(&bcc_row);
         fields_box.append(&bcc_separator);
 
@@ -1250,8 +1273,10 @@ impl NorthMailWindow {
         let subject_box = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
             .spacing(6)
-            .margin_top(6)
-            .margin_bottom(6)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(4)
+            .margin_bottom(4)
             .build();
 
         let subject_label = gtk4::Label::builder()
@@ -1281,8 +1306,6 @@ impl NorthMailWindow {
         fields_box.append(&subject_box);
 
         content.append(&fields_box);
-        // Full-width separator below subject (outside fields_box margins)
-        content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
         // Attachments storage (UI added at bottom after body)
         let attachments: std::rc::Rc<std::cell::RefCell<Vec<(String, String, Vec<u8>, Option<std::path::PathBuf>)>>> =
@@ -1302,6 +1325,7 @@ impl NorthMailWindow {
         let text_scrolled = gtk4::ScrolledWindow::builder()
             .child(&text_view)
             .vexpand(true)
+            .css_classes(["compose-body"])
             .build();
 
         // Attachments bar - compact horizontal row at bottom
@@ -2005,12 +2029,15 @@ impl NorthMailWindow {
     fn build_chip_row(
         label_text: &str,
         chips: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        all_chips: Vec<std::rc::Rc<std::cell::RefCell<Vec<String>>>>,
         window: &NorthMailWindow,
         label_width: i32,
     ) -> (gtk4::Box, Rc<dyn Fn(&str, &str)>) {
         let row = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
             .spacing(6)
+            .margin_start(12)
+            .margin_end(12)
             .margin_top(4)
             .margin_bottom(4)
             .build();
@@ -2082,8 +2109,19 @@ impl NorthMailWindow {
         let add_chip: Rc<dyn Fn(&str, &str)> = {
             let chip_flow = chip_flow.clone();
             let chips = chips.clone();
+            let all_chips = all_chips.clone();
             let entry = entry.clone();
             Rc::new(move |display: &str, email: &str| {
+                // Check for duplicates across all recipient lists (To, Cc, Bcc)
+                let email_lower = email.to_lowercase();
+                for chip_list in &all_chips {
+                    if chip_list.borrow().iter().any(|e| e.to_lowercase() == email_lower) {
+                        // Already exists, just clear entry and return
+                        entry.set_text("");
+                        return;
+                    }
+                }
+
                 // Show just the name in the chip (or email if no name)
                 let chip_text = if display.is_empty() || display == email {
                     email.to_string()
@@ -2108,7 +2146,7 @@ impl NorthMailWindow {
 
                 let remove_btn = gtk4::Button::builder()
                     .icon_name("window-close-symbolic")
-                    .css_classes(["flat", "circular"])
+                    .css_classes(["flat", "chip-close"])
                     .valign(gtk4::Align::Center)
                     .build();
 
