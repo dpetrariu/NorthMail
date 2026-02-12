@@ -519,15 +519,19 @@ impl ImapPool {
             return;
         }
 
-        // Expunge to permanently remove from source
-        debug!("handle_move_message: expunging");
-        if let Err(e) = client.expunge().await {
-            error!("handle_move_message: failed to expunge: {}", e);
-            let _ = response_tx.send(ImapResponse::Error(format!(
-                "Failed to expunge: {}",
-                e
-            )));
-            return;
+        // Expunge to permanently remove from source (use UID EXPUNGE for reliability)
+        debug!("handle_move_message: uid_expunge uid {}", uid);
+        if let Err(e) = client.uid_expunge(uid).await {
+            // Fall back to regular EXPUNGE if UID EXPUNGE not supported
+            debug!("handle_move_message: uid_expunge failed, trying regular expunge: {}", e);
+            if let Err(e2) = client.expunge().await {
+                error!("handle_move_message: failed to expunge: {}", e2);
+                let _ = response_tx.send(ImapResponse::Error(format!(
+                    "Failed to expunge: {}",
+                    e2
+                )));
+                return;
+            }
         }
 
         info!("handle_move_message: moved uid {} from {} to {}", uid, source_folder, dest_folder);

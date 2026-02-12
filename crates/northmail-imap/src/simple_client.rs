@@ -483,6 +483,18 @@ impl SimpleImapClient {
                     envelope.from = addrs;
                 }
             }
+            // To is the 6th element (index 5) - ENVELOPE format: (date subject from sender reply-to to ...)
+            if let Some(to_str) = parts.get(5) {
+                if let Some(addrs) = Self::parse_address_list_from_envelope(to_str) {
+                    envelope.to = addrs;
+                }
+            }
+            // CC is the 7th element (index 6)
+            if let Some(cc_str) = parts.get(6) {
+                if let Some(addrs) = Self::parse_address_list_from_envelope(cc_str) {
+                    envelope.cc = addrs;
+                }
+            }
         }
 
         envelope
@@ -1427,6 +1439,46 @@ impl SimpleImapClient {
                 if !line.contains("OK") {
                     return Err(ImapError::ServerError(format!(
                         "EXPUNGE failed: {}",
+                        line.trim()
+                    )));
+                }
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// UID EXPUNGE - expunge only the specified UID (requires UIDPLUS extension)
+    /// This is more reliable than EXPUNGE for Gmail and other servers
+    pub async fn uid_expunge(&mut self, uid: u32) -> ImapResult<()> {
+        let tag = self.next_tag();
+        let cmd = format!("{} UID EXPUNGE {}\r\n", tag, uid);
+
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or(ImapError::NotConnected)?;
+
+        stream
+            .get_mut()
+            .write_all(cmd.as_bytes())
+            .await
+            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+        loop {
+            let mut line = String::new();
+            stream
+                .read_line(&mut line)
+                .await
+                .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+            debug!("UID EXPUNGE response: {}", line.trim());
+
+            if line.starts_with(&tag) {
+                if !line.contains("OK") {
+                    return Err(ImapError::ServerError(format!(
+                        "UID EXPUNGE failed: {}",
                         line.trim()
                     )));
                 }

@@ -153,6 +153,8 @@ mod imp {
         pub current_account_id: RefCell<String>,
         /// Current folder context for drag-and-drop (folder_path)
         pub current_folder_path: RefCell<String>,
+        /// Whether skeleton loading is currently shown
+        pub is_loading: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -316,6 +318,23 @@ impl MessageList {
             /* Row being dragged */
             .message-row.dragging {
                 background-color: alpha(@accent_bg_color, 0.1);
+            }
+            /* Skeleton loading animation */
+            @keyframes skeleton-pulse {
+                0% { opacity: 0.4; }
+                50% { opacity: 0.7; }
+                100% { opacity: 0.4; }
+            }
+            .skeleton-row {
+                animation: skeleton-pulse 1.5s ease-in-out infinite;
+            }
+            .skeleton-box {
+                background-color: alpha(@view_fg_color, 0.1);
+                border-radius: 4px;
+            }
+            .skeleton-circle {
+                background-color: alpha(@view_fg_color, 0.1);
+                border-radius: 50%;
             }
             "
         );
@@ -698,8 +717,18 @@ impl MessageList {
         )
     }
 
+    /// Clear the search query and search entry text
+    pub fn clear_search(&self) {
+        let imp = self.imp();
+        imp.search_query.replace(String::new());
+        if let Some(entry) = imp.search_entry.borrow().as_ref() {
+            entry.set_text("");
+        }
+    }
+
     /// Show or hide load more capability (with infinite scroll)
     pub fn set_can_load_more(&self, can_load: bool) {
+        tracing::info!("set_can_load_more({})", can_load);
         let imp = self.imp();
         imp.can_load_more.set(can_load);
 
@@ -752,6 +781,7 @@ impl MessageList {
 
                 if value + page_size + threshold >= upper {
                     // Near bottom - trigger load more
+                    tracing::info!("Scroll near bottom, triggering load more");
                     imp.is_loading_more.set(true);
 
                     // Show the loading spinner
@@ -766,7 +796,10 @@ impl MessageList {
 
                     // Call the load more callback
                     if let Some(callback) = imp.on_load_more.borrow().as_ref() {
+                        tracing::info!("Calling load more callback");
                         callback();
+                    } else {
+                        tracing::warn!("No load more callback set!");
                     }
                 }
             });
@@ -898,6 +931,111 @@ impl MessageList {
         true
     }
 
+    /// Show skeleton loading rows while content is being fetched
+    pub fn show_loading(&self) {
+        let imp = self.imp();
+        imp.is_loading.set(true);
+
+        let scrolled = imp.scrolled.borrow();
+        let list_box = imp.list_box.borrow();
+
+        if let (Some(scrolled), Some(list_box)) = (scrolled.as_ref(), list_box.as_ref()) {
+            // Clear existing content
+            while let Some(child) = list_box.first_child() {
+                list_box.remove(&child);
+            }
+            imp.load_more_row.replace(None);
+
+            // Add 5 skeleton rows
+            for i in 0..5 {
+                let row = self.create_skeleton_row(i);
+                list_box.append(&row);
+            }
+
+            scrolled.set_child(Some(list_box));
+        }
+    }
+
+    /// Create a single skeleton loading row
+    fn create_skeleton_row(&self, _index: usize) -> gtk4::ListBoxRow {
+        let row = gtk4::ListBoxRow::builder()
+            .selectable(false)
+            .activatable(false)
+            .build();
+        row.add_css_class("skeleton-row");
+
+        let row_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(12)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(10)
+            .margin_bottom(10)
+            .build();
+
+        // Avatar placeholder (circle)
+        let avatar = gtk4::Box::builder()
+            .width_request(36)
+            .height_request(36)
+            .valign(gtk4::Align::Start)
+            .build();
+        avatar.add_css_class("skeleton-circle");
+        row_box.append(&avatar);
+
+        // Content column
+        let content = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .spacing(6)
+            .hexpand(true)
+            .build();
+
+        // Top row: sender name and date
+        let top_row = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(8)
+            .build();
+
+        let sender = gtk4::Box::builder()
+            .width_request(120)
+            .height_request(14)
+            .valign(gtk4::Align::Center)
+            .build();
+        sender.add_css_class("skeleton-box");
+
+        let date = gtk4::Box::builder()
+            .width_request(50)
+            .height_request(12)
+            .valign(gtk4::Align::Center)
+            .halign(gtk4::Align::End)
+            .hexpand(true)
+            .build();
+        date.add_css_class("skeleton-box");
+
+        top_row.append(&sender);
+        top_row.append(&date);
+        content.append(&top_row);
+
+        // Subject line
+        let subject = gtk4::Box::builder()
+            .width_request(200)
+            .height_request(14)
+            .build();
+        subject.add_css_class("skeleton-box");
+        content.append(&subject);
+
+        // Snippet preview
+        let snippet = gtk4::Box::builder()
+            .height_request(12)
+            .hexpand(true)
+            .build();
+        snippet.add_css_class("skeleton-box");
+        content.append(&snippet);
+
+        row_box.append(&content);
+        row.set_child(Some(&row_box));
+        row
+    }
+
     /// Clear and set initial messages
     pub fn set_messages(&self, messages: Vec<MessageInfo>) {
         self.set_messages_inner(messages, false);
@@ -910,6 +1048,9 @@ impl MessageList {
 
     fn set_messages_inner(&self, messages: Vec<MessageInfo>, is_search_results: bool) {
         let imp = self.imp();
+
+        // Clear loading state
+        imp.is_loading.set(false);
 
         let scrolled = imp.scrolled.borrow();
         let list_box = imp.list_box.borrow();

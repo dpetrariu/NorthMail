@@ -21,6 +21,23 @@ fn main() {
 
     tracing::info!("Starting NorthMail");
 
+    // Set GSettings schema directory for development builds
+    // This must happen before any GSettings are accessed
+    if std::env::var("GSETTINGS_SCHEMA_DIR").is_err() {
+        if let Ok(exe) = std::env::current_exe() {
+            // Check if running from target/debug or target/release
+            if let Some(target_dir) = exe.parent() {
+                if let Some(project_root) = target_dir.parent().and_then(|p| p.parent()) {
+                    let schema_dir = project_root.join("data");
+                    if schema_dir.join("gschemas.compiled").exists() {
+                        std::env::set_var("GSETTINGS_SCHEMA_DIR", &schema_dir);
+                        tracing::debug!("Set GSETTINGS_SCHEMA_DIR to {:?}", schema_dir);
+                    }
+                }
+            }
+        }
+    }
+
     // Create and run the application
     let app = NorthMailApplication::new();
     std::process::exit(app.run().into());

@@ -28,6 +28,26 @@ fn folder_type_to_icon(folder_type: &str) -> &'static str {
     }
 }
 
+/// Format a number with thousand separators (e.g., 62208 -> "62,208")
+fn format_number(n: impl Into<i64>) -> String {
+    let n: i64 = n.into();
+    if n < 1000 {
+        return n.to_string();
+    }
+    let s = n.abs().to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    if n < 0 {
+        result.push('-');
+    }
+    result.chars().rev().collect()
+}
+
 /// Sort priority for known folder types (lower = higher in sidebar)
 fn folder_type_sort_key(folder_type: &str) -> u8 {
     match folder_type {
@@ -1596,62 +1616,130 @@ impl NorthMailApplication {
             return;
         }
 
-        // Show simple sync status (no progress bar for background sync)
-        if let Some(window) = self.active_window() {
-            if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
-                if let Some(sidebar) = win.folder_sidebar() {
-                    sidebar.show_simple_sync_status("Checking mail...");
-                }
-            }
-        }
+        let total_accounts = supported_accounts.len();
+        info!("Starting parallel sync of {} accounts", total_accounts);
 
-        glib::spawn_future_local(async move {
-            for account in supported_accounts.iter() {
-                // Update sync status
-                app.update_simple_sync_status(&format!("Syncing {}...", account.email));
+        // Show initial sync status
+        self.update_sync_status_multi(&supported_accounts.iter().map(|a| a.email.clone()).collect::<Vec<_>>(), 0);
+
+        // Track sync completion with a shared counter
+        let completed = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let accounts_syncing = std::rc::Rc::new(std::cell::RefCell::new(
+            supported_accounts.iter().map(|a| (a.email.clone(), "starting")).collect::<std::collections::HashMap<_, _>>()
+        ));
+
+        // Spawn parallel sync tasks for each account
+        for account in supported_accounts {
+            let app = app.clone();
+            let completed = completed.clone();
+            let accounts_syncing = accounts_syncing.clone();
+            let email = account.email.clone();
+
+            glib::spawn_future_local(async move {
+                // Update status to syncing
+                accounts_syncing.borrow_mut().insert(email.clone(), "syncing");
+                app.update_sync_status_from_map(&accounts_syncing.borrow());
 
                 // Sync this account's folder metadata (STATUS queries)
                 app.sync_account_inbox(&account.id).await;
 
-                // Refresh sidebar after each account so counts appear progressively
+                // Refresh sidebar after this account so counts appear progressively
                 app.refresh_sidebar_folders();
 
                 // Check if this account has no cached inbox messages
-                // If so, stream INBOX messages from IMAP to populate the cache
                 let needs_streaming = app.account_inbox_is_empty(&account.id).await;
                 if needs_streaming {
-                    app.update_simple_sync_status(&format!("Loading {}...", account.email));
-                    app.stream_inbox_to_cache(account).await;
+                    accounts_syncing.borrow_mut().insert(email.clone(), "loading");
+                    app.update_sync_status_from_map(&accounts_syncing.borrow());
 
-                    // If unified inbox is the current view, refresh it with new messages
+                    app.stream_inbox_to_cache(&account).await;
+
+                    // Refresh unified inbox if that's the current view
                     if app.imp().state.borrow().unified_inbox {
                         app.fetch_unified_inbox();
                     }
                 }
-            }
 
-            // Final refresh of unified inbox to show all accounts' messages
-            if app.imp().state.borrow().unified_inbox {
-                app.fetch_unified_inbox();
-            }
+                // Mark this account as done
+                accounts_syncing.borrow_mut().insert(email.clone(), "done");
+                let done = completed.get() + 1;
+                completed.set(done);
 
-            // Show completion briefly
-            app.update_simple_sync_status("Up to date");
+                info!("Account {} sync complete ({}/{})", email, done, total_accounts);
 
-            // Hide sync status after a short delay
-            glib::timeout_future(std::time::Duration::from_secs(2)).await;
-            app.hide_sync_status();
-        });
+                // Update status
+                if done == total_accounts {
+                    // All accounts done
+                    app.update_simple_sync_status("Up to date");
+
+                    // Final refresh of unified inbox
+                    if app.imp().state.borrow().unified_inbox {
+                        app.fetch_unified_inbox();
+                    }
+
+                    // Hide sync status after a short delay
+                    glib::timeout_future(std::time::Duration::from_secs(2)).await;
+                    app.hide_sync_status();
+                } else {
+                    // Show remaining accounts being synced
+                    app.update_sync_status_from_map(&accounts_syncing.borrow());
+                }
+            });
+        }
+    }
+
+    /// Update sync status showing multiple accounts
+    fn update_sync_status_multi(&self, emails: &[String], completed: usize) {
+        let total = emails.len();
+        let status = if completed == 0 {
+            format!("Syncing {} accounts...", total)
+        } else {
+            format!("Syncing... {}/{} accounts", completed, total)
+        };
+        self.update_simple_sync_status(&status);
+    }
+
+    /// Update sync status from account status map
+    fn update_sync_status_from_map(&self, statuses: &std::collections::HashMap<String, &str>) {
+        let syncing: Vec<_> = statuses.iter()
+            .filter(|(_, s)| **s != "done")
+            .map(|(email, status)| {
+                let short_email = email.split('@').next().unwrap_or(email);
+                match *status {
+                    "loading" => format!("{} (loading)", short_email),
+                    "syncing" => short_email.to_string(),
+                    _ => short_email.to_string(),
+                }
+            })
+            .collect();
+
+        let done_count = statuses.iter().filter(|(_, s)| **s == "done").count();
+        let total = statuses.len();
+
+        if syncing.is_empty() {
+            self.update_simple_sync_status("Up to date");
+        } else if syncing.len() <= 2 {
+            self.update_simple_sync_status(&format!("Syncing {}... ({}/{})", syncing.join(", "), done_count, total));
+        } else {
+            self.update_simple_sync_status(&format!("Syncing {} accounts... ({}/{})", syncing.len(), done_count, total));
+        }
     }
 
     /// Update sync status with simple display (no progress bar)
     fn update_simple_sync_status(&self, message: &str) {
+        debug!("Updating sync status: {}", message);
         if let Some(window) = self.active_window() {
             if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
                 if let Some(sidebar) = win.folder_sidebar() {
                     sidebar.show_simple_sync_status(message);
+                } else {
+                    debug!("No sidebar found");
                 }
+            } else {
+                debug!("Window is not NorthMailWindow");
             }
+        } else {
+            debug!("No active window");
         }
     }
 
@@ -2206,7 +2294,8 @@ impl NorthMailApplication {
             let _ = sender.send(result);
         });
 
-        let timeout = std::time::Duration::from_secs(2);
+        // Longer timeout to handle database contention
+        let timeout = std::time::Duration::from_secs(15);
         receiver.recv_timeout(timeout).unwrap_or_default()
     }
 
@@ -2289,54 +2378,111 @@ impl NorthMailApplication {
     }
 
     /// Refresh sidebar folder list from database (without re-connecting signal handlers)
+    /// This is async to avoid blocking the main thread
     fn refresh_sidebar_folders(&self) {
         let accounts = self.imp().accounts.borrow().clone();
         if accounts.is_empty() {
             return;
         }
 
-        let cached_folders_map = self
-            .database()
-            .map(|db| Self::load_cached_folders_for_accounts(db, &accounts))
-            .unwrap_or_default();
+        let db = match self.database() {
+            Some(db) => db.clone(),
+            None => return,
+        };
 
-        let account_folders: Vec<crate::widgets::AccountFolders> = accounts
-            .iter()
-            .map(|account| {
-                let is_supported = Self::is_supported_account(account);
-                let email_display = if is_supported {
-                    account.email.clone()
-                } else {
-                    format!("{} (unsupported)", account.email)
-                };
+        let app = self.clone();
+        let account_ids: Vec<String> = accounts.iter().map(|a| a.id.clone()).collect();
 
-                let db_folders = cached_folders_map
-                    .get(&account.id)
-                    .map(|v: &Vec<northmail_core::models::DbFolder>| v.as_slice())
-                    .unwrap_or(&[]);
-
-                let inbox_unread = db_folders
-                    .iter()
-                    .find(|f| f.folder_type == "inbox")
-                    .and_then(|f| f.unread_count)
-                    .map(|c| c as u32);
-
-                crate::widgets::AccountFolders {
-                    id: account.id.clone(),
-                    email: email_display,
-                    inbox_unread,
-                    folders: Self::build_sidebar_folders(db_folders),
+        // Spawn database query in background thread
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async {
+                let mut map = std::collections::HashMap::new();
+                for account_id in &account_ids {
+                    match db.get_folders(account_id).await {
+                        Ok(folders) => {
+                            map.insert(account_id.clone(), folders);
+                        }
+                        Err(e) => {
+                            warn!("Failed to load cached folders for {}: {}", account_id, e);
+                        }
+                    }
                 }
-            })
-            .collect();
+                map
+            });
+            let _ = tx.send(result);
+        });
 
-        if let Some(window) = self.active_window() {
-            if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
-                if let Some(sidebar) = win.folder_sidebar() {
-                    sidebar.set_accounts(account_folders);
+        // Poll for results without blocking main thread
+        glib::spawn_future_local(async move {
+            let start = std::time::Instant::now();
+            let timeout = std::time::Duration::from_secs(10);
+
+            loop {
+                match rx.try_recv() {
+                    Ok(cached_folders_map) => {
+                        // Build account folders from the results
+                        let account_folders: Vec<crate::widgets::AccountFolders> = accounts
+                            .iter()
+                            .map(|account| {
+                                let is_supported = Self::is_supported_account(account);
+                                let email_display = if is_supported {
+                                    account.email.clone()
+                                } else {
+                                    format!("{} (unsupported)", account.email)
+                                };
+
+                                let db_folders = cached_folders_map
+                                    .get(&account.id)
+                                    .map(|v: &Vec<northmail_core::models::DbFolder>| v.as_slice())
+                                    .unwrap_or(&[]);
+
+                                let inbox_unread = db_folders
+                                    .iter()
+                                    .find(|f| f.folder_type == "inbox")
+                                    .and_then(|f| f.unread_count)
+                                    .map(|c| c as u32);
+
+                                crate::widgets::AccountFolders {
+                                    id: account.id.clone(),
+                                    email: email_display,
+                                    inbox_unread,
+                                    folders: Self::build_sidebar_folders(db_folders),
+                                }
+                            })
+                            .collect();
+
+                        // Don't clear sidebar if we failed to load folders
+                        let total_folders: usize = account_folders.iter().map(|a| a.folders.len()).sum();
+                        if total_folders == 0 && !accounts.is_empty() {
+                            debug!("refresh_sidebar_folders: skipping update - no folders loaded");
+                            return;
+                        }
+
+                        if let Some(window) = app.active_window() {
+                            if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                                if let Some(sidebar) = win.folder_sidebar() {
+                                    sidebar.set_accounts(account_folders);
+                                }
+                            }
+                        }
+                        return;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        if start.elapsed() > timeout {
+                            debug!("refresh_sidebar_folders: timeout waiting for folders");
+                            return;
+                        }
+                        // Yield to GTK main loop
+                        glib::timeout_future(std::time::Duration::from_millis(100)).await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        return;
+                    }
                 }
             }
-        }
+        });
     }
 
     /// Load cached messages for a folder from the database
@@ -2452,6 +2598,8 @@ impl NorthMailApplication {
         let folder_id = self.imp().cache_folder_id.get();
         let offset = self.imp().cache_offset.get();
         let batch_size: i64 = 50;
+
+        info!("load_more_from_cache called: folder_id={}, offset={}", folder_id, offset);
 
         if folder_id == 0 {
             warn!("No cache folder ID for load more");
@@ -2750,6 +2898,8 @@ impl NorthMailApplication {
                     if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
                         win.restore_message_list();
                         if let Some(message_list) = win.message_list() {
+                            // Clear search when switching folders
+                            message_list.clear_search();
                             // Set folder context for drag-and-drop
                             message_list.set_folder_context(&account_id, &folder_path);
                             message_list.set_messages(cached_messages);
@@ -2771,12 +2921,16 @@ impl NorthMailApplication {
                 app.update_simple_sync_status("Checking for updates...");
                 true
             } else {
-                // No cache - show full loading state with detailed status
+                // No cache - show skeleton loading for immediate feedback
                 if let Some(window) = app.active_window() {
                     if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
-                        win.show_loading_with_status("Connecting...", None);
+                        win.restore_message_list();
+                        if let Some(message_list) = win.message_list() {
+                            message_list.show_loading();
+                        }
                     }
                 }
+                app.update_simple_sync_status("Loading messages...");
                 false
             };
 
@@ -3410,7 +3564,7 @@ impl NorthMailApplication {
                         info!("Background streaming {}: INBOX has {} messages", email, total_count);
                         if total_count > 0 {
                             self.update_simple_sync_status(
-                                &format!("Loading {}... 0/{}", email, total_count),
+                                &format!("Loading {}... 0/{}", email, format_number(total_count)),
                             );
                         }
                     }
@@ -3452,7 +3606,7 @@ impl NorthMailApplication {
                     }
                     FetchEvent::SyncProgress { synced, total } => {
                         self.update_simple_sync_status(
-                            &format!("Loading {}... {}/{}", email, synced, total),
+                            &format!("Loading {}... {}/{}", email, format_number(synced), format_number(total)),
                         );
                     }
                     FetchEvent::InitialBatchDone { .. } => {
@@ -3753,7 +3907,7 @@ impl NorthMailApplication {
                     FetchEvent::SyncProgress { synced, total } => {
                         // Update sync progress in sidebar (non-intrusive)
                         if !is_stale {
-                            app.update_simple_sync_status(&format!("Syncing {}/{}...", synced, total));
+                            app.update_simple_sync_status(&format!("Syncing {}/{}...", format_number(synced), format_number(total)));
                         }
                     }
                     FetchEvent::InitialBatchDone { lowest_seq: seq } => {
@@ -4191,7 +4345,13 @@ impl NorthMailApplication {
     /// Resolve a folder_id to (account_id, folder_path) via DB lookup
     /// Used in unified inbox mode to find which account/folder a message belongs to
     pub fn resolve_folder_info(&self, folder_id: i64) -> Option<(String, String)> {
-        let db = self.database()?.clone();
+        let db = match self.database() {
+            Some(db) => db.clone(),
+            None => {
+                warn!("resolve_folder_info: no database available");
+                return None;
+            }
+        };
 
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -4200,10 +4360,25 @@ impl NorthMailApplication {
             let _ = sender.send(result);
         });
 
-        // Timeout for DB query - needs to be long enough for slow queries
-        match receiver.recv_timeout(std::time::Duration::from_millis(500)) {
-            Ok(Ok(Some(folder))) => Some((folder.account_id, folder.full_path)),
-            _ => None,
+        // Timeout for DB query - increased to 10s due to potential database locking
+        match receiver.recv_timeout(std::time::Duration::from_millis(10000)) {
+            Ok(Ok(Some(folder))) => {
+                debug!("resolve_folder_info: folder_id {} -> account={}, path={}",
+                       folder_id, folder.account_id, folder.full_path);
+                Some((folder.account_id, folder.full_path))
+            }
+            Ok(Ok(None)) => {
+                warn!("resolve_folder_info: folder_id {} not found in database", folder_id);
+                None
+            }
+            Ok(Err(e)) => {
+                warn!("resolve_folder_info: database error for folder_id {}: {}", folder_id, e);
+                None
+            }
+            Err(_) => {
+                warn!("resolve_folder_info: timeout waiting for folder_id {}", folder_id);
+                None
+            }
         }
     }
 
@@ -4287,6 +4462,8 @@ impl NorthMailApplication {
                         if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
                             win.restore_message_list();
                             if let Some(message_list) = win.message_list() {
+                                // Clear search when switching folders
+                                message_list.clear_search();
                                 // Unified inbox: set empty context (drag-and-drop not supported)
                                 message_list.set_folder_context("", "UNIFIED_INBOX");
                                 message_list.set_messages(message_infos);
@@ -5921,7 +6098,7 @@ impl NorthMailApplication {
                             Ok((msg_count, body_count)) => {
                                 spinner_clone.set_spinning(false);
                                 spinner_clone.set_visible(false);
-                                row_clone.set_subtitle(&format!("{} messages, {} bodies cached", msg_count, body_count));
+                                row_clone.set_subtitle(&format!("{} messages, {} bodies cached", format_number(msg_count), format_number(body_count)));
                                 break;
                             }
                             Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -7095,21 +7272,75 @@ impl NorthMailApplication {
             }
         };
 
-        // Delete from local database
-        if let Some(db) = self.database() {
-            let db_clone = db.clone();
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    if let Err(e) = db_clone.delete_message(message_id).await {
-                        error!("delete_message: Failed to delete from database: {}", e);
-                    }
-                });
-            });
-        }
+        // Look up the actual trash folder for this account and perform delete
+        let db = match self.database() {
+            Some(db) => db.clone(),
+            None => {
+                warn!("delete_message: No database available");
+                return;
+            }
+        };
 
-        // Move on IMAP (use [Gmail]/Trash for Gmail, Trash or Deleted Items for others)
-        self.move_message_imap(&account_id, &source_folder, uid, "Trash");
+        let app = self.clone();
+        let account_id_clone = account_id.clone();
+        let source_folder_clone = source_folder.clone();
+
+        // Use std::thread with Tokio for database operations
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                // Delete from local database
+                if let Err(e) = db.delete_message(message_id).await {
+                    error!("delete_message: Failed to delete from database: {}", e);
+                }
+
+                // Look up actual trash folder path from database
+                let trash_folder = match db.get_trash_folder(&account_id_clone).await {
+                    Ok(Some(path)) => {
+                        info!("delete_message: Using trash folder from DB: {}", path);
+                        path
+                    }
+                    Ok(None) => {
+                        warn!("delete_message: No trash folder found for account {}, using fallback", account_id_clone);
+                        "Trash".to_string()  // Fallback
+                    }
+                    Err(e) => {
+                        warn!("delete_message: Failed to lookup trash folder: {}, using fallback", e);
+                        "Trash".to_string()  // Fallback
+                    }
+                };
+
+                let _ = tx.send(trash_folder);
+            });
+        });
+
+        // Wait for trash folder lookup and then move on IMAP
+        glib::spawn_future_local(async move {
+            // Poll for result with timeout
+            let start = std::time::Instant::now();
+            let timeout = std::time::Duration::from_secs(5);
+            loop {
+                match rx.try_recv() {
+                    Ok(trash_folder) => {
+                        // Move on IMAP using the actual trash folder path
+                        app.move_message_imap_direct(&account_id, &source_folder_clone, uid, &trash_folder);
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        if start.elapsed() > timeout {
+                            error!("delete_message: Timeout waiting for trash folder lookup");
+                            break;
+                        }
+                        glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        error!("delete_message: Channel disconnected");
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     /// Move a message to a specific folder (drag-and-drop)
@@ -7292,6 +7523,124 @@ impl NorthMailApplication {
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         error!("move_message_imap: Channel disconnected");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Move a message to another folder on IMAP using exact folder path (no translation)
+    fn move_message_imap_direct(&self, account_id: &str, source_folder: &str, uid: u32, dest_folder: &str) {
+        let account_id = account_id.to_string();
+        let source_folder = source_folder.to_string();
+        let dest_folder = dest_folder.to_string();
+
+        info!("move_message_imap_direct: uid={} from {} to {}", uid, source_folder, dest_folder);
+
+        let accounts = self.imp().accounts.borrow().clone();
+        let account = match accounts.iter().find(|a| a.id == account_id) {
+            Some(a) => a.clone(),
+            None => {
+                warn!("move_message_imap_direct: Account not found: {}", account_id);
+                return;
+            }
+        };
+
+        let pool = self.imap_pool();
+        let is_google = Self::is_google_account(&account);
+        let is_microsoft = Self::is_microsoft_account(&account);
+        let imap_host = account.imap_host.clone();
+        let imap_username = account.imap_username.clone();
+
+        glib::spawn_future_local(async move {
+            // Get credentials via AuthManager
+            let auth_manager = match AuthManager::new().await {
+                Ok(am) => am,
+                Err(e) => {
+                    error!("move_message_imap_direct: Failed to create auth manager: {}", e);
+                    return;
+                }
+            };
+
+            let credentials = if is_google {
+                match auth_manager.get_xoauth2_token_for_goa(&account.id).await {
+                    Ok((email, access_token)) => ImapCredentials::Gmail { email, access_token },
+                    Err(e) => {
+                        error!("move_message_imap_direct: Failed to get Google token: {}", e);
+                        return;
+                    }
+                }
+            } else if is_microsoft {
+                match auth_manager.get_xoauth2_token_for_goa(&account.id).await {
+                    Ok((email, access_token)) => ImapCredentials::Microsoft { email, access_token },
+                    Err(e) => {
+                        error!("move_message_imap_direct: Failed to get Microsoft token: {}", e);
+                        return;
+                    }
+                }
+            } else {
+                let host = imap_host.unwrap_or_else(|| "imap.mail.me.com".to_string());
+                let username = imap_username.unwrap_or(account.email.clone());
+                match auth_manager.get_goa_password(&account.id).await {
+                    Ok(password) => ImapCredentials::Password {
+                        host,
+                        port: 993,
+                        username,
+                        password,
+                    },
+                    Err(e) => {
+                        error!("move_message_imap_direct: Failed to get password: {}", e);
+                        return;
+                    }
+                }
+            };
+
+            let worker = match pool.get_or_create(credentials) {
+                Ok(w) => w,
+                Err(e) => {
+                    error!("move_message_imap_direct: Failed to get IMAP worker: {}", e);
+                    return;
+                }
+            };
+
+            let (response_tx, response_rx) = std::sync::mpsc::channel();
+
+            if let Err(e) = worker.send(ImapCommand::MoveMessage {
+                source_folder: source_folder.clone(),
+                dest_folder: dest_folder.clone(),
+                uid,
+                response_tx,
+            }) {
+                error!("move_message_imap_direct: Failed to send command: {}", e);
+                return;
+            }
+
+            // Non-blocking poll with yield to GTK main loop
+            let timeout = std::time::Duration::from_secs(30);
+            let start = std::time::Instant::now();
+            loop {
+                match response_rx.try_recv() {
+                    Ok(ImapResponse::Ok) => {
+                        info!("move_message_imap_direct: Successfully moved uid {} from {} to {}", uid, source_folder, dest_folder);
+                        break;
+                    }
+                    Ok(ImapResponse::Error(e)) => {
+                        error!("move_message_imap_direct: IMAP error: {}", e);
+                        break;
+                    }
+                    Ok(_) => {
+                        debug!("move_message_imap_direct: Unexpected response");
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        if start.elapsed() > timeout {
+                            error!("move_message_imap_direct: Timeout waiting for response");
+                            break;
+                        }
+                        glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        error!("move_message_imap_direct: Channel disconnected");
                         break;
                     }
                 }

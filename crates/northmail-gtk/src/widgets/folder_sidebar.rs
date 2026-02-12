@@ -19,6 +19,22 @@ fn encode_row_name(section: usize, kind: &str, account_id: &str, folder_path: &s
     format!("{}:{}:{}:{}", section, kind, account_id, folder_path)
 }
 
+/// Format a number with thousand separators (e.g., 1234 -> "1,234")
+fn format_number(n: u32) -> String {
+    if n < 1000 {
+        return n.to_string();
+    }
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
+}
+
 /// Returns (section, kind, account_id, folder_path)
 fn decode_row_name(name: &str) -> (usize, &str, &str, &str) {
     let mut parts = name.splitn(4, ':');
@@ -413,31 +429,41 @@ impl FolderSidebar {
             .orientation(gtk4::Orientation::Vertical)
             .build();
 
-        // Sync status area (hidden by default)
+        // Sync status area (hidden by default) - styled as a card for visibility
         let sync_status_box = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
-            .spacing(4)
-            .margin_start(12)
-            .margin_end(12)
+            .spacing(6)
+            .margin_start(8)
+            .margin_end(8)
             .margin_top(8)
             .margin_bottom(8)
             .visible(false)
+            .css_classes(["card"])
+            .build();
+
+        let sync_inner = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .spacing(6)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(10)
+            .margin_bottom(10)
             .build();
 
         let sync_top_row = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
-            .spacing(6)
+            .spacing(8)
             .build();
 
         let sync_spinner = gtk4::Spinner::builder()
             .spinning(true)
-            .width_request(12)
-            .height_request(12)
+            .width_request(16)
+            .height_request(16)
             .build();
 
         let sync_label = gtk4::Label::builder()
             .label("Syncing...")
-            .css_classes(["dim-label", "caption"])
+            .css_classes(["caption"])
             .xalign(0.0)
             .hexpand(true)
             .ellipsize(gtk4::pango::EllipsizeMode::End)
@@ -445,13 +471,13 @@ impl FolderSidebar {
 
         sync_top_row.append(&sync_spinner);
         sync_top_row.append(&sync_label);
-        sync_status_box.append(&sync_top_row);
+        sync_inner.append(&sync_top_row);
 
         let sync_progress = gtk4::ProgressBar::builder()
             .show_text(false)
             .build();
-        sync_progress.add_css_class("osd");
-        sync_status_box.append(&sync_progress);
+        sync_inner.append(&sync_progress);
+        sync_status_box.append(&sync_inner);
 
         let sync_detail_label = gtk4::Label::builder()
             .label("")
@@ -460,7 +486,7 @@ impl FolderSidebar {
             .ellipsize(gtk4::pango::EllipsizeMode::End)
             .visible(false)
             .build();
-        sync_status_box.append(&sync_detail_label);
+        sync_inner.append(&sync_detail_label);
 
         bottom_box.append(&sync_status_box);
         self.append(&bottom_box);
@@ -634,7 +660,7 @@ impl FolderSidebar {
             if count > 0 {
                 content.append(
                     &gtk4::Label::builder()
-                        .label(&count.to_string())
+                        .label(&format_number(count))
                         .css_classes(["dim-label"])
                         .build(),
                 );
@@ -744,7 +770,7 @@ impl FolderSidebar {
             if count > 0 {
                 content.append(
                     &gtk4::Label::builder()
-                        .label(&count.to_string())
+                        .label(&format_number(count))
                         .css_classes(["dim-label"])
                         .build(),
                 );

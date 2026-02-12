@@ -426,6 +426,26 @@ impl NorthMailWindow {
                  font-size: 12px;
                  color: alpha(@view_fg_color, 0.7);
              }
+             /* Sender chip with hover effect */
+             .sender-chip {
+                 padding: 6px 10px;
+                 border-radius: 8px;
+                 background: transparent;
+                 transition: background 150ms ease;
+             }
+             .sender-chip:hover {
+                 background: alpha(@view_fg_color, 0.08);
+                 cursor: pointer;
+             }
+             /* Context menu item styling */
+             .context-menu-item {
+                 font-size: 13px;
+                 padding: 6px 12px;
+                 min-height: 28px;
+             }
+             .context-menu-item > label {
+                 font-size: 13px;
+             }
              /* Clickable sender button styling */
              .sender-clickable {
                  padding: 0;
@@ -1044,24 +1064,47 @@ impl NorthMailWindow {
                 let message_id = msg.id;
                 let msg_uid = msg.uid;
                 let msg_folder_id = msg.folder_id;
-                delete_button.connect_clicked(move |_| {
+                delete_button.connect_clicked(move |btn| {
                     debug!("Delete button clicked: uid={}", msg_uid);
-                    if let Some(app) = window.application() {
-                        if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
-                            app.delete_message(message_id, msg_uid, msg_folder_id);
-                            // Update message list by removing this message
-                            let imp = window.imp();
-                            if let Some(message_list) = imp.message_list.get() {
-                                message_list.remove_message(msg_uid);
+                    let window = window.clone();
+
+                    // Show confirmation dialog
+                    let dialog = adw::AlertDialog::builder()
+                        .heading("Delete Message?")
+                        .body("This message will be moved to Trash.")
+                        .build();
+
+                    dialog.add_response("cancel", "Cancel");
+                    dialog.add_response("delete", "Delete");
+                    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+                    dialog.set_default_response(Some("cancel"));
+                    dialog.set_close_response("cancel");
+
+                    dialog.connect_response(None, move |_, response| {
+                        debug!("Delete dialog response: {}", response);
+                        if response == "delete" {
+                            debug!("User confirmed delete for uid={}", msg_uid);
+                            if let Some(app) = window.application() {
+                                if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                                    debug!("Calling delete_message");
+                                    app.delete_message(message_id, msg_uid, msg_folder_id);
+                                    // Update message list by removing this message
+                                    let imp = window.imp();
+                                    if let Some(message_list) = imp.message_list.get() {
+                                        message_list.remove_message(msg_uid);
+                                    }
+                                    // Clear message view
+                                    while let Some(child) = imp.message_view_box.first_child() {
+                                        imp.message_view_box.remove(&child);
+                                    }
+                                    *imp.current_message_uid.borrow_mut() = None;
+                                    window.add_toast(adw::Toast::new("Message deleted"));
+                                }
                             }
-                            // Clear message view
-                            while let Some(child) = imp.message_view_box.first_child() {
-                                imp.message_view_box.remove(&child);
-                            }
-                            *imp.current_message_uid.borrow_mut() = None;
-                            window.add_toast(adw::Toast::new("Message deleted"));
                         }
-                    }
+                    });
+
+                    dialog.present(Some(&btn.root().unwrap().downcast::<gtk4::Window>().unwrap()));
                 });
             }
 
@@ -1204,11 +1247,154 @@ impl NorthMailWindow {
                 .css_classes(["message-sender-email"])
                 .build();
 
-            // To: row (inline with sender info)
+            sender_info.append(&name_label);
+            sender_info.append(&email_label);
+
+            // Wrap sender info in a box with padding for hover effect
+            let sender_chip = gtk4::Box::builder()
+                .orientation(gtk4::Orientation::Vertical)
+                .css_classes(["sender-chip"])
+                .build();
+            sender_chip.append(&sender_info);
+
+            // Create context menu for right-click
+            let popover = gtk4::Popover::new();
+            popover.set_parent(&sender_chip);
+            popover.set_has_arrow(false);
+            popover.add_css_class("menu");
+
+            let menu_box = gtk4::Box::builder()
+                .orientation(gtk4::Orientation::Vertical)
+                .spacing(0)
+                .build();
+
+            // New Email button
+            let new_email_btn = gtk4::Button::builder()
+                .label("New Email")
+                .css_classes(["flat", "context-menu-item"])
+                .build();
+            new_email_btn.set_halign(gtk4::Align::Fill);
+            if let Some(child) = new_email_btn.child() {
+                if let Some(label) = child.downcast_ref::<gtk4::Label>() {
+                    label.set_xalign(0.0);
+                }
+            }
+            {
+                let window = self.clone();
+                let to_email = from_email.clone();
+                let to_name = display_name.clone();
+                let popover_clone = popover.clone();
+                new_email_btn.connect_clicked(move |_| {
+                    popover_clone.popdown();
+                    let mode = ComposeMode::New {
+                        to: Some((to_email.clone(), to_name.clone())),
+                    };
+                    window.show_compose_dialog_with_mode(mode);
+                });
+            }
+            menu_box.append(&new_email_btn);
+
+            // Copy Address button
+            let copy_btn = gtk4::Button::builder()
+                .label("Copy Address")
+                .css_classes(["flat", "context-menu-item"])
+                .build();
+            copy_btn.set_halign(gtk4::Align::Fill);
+            if let Some(child) = copy_btn.child() {
+                if let Some(label) = child.downcast_ref::<gtk4::Label>() {
+                    label.set_xalign(0.0);
+                }
+            }
+            {
+                let email_for_copy = from_email.clone();
+                let popover_clone = popover.clone();
+                copy_btn.connect_clicked(move |btn| {
+                    popover_clone.popdown();
+                    let display = btn.display();
+                    let clipboard = display.clipboard();
+                    clipboard.set_text(&email_for_copy);
+                });
+            }
+            menu_box.append(&copy_btn);
+
+            // Add to Contacts button
+            let add_contact_btn = gtk4::Button::builder()
+                .label("Add to Contacts")
+                .css_classes(["flat", "context-menu-item"])
+                .build();
+            add_contact_btn.set_halign(gtk4::Align::Fill);
+            if let Some(child) = add_contact_btn.child() {
+                if let Some(label) = child.downcast_ref::<gtk4::Label>() {
+                    label.set_xalign(0.0);
+                }
+            }
+            {
+                let popover_clone = popover.clone();
+                let contact_email = from_email.clone();
+                let contact_name = display_name.clone();
+                let window = self.clone();
+                add_contact_btn.connect_clicked(move |_| {
+                    popover_clone.popdown();
+
+                    let email = contact_email.clone();
+                    let name = contact_name.clone();
+                    let win = window.clone();
+
+                    // Add contact via Evolution Data Server D-Bus API
+                    glib::spawn_future_local(async move {
+                        match add_contact_to_eds(&name, &email).await {
+                            Ok(()) => {
+                                let toast = adw::Toast::new(&format!("Added {} to contacts", name));
+                                win.imp().toast_overlay.add_toast(toast);
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to add contact: {}", e);
+                                let toast = adw::Toast::new("Failed to add contact");
+                                win.imp().toast_overlay.add_toast(toast);
+                            }
+                        }
+                    });
+                });
+            }
+            menu_box.append(&add_contact_btn);
+
+            popover.set_child(Some(&menu_box));
+
+            // Right-click gesture for context menu
+            let gesture = gtk4::GestureClick::new();
+            gesture.set_button(3); // Right mouse button
+            let popover_clone = popover.clone();
+            gesture.connect_released(move |_gesture, _n_press, x, y| {
+                popover_clone.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                popover_clone.popup();
+            });
+            sender_chip.add_controller(gesture);
+
+            // Left-click to compose
+            let click_gesture = gtk4::GestureClick::new();
+            click_gesture.set_button(1); // Left mouse button
+            {
+                let window = self.clone();
+                let to_email = from_email.clone();
+                let to_name = display_name.clone();
+                click_gesture.connect_released(move |_, _, _, _| {
+                    let mode = ComposeMode::New {
+                        to: Some((to_email.clone(), to_name.clone())),
+                    };
+                    window.show_compose_dialog_with_mode(mode);
+                });
+            }
+            sender_chip.add_controller(click_gesture);
+
+            sender_row.append(&sender_chip);
+
+            // To: row (separate from clickable sender)
             let to_display = if msg.to.is_empty() { "(sync to update)".to_string() } else { msg.to.clone() };
             let to_row = gtk4::Box::builder()
                 .orientation(gtk4::Orientation::Horizontal)
                 .spacing(4)
+                .margin_start(48) // Align with sender info (after avatar)
+                .margin_top(4)
                 .build();
             let to_label = gtk4::Label::builder()
                 .label("To:")
@@ -1223,31 +1409,6 @@ impl NorthMailWindow {
                 .build();
             to_row.append(&to_label);
             to_row.append(&to_value);
-
-            sender_info.append(&name_label);
-            sender_info.append(&email_label);
-            sender_info.append(&to_row);
-
-            // Make sender clickable to compose new email
-            let sender_button = gtk4::Button::builder()
-                .child(&sender_info)
-                .css_classes(["flat", "sender-clickable"])
-                .tooltip_text("Click to compose email")
-                .build();
-
-            {
-                let window = self.clone();
-                let to_email = from_email.clone();
-                let to_name = display_name.clone();
-                sender_button.connect_clicked(move |_| {
-                    let mode = ComposeMode::New {
-                        to: Some((to_email.clone(), to_name.clone())),
-                    };
-                    window.show_compose_dialog_with_mode(mode);
-                });
-            }
-
-            sender_row.append(&sender_button);
 
             // Date on right — format nicely
             let formatted_date = if let Some(epoch) = msg.date_epoch {
@@ -1267,6 +1428,7 @@ impl NorthMailWindow {
             sender_row.append(&date_label);
 
             header_content.append(&sender_row);
+            header_content.append(&to_row);
 
             // Cc: (if available) - shown separately below sender row
             if !msg.cc.is_empty() {
@@ -3820,4 +3982,74 @@ fn save_attachment(filename: &str, data: &Rc<Vec<u8>>, widget: &impl gtk4::prelu
             }
         }
     });
+}
+
+/// Add a contact to Evolution Data Server via D-Bus
+async fn add_contact_to_eds(name: &str, email: &str) -> Result<(), String> {
+    use zbus::Connection;
+    use zbus::zvariant::ObjectPath;
+
+    // Create vCard
+    let vcard = format!(
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:{}\r\nEMAIL:{}\r\nEND:VCARD",
+        name, email
+    );
+
+    // Connect to session bus
+    let connection = Connection::session()
+        .await
+        .map_err(|e| format!("Failed to connect to session bus: {}", e))?;
+
+    // Open the system address book
+    let reply: (String, String) = connection
+        .call_method(
+            Some("org.gnome.evolution.dataserver.AddressBook10"),
+            "/org/gnome/evolution/dataserver/AddressBookFactory",
+            Some("org.gnome.evolution.dataserver.AddressBookFactory"),
+            "OpenAddressBook",
+            &("system-address-book",),
+        )
+        .await
+        .map_err(|e| format!("Failed to open address book: {}", e))?
+        .body()
+        .deserialize()
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    let (object_path_str, _bus_name) = reply;
+    let object_path = ObjectPath::try_from(object_path_str.as_str())
+        .map_err(|e| format!("Invalid object path: {}", e))?;
+
+    // Open the book (required before creating contacts)
+    let _: Vec<String> = connection
+        .call_method(
+            Some("org.gnome.evolution.dataserver.AddressBook10"),
+            &object_path,
+            Some("org.gnome.evolution.dataserver.AddressBook"),
+            "Open",
+            &(),
+        )
+        .await
+        .map_err(|e| format!("Failed to open book: {}", e))?
+        .body()
+        .deserialize()
+        .map_err(|e| format!("Failed to parse open response: {}", e))?;
+
+    // Create the contact
+    let vcards: Vec<&str> = vec![&vcard];
+    let opflags: u32 = 0;
+    let _: Vec<String> = connection
+        .call_method(
+            Some("org.gnome.evolution.dataserver.AddressBook10"),
+            &object_path,
+            Some("org.gnome.evolution.dataserver.AddressBook"),
+            "CreateContacts",
+            &(vcards, opflags),
+        )
+        .await
+        .map_err(|e| format!("Failed to create contact: {}", e))?
+        .body()
+        .deserialize()
+        .map_err(|e| format!("Failed to parse create response: {}", e))?;
+
+    Ok(())
 }

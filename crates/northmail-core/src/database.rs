@@ -160,6 +160,15 @@ impl Database {
             .await?;
 
         let db = Self { pool };
+
+        // Enable WAL mode for better concurrency and set busy timeout
+        sqlx::query("PRAGMA journal_mode = WAL")
+            .execute(&db.pool)
+            .await?;
+        sqlx::query("PRAGMA busy_timeout = 30000")  // 30 second busy timeout
+            .execute(&db.pool)
+            .await?;
+
         db.initialize().await?;
 
         Ok(db)
@@ -1453,6 +1462,30 @@ impl Database {
     pub async fn get_drafts_folder(&self, account_id: &str) -> CoreResult<Option<String>> {
         let row = sqlx::query(
             "SELECT full_path FROM folders WHERE account_id = ? AND folder_type = 'drafts' LIMIT 1",
+        )
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| r.get::<String, _>("full_path")))
+    }
+
+    /// Get the trash folder path for an account
+    pub async fn get_trash_folder(&self, account_id: &str) -> CoreResult<Option<String>> {
+        let row = sqlx::query(
+            "SELECT full_path FROM folders WHERE account_id = ? AND folder_type = 'trash' LIMIT 1",
+        )
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| r.get::<String, _>("full_path")))
+    }
+
+    /// Get the archive folder path for an account
+    pub async fn get_archive_folder(&self, account_id: &str) -> CoreResult<Option<String>> {
+        let row = sqlx::query(
+            "SELECT full_path FROM folders WHERE account_id = ? AND folder_type = 'archive' LIMIT 1",
         )
         .bind(account_id)
         .fetch_optional(&self.pool)
