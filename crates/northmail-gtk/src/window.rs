@@ -1105,9 +1105,9 @@ impl NorthMailWindow {
         css_provider.load_from_string(
             "
             .compose-fields { background: @view_bg_color; }
-            .compose-entry { background: transparent; border: none; outline: none; box-shadow: none; min-height: 20px; padding: 0; margin: 0; }
+            .compose-entry { background: transparent; border: none; outline: none; box-shadow: none; min-height: 20px; padding: 0; margin: 0; font-size: 0.9em; }
             .compose-entry:focus { background: transparent; border: none; outline: none; box-shadow: none; }
-            .compose-entry > text { background: transparent; border: none; outline: none; box-shadow: none; padding: 0; margin: 0; }
+            .compose-entry > text { background: transparent; border: none; outline: none; box-shadow: none; padding: 0; margin: 0; font-size: 0.9em; }
             .compose-chip { background: @accent_bg_color; border-radius: 8px; padding: 0 0 0 6px; margin: 0; min-height: 0; }
             .compose-chip label { font-size: 0.9em; margin: 0; padding: 2px 0; color: @accent_fg_color; }
             .chip-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0 2px 0 4px; -gtk-icon-size: 12px; }
@@ -1124,6 +1124,12 @@ impl NorthMailWindow {
             .more-badge:hover { background: alpha(@accent_color, 0.25); }
             .warning { color: @warning_color; }
             .compose-send { min-height: 24px; padding-top: 2px; padding-bottom: 2px; }
+            .format-bar { background-color: white; }
+            .format-bar button { min-height: 18px; min-width: 18px; padding: 1px; }
+            .format-bar button image { -gtk-icon-size: 14px; }
+            .format-bar dropdown { min-height: 18px; }
+            .format-bar dropdown button { min-height: 18px; padding: 1px 4px; font-size: 0.85em; }
+            .format-bar .linked button:checked { background: @accent_bg_color; color: @accent_fg_color; }
             ",
         );
         gtk4::style_context_add_provider_for_display(
@@ -1158,6 +1164,7 @@ impl NorthMailWindow {
         let content = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
             .spacing(0)
+            .css_classes(["view"])
             .build();
 
         // --- From dropdown in header ---
@@ -1321,6 +1328,513 @@ impl NorthMailWindow {
             .top_margin(12)
             .bottom_margin(12)
             .build();
+
+        // Create text tags for formatting
+        let buffer = text_view.buffer();
+        let tag_table = buffer.tag_table();
+
+        // Basic style tags
+        let bold_tag = gtk4::TextTag::builder().name("bold").weight(700).build();
+        let italic_tag = gtk4::TextTag::builder().name("italic").style(gtk4::pango::Style::Italic).build();
+        let underline_tag = gtk4::TextTag::builder().name("underline").underline(gtk4::pango::Underline::Single).build();
+        let strikethrough_tag = gtk4::TextTag::builder().name("strikethrough").strikethrough(true).build();
+
+        // Alignment tags (for paragraph-level formatting)
+        let align_left_tag = gtk4::TextTag::builder().name("align-left").justification(gtk4::Justification::Left).build();
+        let align_center_tag = gtk4::TextTag::builder().name("align-center").justification(gtk4::Justification::Center).build();
+        let align_right_tag = gtk4::TextTag::builder().name("align-right").justification(gtk4::Justification::Right).build();
+
+        tag_table.add(&bold_tag);
+        tag_table.add(&italic_tag);
+        tag_table.add(&underline_tag);
+        tag_table.add(&strikethrough_tag);
+        tag_table.add(&align_left_tag);
+        tag_table.add(&align_center_tag);
+        tag_table.add(&align_right_tag);
+
+        // Pre-create font family tags
+        let font_names = ["Sans", "Serif", "Monospace", "Cantarell", "DejaVu Sans"];
+        for font in &font_names {
+            let tag = gtk4::TextTag::builder()
+                .name(&format!("font-{}", font.to_lowercase().replace(' ', "-")))
+                .family(*font)
+                .build();
+            tag_table.add(&tag);
+        }
+
+        // Pre-create font size tags
+        let sizes = [10, 11, 12, 14, 16, 18, 20, 24, 28, 32];
+        for size in &sizes {
+            let tag = gtk4::TextTag::builder()
+                .name(&format!("size-{}", size))
+                .size_points(*size as f64)
+                .build();
+            tag_table.add(&tag);
+        }
+
+        // Formatting toolbar
+        let format_bar = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(6)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(2)
+            .margin_bottom(2)
+            .css_classes(["format-bar", "compose-fields"])
+            .build();
+
+        // Helper to create a button group box
+        let create_button_group = || -> gtk4::Box {
+            gtk4::Box::builder()
+                .orientation(gtk4::Orientation::Horizontal)
+                .spacing(0)
+                .css_classes(["linked"])
+                .build()
+        };
+
+        // Font family dropdown
+        let font_families = gtk4::StringList::new(&font_names);
+        let font_dropdown = gtk4::DropDown::builder()
+            .model(&font_families)
+            .tooltip_text("Font Family")
+            .build();
+
+        // Font size dropdown
+        let size_strings: Vec<String> = sizes.iter().map(|s| s.to_string()).collect();
+        let size_strs: Vec<&str> = size_strings.iter().map(|s| s.as_str()).collect();
+        let font_sizes = gtk4::StringList::new(&size_strs);
+        let size_dropdown = gtk4::DropDown::builder()
+            .model(&font_sizes)
+            .selected(2) // Default to 12
+            .tooltip_text("Font Size")
+            .build();
+
+        // Text style group (Bold, Italic, Underline, Strikethrough)
+        let style_group = create_button_group();
+
+        let bold_btn = gtk4::ToggleButton::builder()
+            .icon_name("format-text-bold-symbolic")
+            .tooltip_text("Bold (Ctrl+B)")
+            .build();
+
+        let italic_btn = gtk4::ToggleButton::builder()
+            .icon_name("format-text-italic-symbolic")
+            .tooltip_text("Italic (Ctrl+I)")
+            .build();
+
+        let underline_btn = gtk4::ToggleButton::builder()
+            .icon_name("format-text-underline-symbolic")
+            .tooltip_text("Underline (Ctrl+U)")
+            .build();
+
+        let strikethrough_btn = gtk4::ToggleButton::builder()
+            .icon_name("format-text-strikethrough-symbolic")
+            .tooltip_text("Strikethrough")
+            .build();
+
+        style_group.append(&bold_btn);
+        style_group.append(&italic_btn);
+        style_group.append(&underline_btn);
+        style_group.append(&strikethrough_btn);
+
+        // Alignment group
+        let align_group = create_button_group();
+
+        let align_left_btn = gtk4::ToggleButton::builder()
+            .icon_name("format-justify-left-symbolic")
+            .tooltip_text("Align Left")
+            .active(true)
+            .build();
+
+        let align_center_btn = gtk4::ToggleButton::builder()
+            .icon_name("format-justify-center-symbolic")
+            .tooltip_text("Center")
+            .build();
+
+        let align_right_btn = gtk4::ToggleButton::builder()
+            .icon_name("format-justify-right-symbolic")
+            .tooltip_text("Align Right")
+            .build();
+
+        align_center_btn.set_group(Some(&align_left_btn));
+        align_right_btn.set_group(Some(&align_left_btn));
+
+        align_group.append(&align_left_btn);
+        align_group.append(&align_center_btn);
+        align_group.append(&align_right_btn);
+
+        // List group
+        let list_group = create_button_group();
+
+        let bullet_btn = gtk4::ToggleButton::builder()
+            .icon_name("view-list-bullet-symbolic")
+            .tooltip_text("Bullet List")
+            .build();
+
+        let numbered_btn = gtk4::ToggleButton::builder()
+            .icon_name("view-list-ordered-symbolic")
+            .tooltip_text("Numbered List")
+            .build();
+
+        list_group.append(&bullet_btn);
+        list_group.append(&numbered_btn);
+
+        format_bar.append(&font_dropdown);
+        format_bar.append(&size_dropdown);
+        format_bar.append(&style_group);
+        format_bar.append(&align_group);
+        format_bar.append(&list_group);
+
+        // Helper to toggle tag on selection
+        let toggle_tag = |buffer: &gtk4::TextBuffer, tag_name: &str| {
+            if let Some((start, end)) = buffer.selection_bounds() {
+                let tag_table = buffer.tag_table();
+                if let Some(tag) = tag_table.lookup(tag_name) {
+                    if start.has_tag(&tag) {
+                        buffer.remove_tag(&tag, &start, &end);
+                    } else {
+                        buffer.apply_tag(&tag, &start, &end);
+                    }
+                }
+            }
+        };
+
+        // Helper to apply tag to selection (replacing others of same type)
+        let apply_tag_exclusive = |buffer: &gtk4::TextBuffer, tag_name: &str, prefix: &str| {
+            if let Some((start, end)) = buffer.selection_bounds() {
+                let tag_table = buffer.tag_table();
+                // Remove all tags with this prefix
+                let mut i = 0;
+                loop {
+                    if let Some(tag) = tag_table.lookup(&format!("{}-{}", prefix, i)) {
+                        buffer.remove_tag(&tag, &start, &end);
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                // Apply the new tag
+                if let Some(tag) = tag_table.lookup(tag_name) {
+                    buffer.apply_tag(&tag, &start, &end);
+                }
+            }
+        };
+
+        // Helper to get paragraph bounds for current selection/cursor
+        let get_paragraph_bounds = |buffer: &gtk4::TextBuffer| -> Option<(gtk4::TextIter, gtk4::TextIter)> {
+            let (start, end) = buffer.selection_bounds().unwrap_or_else(|| {
+                let cursor = buffer.iter_at_offset(buffer.cursor_position());
+                (cursor.clone(), cursor)
+            });
+            let mut para_start = start;
+            para_start.set_line_offset(0);
+            let mut para_end = end;
+            if !para_end.ends_line() {
+                para_end.forward_to_line_end();
+            }
+            Some((para_start, para_end))
+        };
+
+        // Connect font dropdown
+        {
+            let buffer = text_view.buffer();
+            let font_names = font_names.clone();
+            font_dropdown.connect_selected_notify(move |dropdown| {
+                let idx = dropdown.selected() as usize;
+                if idx < font_names.len() {
+                    let font = font_names[idx];
+                    let tag_name = format!("font-{}", font.to_lowercase().replace(' ', "-"));
+                    if let Some((start, end)) = buffer.selection_bounds() {
+                        // Remove other font tags first
+                        for f in &font_names {
+                            let other_tag = format!("font-{}", f.to_lowercase().replace(' ', "-"));
+                            if let Some(tag) = buffer.tag_table().lookup(&other_tag) {
+                                buffer.remove_tag(&tag, &start, &end);
+                            }
+                        }
+                        if let Some(tag) = buffer.tag_table().lookup(&tag_name) {
+                            buffer.apply_tag(&tag, &start, &end);
+                        }
+                    }
+                }
+            });
+        }
+
+        // Connect size dropdown
+        {
+            let buffer = text_view.buffer();
+            size_dropdown.connect_selected_notify(move |dropdown| {
+                let idx = dropdown.selected() as usize;
+                if idx < sizes.len() {
+                    let size = sizes[idx];
+                    let tag_name = format!("size-{}", size);
+                    if let Some((start, end)) = buffer.selection_bounds() {
+                        // Remove other size tags first
+                        for s in &sizes {
+                            let other_tag = format!("size-{}", s);
+                            if let Some(tag) = buffer.tag_table().lookup(&other_tag) {
+                                buffer.remove_tag(&tag, &start, &end);
+                            }
+                        }
+                        if let Some(tag) = buffer.tag_table().lookup(&tag_name) {
+                            buffer.apply_tag(&tag, &start, &end);
+                        }
+                    }
+                }
+            });
+        }
+
+        // Connect formatting buttons
+        {
+            let buffer = buffer.clone();
+            bold_btn.connect_clicked(move |_| {
+                toggle_tag(&buffer, "bold");
+            });
+        }
+        {
+            let buffer = text_view.buffer();
+            italic_btn.connect_clicked(move |_| {
+                toggle_tag(&buffer, "italic");
+            });
+        }
+        {
+            let buffer = text_view.buffer();
+            underline_btn.connect_clicked(move |_| {
+                toggle_tag(&buffer, "underline");
+            });
+        }
+        {
+            let buffer = text_view.buffer();
+            strikethrough_btn.connect_clicked(move |_| {
+                toggle_tag(&buffer, "strikethrough");
+            });
+        }
+
+        // Connect alignment buttons - apply to paragraph
+        {
+            let buffer = text_view.buffer();
+            align_left_btn.connect_toggled(move |btn| {
+                if btn.is_active() {
+                    if let Some((start, end)) = get_paragraph_bounds(&buffer) {
+                        // Remove other alignment tags
+                        if let Some(tag) = buffer.tag_table().lookup("align-center") {
+                            buffer.remove_tag(&tag, &start, &end);
+                        }
+                        if let Some(tag) = buffer.tag_table().lookup("align-right") {
+                            buffer.remove_tag(&tag, &start, &end);
+                        }
+                        if let Some(tag) = buffer.tag_table().lookup("align-left") {
+                            buffer.apply_tag(&tag, &start, &end);
+                        }
+                    }
+                }
+            });
+        }
+        {
+            let buffer = text_view.buffer();
+            align_center_btn.connect_toggled(move |btn| {
+                if btn.is_active() {
+                    if let Some((start, end)) = get_paragraph_bounds(&buffer) {
+                        if let Some(tag) = buffer.tag_table().lookup("align-left") {
+                            buffer.remove_tag(&tag, &start, &end);
+                        }
+                        if let Some(tag) = buffer.tag_table().lookup("align-right") {
+                            buffer.remove_tag(&tag, &start, &end);
+                        }
+                        if let Some(tag) = buffer.tag_table().lookup("align-center") {
+                            buffer.apply_tag(&tag, &start, &end);
+                        }
+                    }
+                }
+            });
+        }
+        {
+            let buffer = text_view.buffer();
+            align_right_btn.connect_toggled(move |btn| {
+                if btn.is_active() {
+                    if let Some((start, end)) = get_paragraph_bounds(&buffer) {
+                        if let Some(tag) = buffer.tag_table().lookup("align-left") {
+                            buffer.remove_tag(&tag, &start, &end);
+                        }
+                        if let Some(tag) = buffer.tag_table().lookup("align-center") {
+                            buffer.remove_tag(&tag, &start, &end);
+                        }
+                        if let Some(tag) = buffer.tag_table().lookup("align-right") {
+                            buffer.apply_tag(&tag, &start, &end);
+                        }
+                    }
+                }
+            });
+        }
+
+        // Connect bullet list button - add/remove "• " at line starts
+        {
+            let buffer = text_view.buffer();
+            bullet_btn.connect_toggled(move |btn| {
+                // Only act on user clicks, not programmatic updates
+                if !btn.is_sensitive() { return; }
+
+                if let Some((sel_start, sel_end)) = get_paragraph_bounds(&buffer) {
+                    let start_line = sel_start.line();
+                    let end_line = sel_end.line();
+
+                    for line in start_line..=end_line {
+                        let mut line_start = buffer.iter_at_line(line).unwrap();
+                        let line_text = line_start.slice(&{
+                            let mut end = line_start.clone();
+                            end.forward_to_line_end();
+                            end
+                        });
+                        let line_str = line_text.to_string();
+
+                        if line_str.starts_with("• ") {
+                            // Remove bullet
+                            let mut bullet_end = line_start.clone();
+                            bullet_end.forward_chars(2);
+                            buffer.delete(&mut line_start, &mut bullet_end);
+                        } else if !line_str.trim().is_empty() {
+                            // First remove any existing number prefix
+                            if line_str.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                                if let Some(pos) = line_str.find(". ") {
+                                    let mut num_end = line_start.clone();
+                                    num_end.forward_chars((pos + 2) as i32);
+                                    buffer.delete(&mut line_start, &mut num_end);
+                                }
+                            }
+                            // Add bullet
+                            let mut line_start = buffer.iter_at_line(line).unwrap();
+                            buffer.insert(&mut line_start, "• ");
+                        }
+                    }
+                }
+            });
+        }
+
+        // Connect numbered list button - add/remove "1. " etc at line starts
+        {
+            let buffer = text_view.buffer();
+            numbered_btn.connect_toggled(move |btn| {
+                // Only act on user clicks, not programmatic updates
+                if !btn.is_sensitive() { return; }
+
+                if let Some((sel_start, sel_end)) = get_paragraph_bounds(&buffer) {
+                    let start_line = sel_start.line();
+                    let end_line = sel_end.line();
+
+                    // Check if first line has a number
+                    let first_iter = buffer.iter_at_line(start_line).unwrap();
+                    let first_text = first_iter.slice(&{
+                        let mut end = first_iter.clone();
+                        end.forward_to_line_end();
+                        end
+                    });
+                    let first_str = first_text.to_string();
+                    let is_numbered = first_str.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+                        && first_str.contains(". ");
+
+                    let mut num = 1;
+                    for line in start_line..=end_line {
+                        let mut line_start = buffer.iter_at_line(line).unwrap();
+                        let line_text = line_start.slice(&{
+                            let mut end = line_start.clone();
+                            end.forward_to_line_end();
+                            end
+                        });
+                        let line_str = line_text.to_string();
+
+                        if is_numbered {
+                            // Remove number - find ". " and delete up to it
+                            if let Some(pos) = line_str.find(". ") {
+                                let mut num_end = line_start.clone();
+                                num_end.forward_chars((pos + 2) as i32);
+                                buffer.delete(&mut line_start, &mut num_end);
+                            }
+                        } else if !line_str.trim().is_empty() {
+                            // First remove any existing bullet prefix
+                            if line_str.starts_with("• ") {
+                                let mut bullet_end = line_start.clone();
+                                bullet_end.forward_chars(2);
+                                buffer.delete(&mut line_start, &mut bullet_end);
+                            }
+                            // Add number
+                            let mut line_start = buffer.iter_at_line(line).unwrap();
+                            buffer.insert(&mut line_start, &format!("{}. ", num));
+                            num += 1;
+                        }
+                    }
+                }
+            });
+        }
+
+        // Track cursor position to update button states
+        // Create shared update function
+        let update_list_buttons = {
+            let bullet_btn = bullet_btn.clone();
+            let numbered_btn = numbered_btn.clone();
+            Rc::new(move |buf: &gtk4::TextBuffer| {
+                let iter = buf.iter_at_offset(buf.cursor_position());
+
+                // Check current line for bullet/numbered list
+                let mut line_start = iter.clone();
+                line_start.set_line_offset(0);
+                let mut line_end = line_start.clone();
+                line_end.forward_to_line_end();
+                let line_text = line_start.slice(&line_end);
+
+                let is_bullet = line_text.starts_with("• ");
+                let is_numbered = line_text.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+                    && line_text.contains(". ");
+
+                // Temporarily block signal by making insensitive during programmatic update
+                bullet_btn.set_sensitive(false);
+                bullet_btn.set_active(is_bullet);
+                bullet_btn.set_sensitive(true);
+
+                numbered_btn.set_sensitive(false);
+                numbered_btn.set_active(is_numbered);
+                numbered_btn.set_sensitive(true);
+            })
+        };
+
+        {
+            let bold_btn = bold_btn.clone();
+            let italic_btn = italic_btn.clone();
+            let underline_btn = underline_btn.clone();
+            let strikethrough_btn = strikethrough_btn.clone();
+            let update_list_buttons = update_list_buttons.clone();
+            let buffer = text_view.buffer();
+
+            buffer.connect_cursor_position_notify(move |buf| {
+                let iter = buf.iter_at_offset(buf.cursor_position());
+                let tag_table = buf.tag_table();
+
+                if let Some(tag) = tag_table.lookup("bold") {
+                    bold_btn.set_active(iter.has_tag(&tag));
+                }
+                if let Some(tag) = tag_table.lookup("italic") {
+                    italic_btn.set_active(iter.has_tag(&tag));
+                }
+                if let Some(tag) = tag_table.lookup("underline") {
+                    underline_btn.set_active(iter.has_tag(&tag));
+                }
+                if let Some(tag) = tag_table.lookup("strikethrough") {
+                    strikethrough_btn.set_active(iter.has_tag(&tag));
+                }
+
+                update_list_buttons(buf);
+            });
+        }
+
+        // Also update on buffer changes (for when bullet/number is added/removed)
+        {
+            let update_list_buttons = update_list_buttons.clone();
+            let buffer = text_view.buffer();
+            buffer.connect_changed(move |buf| {
+                update_list_buttons(buf);
+            });
+        }
+
+        content.append(&format_bar);
 
         let text_scrolled = gtk4::ScrolledWindow::builder()
             .child(&text_view)
