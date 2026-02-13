@@ -20,6 +20,8 @@ Cargo.lock
 *.o
 *.a
 *.so
+data/gschemas.compiled
+data/schemas/
 
 # Editor backup files
 *~
