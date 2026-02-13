@@ -2751,7 +2751,7 @@ impl NorthMailApplication {
                             id: 0,
                             folder_id,
                             uid: msg.uid as i64,
-                            message_id: None,
+                            message_id: msg.message_id.clone(),
                             subject: Some(msg.subject.clone()),
                             from_address: Some(msg.from_address.clone()),
                             from_name: Some(msg.from.clone()),
@@ -3890,19 +3890,12 @@ impl NorthMailApplication {
                     FetchEvent::BackgroundMessages(messages) => {
                         // Track UIDs for cache cleanup
                         synced_uids.extend(messages.iter().map(|m| m.uid as i64));
-                        // Save to cache
+                        // Save to cache only - DO NOT update UI here
+                        // The UI already shows initial batch from cache.
+                        // Updating UI with 500+ messages per batch causes O(n²) widget rebuilds
+                        // which freezes the app when syncing large mailboxes (62k+ messages).
+                        // Users can use "load more" (pagination) to see older messages.
                         app.save_messages_to_cache(account_id, folder_path, &messages);
-                        // If still viewing this folder, append new matching messages
-                        // (deduped by UID, filtered by message_matches)
-                        if !is_stale {
-                            if let Some(window) = app.active_window() {
-                                if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
-                                    if let Some(message_list) = win.message_list() {
-                                        message_list.append_new_messages(messages);
-                                    }
-                                }
-                            }
-                        }
                     }
                     FetchEvent::SyncProgress { synced, total } => {
                         // Update sync progress in sidebar (non-intrusive)
@@ -4292,6 +4285,7 @@ impl NorthMailApplication {
                     id: h.uid as i64,
                     uid: h.uid,
                     folder_id,
+                    message_id: h.envelope.message_id.clone(),
                     subject: decode_mime_header(&h.envelope.subject.clone().unwrap_or_default()),
                     from: h
                         .envelope
@@ -6151,11 +6145,12 @@ impl NorthMailApplication {
                         match receiver.try_recv() {
                             Ok(Ok(())) => {
                                 info!("Cache cleared successfully");
-                                // Close and reopen dialog to refresh counts
+                                // Close dialog
                                 if let Some(dialog) = dialog_weak.upgrade() {
                                     dialog.close();
                                 }
-                                app.show_settings_window();
+                                // Trigger a fresh sync of all accounts
+                                app.sync_all_accounts();
                                 break;
                             }
                             Ok(Err(e)) => {
@@ -7245,6 +7240,46 @@ impl NorthMailApplication {
 
         // Move on IMAP
         self.move_message_imap(&account_id, &source_folder, uid, "Archive");
+    }
+
+    /// Move a message to spam folder
+    pub fn move_to_spam(&self, message_id: i64, uid: u32, folder_id: i64) {
+        info!("move_to_spam: uid={}, folder_id={}", uid, folder_id);
+
+        let effective_folder_id = if folder_id > 0 {
+            folder_id
+        } else {
+            self.cache_folder_id()
+        };
+
+        if effective_folder_id <= 0 {
+            warn!("move_to_spam: Invalid folder_id {}", effective_folder_id);
+            return;
+        }
+
+        let (account_id, source_folder) = match self.resolve_folder_info(effective_folder_id) {
+            Some(info) => info,
+            None => {
+                warn!("move_to_spam: Could not resolve folder_id {}", effective_folder_id);
+                return;
+            }
+        };
+
+        // Delete from local database
+        if let Some(db) = self.database() {
+            let db_clone = db.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    if let Err(e) = db_clone.delete_message(message_id).await {
+                        error!("move_to_spam: Failed to delete from database: {}", e);
+                    }
+                });
+            });
+        }
+
+        // Move on IMAP
+        self.move_message_imap(&account_id, &source_folder, uid, "Spam");
     }
 
     /// Delete a message (move to Trash folder)

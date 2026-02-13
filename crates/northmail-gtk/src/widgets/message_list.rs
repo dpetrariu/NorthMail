@@ -155,6 +155,8 @@ mod imp {
         pub current_folder_path: RefCell<String>,
         /// Whether skeleton loading is currently shown
         pub is_loading: Cell<bool>,
+        /// Whether a context menu is currently open (prevents auto-selection during rebuilds)
+        pub context_menu_open: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -177,6 +179,28 @@ mod imp {
                         .build(),
                     Signal::builder("star-toggled")
                         .param_types([u32::static_type(), i64::static_type(), i64::static_type(), bool::static_type()])
+                        .build(),
+                    // Context menu signals: (uid, msg_id, folder_id, ...)
+                    Signal::builder("mark-read")
+                        .param_types([u32::static_type(), i64::static_type(), i64::static_type(), bool::static_type()])
+                        .build(),
+                    Signal::builder("archive")
+                        .param_types([u32::static_type(), i64::static_type(), i64::static_type()])
+                        .build(),
+                    Signal::builder("trash")
+                        .param_types([u32::static_type(), i64::static_type(), i64::static_type()])
+                        .build(),
+                    Signal::builder("spam")
+                        .param_types([u32::static_type(), i64::static_type(), i64::static_type()])
+                        .build(),
+                    Signal::builder("reply")
+                        .param_types([u32::static_type()])
+                        .build(),
+                    Signal::builder("reply-all")
+                        .param_types([u32::static_type()])
+                        .build(),
+                    Signal::builder("forward")
+                        .param_types([u32::static_type()])
                         .build(),
                 ]
             })
@@ -335,6 +359,19 @@ impl MessageList {
             .skeleton-circle {
                 background-color: alpha(@view_fg_color, 0.1);
                 border-radius: 50%;
+            }
+            /* Context menu styling - force dark text to override inherited white from selected rows */
+            popover.message-context-menu * {
+                color: #1c1c1c;
+            }
+            popover.message-context-menu modelbutton {
+                background: transparent;
+            }
+            popover.message-context-menu modelbutton:hover {
+                background-color: rgba(0, 0, 0, 0.08);
+            }
+            popover.message-context-menu modelbutton:focus:not(:hover) {
+                background: transparent;
             }
             "
         );
@@ -1141,8 +1178,11 @@ impl MessageList {
                     tracing::debug!("Row activation handler connected");
                 }
 
-                // Restore selection if we had one
-                if let Some(uid) = selected_uid {
+                // Restore selection if we had one, BUT not if a context menu is open
+                // (to prevent auto-selection bugs during background sync with menu open)
+                if imp.context_menu_open.get() {
+                    list_box.unselect_all();
+                } else if let Some(uid) = selected_uid {
                     for (idx, msg) in visible.iter().enumerate() {
                         if msg.uid == uid {
                             if let Some(row) = list_box.row_at_index(idx as i32) {
@@ -1469,8 +1509,215 @@ impl MessageList {
 
         row.add_controller(drag_source);
 
+        // Add context menu for right-click
+        self.add_row_context_menu(&row, msg);
+
         // Add separator between messages
         list_box.append(&row);
+    }
+
+    /// Add native context menu to a message row using gio::Menu
+    fn add_row_context_menu(&self, row: &gtk4::ListBoxRow, msg: &MessageInfo) {
+        use gtk4::gio;
+
+        let msg_uid = msg.uid;
+        let msg_id = msg.id;
+        let msg_folder_id = msg.folder_id;
+        let is_read = msg.is_read;
+        let is_starred = msg.is_starred;
+
+        // Create menu model with sections
+        let menu = gio::Menu::new();
+
+        // Read/Unread toggle
+        if is_read {
+            menu.append(Some("Mark as Unread"), Some("msg.mark-unread"));
+        } else {
+            menu.append(Some("Mark as Read"), Some("msg.mark-read"));
+        }
+
+        // Star toggle
+        if is_starred {
+            menu.append(Some("Unstar"), Some("msg.unstar"));
+        } else {
+            menu.append(Some("Star"), Some("msg.star"));
+        }
+
+        // Actions section
+        let actions_section = gio::Menu::new();
+        actions_section.append(Some("Reply"), Some("msg.reply"));
+        actions_section.append(Some("Reply All"), Some("msg.reply-all"));
+        actions_section.append(Some("Forward"), Some("msg.forward"));
+        menu.append_section(None, &actions_section);
+
+        // Move section
+        let move_section = gio::Menu::new();
+        move_section.append(Some("Archive"), Some("msg.archive"));
+        move_section.append(Some("Move to Trash"), Some("msg.trash"));
+        move_section.append(Some("Mark as Spam"), Some("msg.spam"));
+        menu.append_section(None, &move_section);
+
+        // Create popover menu from model
+        let popover = gtk4::PopoverMenu::from_model(Some(&menu));
+        popover.set_parent(row);
+        popover.set_has_arrow(false);
+        popover.add_css_class("message-context-menu");
+
+        // Create action group for menu items
+        let action_group = gio::SimpleActionGroup::new();
+        let widget = self.clone();
+
+        // Mark as Read action
+        {
+            let action = gio::SimpleAction::new("mark-read", None);
+            let w = widget.clone();
+            let popover_ref = popover.clone();
+            action.connect_activate(move |_, _| {
+                popover_ref.popdown();
+                w.imp().context_menu_open.set(false);
+                w.emit_by_name::<()>("mark-read", &[&msg_uid, &msg_id, &msg_folder_id, &true]);
+            });
+            action_group.add_action(&action);
+        }
+
+        // Mark as Unread action
+        {
+            let action = gio::SimpleAction::new("mark-unread", None);
+            let w = widget.clone();
+            let popover_ref = popover.clone();
+            action.connect_activate(move |_, _| {
+                popover_ref.popdown();
+                w.imp().context_menu_open.set(false);
+                w.emit_by_name::<()>("mark-read", &[&msg_uid, &msg_id, &msg_folder_id, &false]);
+            });
+            action_group.add_action(&action);
+        }
+
+        // Star action
+        {
+            let action = gio::SimpleAction::new("star", None);
+            let w = widget.clone();
+            let popover_ref = popover.clone();
+            action.connect_activate(move |_, _| {
+                popover_ref.popdown();
+                w.imp().context_menu_open.set(false);
+                w.emit_by_name::<()>("star-toggled", &[&msg_uid, &msg_id, &msg_folder_id, &true]);
+            });
+            action_group.add_action(&action);
+        }
+
+        // Unstar action
+        {
+            let action = gio::SimpleAction::new("unstar", None);
+            let w = widget.clone();
+            let popover_ref = popover.clone();
+            action.connect_activate(move |_, _| {
+                popover_ref.popdown();
+                w.imp().context_menu_open.set(false);
+                w.emit_by_name::<()>("star-toggled", &[&msg_uid, &msg_id, &msg_folder_id, &false]);
+            });
+            action_group.add_action(&action);
+        }
+
+        // Reply action
+        {
+            let action = gio::SimpleAction::new("reply", None);
+            let w = widget.clone();
+            let popover_ref = popover.clone();
+            action.connect_activate(move |_, _| {
+                popover_ref.popdown();
+                w.imp().context_menu_open.set(false);
+                w.emit_by_name::<()>("reply", &[&msg_uid]);
+            });
+            action_group.add_action(&action);
+        }
+
+        // Reply All action
+        {
+            let action = gio::SimpleAction::new("reply-all", None);
+            let w = widget.clone();
+            let popover_ref = popover.clone();
+            action.connect_activate(move |_, _| {
+                popover_ref.popdown();
+                w.imp().context_menu_open.set(false);
+                w.emit_by_name::<()>("reply-all", &[&msg_uid]);
+            });
+            action_group.add_action(&action);
+        }
+
+        // Forward action
+        {
+            let action = gio::SimpleAction::new("forward", None);
+            let w = widget.clone();
+            let popover_ref = popover.clone();
+            action.connect_activate(move |_, _| {
+                popover_ref.popdown();
+                w.imp().context_menu_open.set(false);
+                w.emit_by_name::<()>("forward", &[&msg_uid]);
+            });
+            action_group.add_action(&action);
+        }
+
+        // Archive action
+        {
+            let action = gio::SimpleAction::new("archive", None);
+            let w = widget.clone();
+            let popover_ref = popover.clone();
+            action.connect_activate(move |_, _| {
+                popover_ref.popdown();
+                w.imp().context_menu_open.set(false);
+                w.emit_by_name::<()>("archive", &[&msg_uid, &msg_id, &msg_folder_id]);
+            });
+            action_group.add_action(&action);
+        }
+
+        // Trash action
+        {
+            let action = gio::SimpleAction::new("trash", None);
+            let w = widget.clone();
+            let popover_ref = popover.clone();
+            action.connect_activate(move |_, _| {
+                popover_ref.popdown();
+                w.imp().context_menu_open.set(false);
+                w.emit_by_name::<()>("trash", &[&msg_uid, &msg_id, &msg_folder_id]);
+            });
+            action_group.add_action(&action);
+        }
+
+        // Spam action
+        {
+            let action = gio::SimpleAction::new("spam", None);
+            let w = widget.clone();
+            let popover_ref = popover.clone();
+            action.connect_activate(move |_, _| {
+                popover_ref.popdown();
+                w.imp().context_menu_open.set(false);
+                w.emit_by_name::<()>("spam", &[&msg_uid, &msg_id, &msg_folder_id]);
+            });
+            action_group.add_action(&action);
+        }
+
+        // Insert action group into the row
+        row.insert_action_group("msg", Some(&action_group));
+
+        // Right-click gesture for context menu
+        let gesture = gtk4::GestureClick::new();
+        gesture.set_button(3); // Right click
+        let popover_clone = popover.clone();
+        let widget_for_gesture = self.clone();
+        gesture.connect_pressed(move |gesture, _n, x, y| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            widget_for_gesture.imp().context_menu_open.set(true);
+            popover_clone.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover_clone.popup();
+        });
+        row.add_controller(gesture);
+
+        // Track when popover closes
+        let widget_for_close = self.clone();
+        popover.connect_closed(move |_| {
+            widget_for_close.imp().context_menu_open.set(false);
+        });
     }
 
     /// Update a message's starred status in the list
@@ -1551,8 +1798,10 @@ impl MessageList {
                 imp.load_more_row.replace(Some(load_row));
             }
 
-            // Restore selection
-            if let Some(uid) = selected_uid {
+            // Restore selection, BUT not if a context menu is open
+            if imp.context_menu_open.get() {
+                list_box.unselect_all();
+            } else if let Some(uid) = selected_uid {
                 let filtered: Vec<&MessageInfo> = messages.iter()
                     .filter(|m| self.message_matches(m))
                     .collect();
@@ -1604,6 +1853,7 @@ pub struct MessageInfo {
     pub id: i64,
     pub uid: u32,
     pub folder_id: i64,
+    pub message_id: Option<String>,
     pub subject: String,
     pub from: String,
     pub from_address: String,
@@ -1623,6 +1873,7 @@ impl From<&northmail_core::models::DbMessage> for MessageInfo {
             id: db_msg.id,
             uid: db_msg.uid as u32,
             folder_id: db_msg.folder_id,
+            message_id: db_msg.message_id.clone(),
             subject: db_msg.subject.clone().unwrap_or_default(),
             from: db_msg
                 .from_name

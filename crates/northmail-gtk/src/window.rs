@@ -711,23 +711,184 @@ impl NorthMailWindow {
             }
         });
 
-        // Connect star-toggled callback (star button clicked in message list)
+        // Connect star-toggled callback (star button clicked in message list or context menu)
         let window = self.clone();
         message_list.connect_star_toggled(move |list, uid, msg_id, folder_id, is_starred| {
             debug!("Star toggled in list: uid={}, is_starred={}", uid, is_starred);
-            // Update the message info in the list
-            if is_starred {
-                list.update_message_starred(uid, true);
-            } else {
-                list.update_message_starred(uid, false);
-            }
-            // Sync to database and IMAP via application
+            list.update_message_starred(uid, is_starred);
             if let Some(app) = window.application() {
                 if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
                     app.set_message_starred(msg_id, uid, folder_id, is_starred);
                 }
             }
         });
+
+        // Connect mark-read callback from context menu
+        let window = self.clone();
+        message_list.connect_closure(
+            "mark-read",
+            false,
+            glib::closure_local!(move |list: &MessageList, uid: u32, msg_id: i64, folder_id: i64, is_read: bool| {
+                debug!("Mark read from context menu: uid={}, is_read={}", uid, is_read);
+                list.update_message_read(uid, is_read);
+                if let Some(app) = window.application() {
+                    if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                        app.set_message_read(msg_id, uid, folder_id, is_read);
+                    }
+                }
+            }),
+        );
+
+        // Connect archive callback from context menu
+        let window = self.clone();
+        message_list.connect_closure(
+            "archive",
+            false,
+            glib::closure_local!(move |list: &MessageList, uid: u32, msg_id: i64, folder_id: i64| {
+                debug!("Archive from context menu: uid={}", uid);
+                list.remove_message(uid);
+                if let Some(app) = window.application() {
+                    if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                        app.archive_message(msg_id, uid, folder_id);
+                    }
+                }
+            }),
+        );
+
+        // Connect trash callback from context menu
+        let window = self.clone();
+        message_list.connect_closure(
+            "trash",
+            false,
+            glib::closure_local!(move |list: &MessageList, uid: u32, msg_id: i64, folder_id: i64| {
+                debug!("Trash from context menu: uid={}", uid);
+                list.remove_message(uid);
+                if let Some(app) = window.application() {
+                    if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                        app.delete_message(msg_id, uid, folder_id);
+                    }
+                }
+            }),
+        );
+
+        // Connect spam callback from context menu
+        let window = self.clone();
+        message_list.connect_closure(
+            "spam",
+            false,
+            glib::closure_local!(move |list: &MessageList, uid: u32, msg_id: i64, folder_id: i64| {
+                debug!("Mark as spam from context menu: uid={}", uid);
+                list.remove_message(uid);
+                if let Some(app) = window.application() {
+                    if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                        app.move_to_spam(msg_id, uid, folder_id);
+                    }
+                }
+            }),
+        );
+
+        // Connect reply callback from context menu
+        let window = self.clone();
+        message_list.connect_closure(
+            "reply",
+            false,
+            glib::closure_local!(move |list: &MessageList, uid: u32| {
+                debug!("Reply from context menu: uid={}", uid);
+                let messages = list.imp().messages.borrow();
+                if let Some(msg) = messages.iter().find(|m| m.uid == uid) {
+                    let reply_to = extract_email_address(&msg.from);
+                    let from_display = msg.from.clone();
+                    let subject = if msg.subject.to_lowercase().starts_with("re:") {
+                        msg.subject.clone()
+                    } else {
+                        format!("Re: {}", msg.subject)
+                    };
+                    drop(messages);
+                    let mode = ComposeMode::Reply {
+                        to: reply_to,
+                        to_display: from_display,
+                        subject,
+                        quoted_body: String::new(),
+                        in_reply_to: None,
+                        references: Vec::new(),
+                    };
+                    window.show_compose_dialog_with_mode(mode);
+                }
+            }),
+        );
+
+        // Connect reply-all callback from context menu
+        let window = self.clone();
+        message_list.connect_closure(
+            "reply-all",
+            false,
+            glib::closure_local!(move |list: &MessageList, uid: u32| {
+                debug!("Reply all from context menu: uid={}", uid);
+                let messages = list.imp().messages.borrow();
+                if let Some(msg) = messages.iter().find(|m| m.uid == uid) {
+                    let reply_to = extract_email_address(&msg.from);
+                    let from_display = msg.from.clone();
+                    let to_addrs: Vec<(String, String)> = msg.to.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| {
+                            let email = extract_email_address(&s);
+                            (email.clone(), s)
+                        })
+                        .filter(|(e, _)| !e.is_empty() && e.contains('@') && e != &reply_to)
+                        .collect();
+                    let cc_addrs: Vec<(String, String)> = msg.cc.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| {
+                            let email = extract_email_address(&s);
+                            (email.clone(), s)
+                        })
+                        .filter(|(e, _)| !e.is_empty() && e.contains('@') && e != &reply_to)
+                        .collect();
+                    let subject = if msg.subject.to_lowercase().starts_with("re:") {
+                        msg.subject.clone()
+                    } else {
+                        format!("Re: {}", msg.subject)
+                    };
+                    drop(messages);
+                    let mode = ComposeMode::ReplyAll {
+                        to: std::iter::once((reply_to, from_display)).chain(to_addrs).collect(),
+                        cc: cc_addrs,
+                        subject,
+                        quoted_body: String::new(),
+                        in_reply_to: None,
+                        references: Vec::new(),
+                    };
+                    window.show_compose_dialog_with_mode(mode);
+                }
+            }),
+        );
+
+        // Connect forward callback from context menu
+        let window = self.clone();
+        message_list.connect_closure(
+            "forward",
+            false,
+            glib::closure_local!(move |list: &MessageList, uid: u32| {
+                debug!("Forward from context menu: uid={}", uid);
+                let messages = list.imp().messages.borrow();
+                if let Some(msg) = messages.iter().find(|m| m.uid == uid) {
+                    let subject = if msg.subject.to_lowercase().starts_with("fwd:") {
+                        msg.subject.clone()
+                    } else {
+                        format!("Fwd: {}", msg.subject)
+                    };
+                    drop(messages);
+                    let mode = ComposeMode::Forward {
+                        subject,
+                        quoted_body: String::new(),
+                        attachments: Vec::new(),
+                    };
+                    window.show_compose_dialog_with_mode(mode);
+                }
+            }),
+        );
 
         imp.message_list.set(message_list).unwrap();
 

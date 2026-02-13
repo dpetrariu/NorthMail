@@ -495,6 +495,13 @@ impl SimpleImapClient {
                     envelope.cc = addrs;
                 }
             }
+            // Message-ID is the 10th element (index 9)
+            // ENVELOPE format: (date subject from sender reply-to to cc bcc in-reply-to message-id)
+            if let Some(msg_id) = parts.get(9) {
+                if *msg_id != "NIL" {
+                    envelope.message_id = Some(msg_id.clone());
+                }
+            }
         }
 
         envelope
