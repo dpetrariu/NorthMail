@@ -419,7 +419,7 @@ mod imp {
             self.parent_startup();
             info!("Application starting up");
 
-            // Set human-readable application name (shown in GNOME shell, app switcher, etc.)
+            // Set human-readable application name
             glib::set_application_name("NorthMail");
 
             // Load bundled resources (compiled by build.rs)
@@ -449,6 +449,10 @@ mod imp {
                                 icon_theme.add_search_path(&icons_path);
                                 info!("Added icon search path: {:?}", icons_path);
                             }
+
+                            // Install desktop file and icon for dev builds so GNOME dock
+                            // shows "NorthMail" name and the correct icon instead of the raw app ID
+                            Self::install_dev_desktop_entry(root);
                         }
                     }
                 }
@@ -459,6 +463,54 @@ mod imp {
 
             let app = self.obj();
             app.setup_actions();
+        }
+    }
+
+    impl NorthMailApplication {
+        /// Install .desktop file and icon to ~/.local for dev builds.
+        /// This makes GNOME show "NorthMail" in the dock tooltip and the correct app icon.
+        fn install_dev_desktop_entry(project_root: &std::path::Path) {
+            let home = match std::env::var("HOME") {
+                Ok(h) => std::path::PathBuf::from(h),
+                Err(_) => return,
+            };
+
+            // Install desktop file
+            let desktop_src = project_root.join("data").join("org.northmail.NorthMail.desktop");
+            let desktop_dst_dir = home.join(".local/share/applications");
+            let desktop_dst = desktop_dst_dir.join("org.northmail.NorthMail.desktop");
+            if desktop_src.exists() && !desktop_dst.exists() {
+                let _ = std::fs::create_dir_all(&desktop_dst_dir);
+                if let Ok(contents) = std::fs::read_to_string(&desktop_src) {
+                    // Rewrite Exec= to point to the dev binary
+                    let exe = std::env::current_exe().unwrap_or_default();
+                    let patched = contents
+                        .lines()
+                        .map(|line| {
+                            if line.starts_with("Exec=") {
+                                format!("Exec={} %U", exe.display())
+                            } else {
+                                line.to_string()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if std::fs::write(&desktop_dst, patched).is_ok() {
+                        info!("Installed dev desktop file to {:?}", desktop_dst);
+                    }
+                }
+            }
+
+            // Install icon
+            let icon_src = project_root.join("data/icons/hicolor/128x128/apps/org.northmail.NorthMail.png");
+            let icon_dst_dir = home.join(".local/share/icons/hicolor/128x128/apps");
+            let icon_dst = icon_dst_dir.join("org.northmail.NorthMail.png");
+            if icon_src.exists() && !icon_dst.exists() {
+                let _ = std::fs::create_dir_all(&icon_dst_dir);
+                if std::fs::copy(&icon_src, &icon_dst).is_ok() {
+                    info!("Installed dev icon to {:?}", icon_dst);
+                }
+            }
         }
     }
 

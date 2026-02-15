@@ -2,5 +2,28 @@
 <gresources>
   <gresource prefix="/org/northmail/NorthMail/icons/scalable/actions">
     <file alias="dock-left-symbolic.svg">icons/hicolor/symbolic/actions/dock-left-symbolic.svg</file>
+    <file alias="mail-inbox-symbolic.svg">icons/hicolor/symbolic/actions/mail-inbox-symbolic.svg</file>
+    <file alias="funnel-symbolic.svg">icons/hicolor/symbolic/actions/funnel-symbolic.svg</file>
+  </gresource>
+  <gresource prefix="/org/northmail/NorthMail/icons/16x16/apps">
+    <file alias="org.northmail.NorthMail.png">icons/hicolor/16x16/apps/org.northmail.NorthMail.png</file>
+  </gresource>
+  <gresource prefix="/org/northmail/NorthMail/icons/32x32/apps">
+    <file alias="org.northmail.NorthMail.png">icons/hicolor/32x32/apps/org.northmail.NorthMail.png</file>
+  </gresource>
+  <gresource prefix="/org/northmail/NorthMail/icons/48x48/apps">
+    <file alias="org.northmail.NorthMail.png">icons/hicolor/48x48/apps/org.northmail.NorthMail.png</file>
+  </gresource>
+  <gresource prefix="/org/northmail/NorthMail/icons/64x64/apps">
+    <file alias="org.northmail.NorthMail.png">icons/hicolor/64x64/apps/org.northmail.NorthMail.png</file>
+  </gresource>
+  <gresource prefix="/org/northmail/NorthMail/icons/128x128/apps">
+    <file alias="org.northmail.NorthMail.png">icons/hicolor/128x128/apps/org.northmail.NorthMail.png</file>
+  </gresource>
+  <gresource prefix="/org/northmail/NorthMail/icons/256x256/apps">
+    <file alias="org.northmail.NorthMail.png">icons/hicolor/256x256/apps/org.northmail.NorthMail.png</file>
+  </gresource>
+  <gresource prefix="/org/northmail/NorthMail/icons/512x512/apps">
+    <file alias="org.northmail.NorthMail.png">icons/hicolor/512x512/apps/org.northmail.NorthMail.png</file>
   </gresource>
 </gresources>

@@ -22,13 +22,33 @@ A modern email client for GNOME, built with GTK4/libadwaita and Rust.
 - libsecret 0.20+
 - WebKitGTK 6.0
 - SQLite 3.40+
+- OpenSSL
+
+#### Fedora
+
+```bash
+sudo dnf install -y gcc gcc-c++ gtk4-devel libadwaita-devel \
+    gnome-online-accounts-devel libsecret-devel webkitgtk6.0-devel \
+    sqlite-devel openssl-devel
+```
+
+#### Ubuntu/Debian
+
+```bash
+sudo apt install -y build-essential libgtk-4-dev libadwaita-1-dev \
+    libgoa-1.0-dev libsecret-1-dev libwebkitgtk-6.0-dev \
+    libsqlite3-dev libssl-dev
+```
 
 ### From Source
 
 ```bash
 # Clone the repository
-git clone https://github.com/northmail/northmail.git
-cd northmail
+git clone https://github.com/dpetrariu/NorthMail.git
+cd NorthMail
+
+# Compile GSettings schema (required before first run)
+glib-compile-schemas data/
 
 # Build with Cargo
 cargo build --release
