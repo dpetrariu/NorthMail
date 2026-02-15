@@ -337,6 +337,11 @@ impl MessageView {
     pub fn show_message(&self, message: &MessageDetails) {
         let imp = self.imp();
 
+        // Update star button to match message state
+        if let Some(star_btn) = imp.star_button.borrow().as_ref() {
+            star_btn.set_active(message.is_starred);
+        }
+
         // Update header
         if let Some(header_box) = imp.header_card.borrow().as_ref() {
             // Clear existing content
@@ -612,6 +617,13 @@ impl MessageView {
         }
     }
 
+    /// Update the starred state shown in the message view header
+    pub fn set_starred(&self, is_starred: bool) {
+        if let Some(star_btn) = self.imp().star_button.borrow().as_ref() {
+            star_btn.set_active(is_starred);
+        }
+    }
+
     /// Clear the message view
     pub fn clear(&self) {
         let imp = self.imp();
@@ -808,6 +820,8 @@ pub struct MessageDetails {
     pub to: Vec<String>,
     pub cc: Vec<String>,
     pub date: String,
+    pub is_read: bool,
+    pub is_starred: bool,
     pub text_body: Option<String>,
     pub html_body: Option<String>,
     pub attachments: Vec<AttachmentInfo>,

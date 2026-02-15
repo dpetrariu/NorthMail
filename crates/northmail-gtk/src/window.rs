@@ -5,6 +5,7 @@ use crate::widgets::{FolderSidebar, MessageList, MessageView};
 use gtk4::{gio, glib, prelude::*, subclass::prelude::*};
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use std::cell::Cell;
 use std::rc::Rc;
 use tracing::debug;
 
@@ -289,6 +290,16 @@ mod imp {
         pub loading_progress_label: std::cell::RefCell<Option<gtk4::Label>>,
         /// Currently displayed message UID (to avoid reloading the same message)
         pub current_message_uid: std::cell::RefCell<Option<u32>>,
+        /// Star button in the currently displayed message view header
+        pub current_star_button: std::cell::RefCell<Option<gtk4::ToggleButton>>,
+        /// Read button in the currently displayed message view header
+        pub current_read_button: std::cell::RefCell<Option<gtk4::Button>>,
+        /// Read state for the currently displayed message's read button
+        pub current_read_state: std::cell::RefCell<Option<std::rc::Rc<std::cell::Cell<bool>>>>,
+        /// Body text of the currently displayed message (for reply/forward from context menu)
+        pub current_body_text: std::cell::RefCell<Option<String>>,
+        /// Attachments of the currently displayed message (for forward from context menu)
+        pub current_attachments: std::cell::RefCell<Vec<(String, String, Vec<u8>)>>,
     }
 
     #[glib::object_subclass]
@@ -716,6 +727,7 @@ impl NorthMailWindow {
         message_list.connect_star_toggled(move |list, uid, msg_id, folder_id, is_starred| {
             debug!("Star toggled in list: uid={}, is_starred={}", uid, is_starred);
             list.update_message_starred(uid, is_starred);
+            window.update_message_view_starred(uid, is_starred);
             if let Some(app) = window.application() {
                 if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
                     app.set_message_starred(msg_id, uid, folder_id, is_starred);
@@ -731,6 +743,7 @@ impl NorthMailWindow {
             glib::closure_local!(move |list: &MessageList, uid: u32, msg_id: i64, folder_id: i64, is_read: bool| {
                 debug!("Mark read from context menu: uid={}, is_read={}", uid, is_read);
                 list.update_message_read(uid, is_read);
+                window.update_message_view_read(uid, is_read);
                 if let Some(app) = window.application() {
                     if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
                         app.set_message_read(msg_id, uid, folder_id, is_read);
@@ -798,17 +811,29 @@ impl NorthMailWindow {
                 if let Some(msg) = messages.iter().find(|m| m.uid == uid) {
                     let reply_to = extract_email_address(&msg.from);
                     let from_display = msg.from.clone();
+                    let from_for_quote = msg.from.clone();
+                    let date_for_quote = msg.date.clone();
                     let subject = if msg.subject.to_lowercase().starts_with("re:") {
                         msg.subject.clone()
                     } else {
                         format!("Re: {}", msg.subject)
                     };
                     drop(messages);
+                    // Use stored body text if this message is currently displayed
+                    let quoted_body = if *window.imp().current_message_uid.borrow() == Some(uid) {
+                        if let Some(body) = window.imp().current_body_text.borrow().as_ref() {
+                            format_quoted_body(&from_for_quote, &date_for_quote, body)
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    };
                     let mode = ComposeMode::Reply {
                         to: reply_to,
                         to_display: from_display,
                         subject,
-                        quoted_body: String::new(),
+                        quoted_body,
                         in_reply_to: None,
                         references: Vec::new(),
                     };
@@ -828,6 +853,8 @@ impl NorthMailWindow {
                 if let Some(msg) = messages.iter().find(|m| m.uid == uid) {
                     let reply_to = extract_email_address(&msg.from);
                     let from_display = msg.from.clone();
+                    let from_for_quote = msg.from.clone();
+                    let date_for_quote = msg.date.clone();
                     let to_addrs: Vec<(String, String)> = msg.to.split(',')
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
@@ -852,11 +879,21 @@ impl NorthMailWindow {
                         format!("Re: {}", msg.subject)
                     };
                     drop(messages);
+                    // Use stored body text if this message is currently displayed
+                    let quoted_body = if *window.imp().current_message_uid.borrow() == Some(uid) {
+                        if let Some(body) = window.imp().current_body_text.borrow().as_ref() {
+                            format_quoted_body(&from_for_quote, &date_for_quote, body)
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    };
                     let mode = ComposeMode::ReplyAll {
                         to: std::iter::once((reply_to, from_display)).chain(to_addrs).collect(),
                         cc: cc_addrs,
                         subject,
-                        quoted_body: String::new(),
+                        quoted_body,
                         in_reply_to: None,
                         references: Vec::new(),
                     };
@@ -874,16 +911,34 @@ impl NorthMailWindow {
                 debug!("Forward from context menu: uid={}", uid);
                 let messages = list.imp().messages.borrow();
                 if let Some(msg) = messages.iter().find(|m| m.uid == uid) {
+                    let from_for_quote = msg.from.clone();
+                    let to_for_quote: Vec<String> = msg.to.split(',')
+                        .map(|s| s.trim().to_string())
+                        .collect();
+                    let date_for_quote = msg.date.clone();
+                    let subject_for_quote = msg.subject.clone();
                     let subject = if msg.subject.to_lowercase().starts_with("fwd:") {
                         msg.subject.clone()
                     } else {
                         format!("Fwd: {}", msg.subject)
                     };
                     drop(messages);
+                    // Use stored body text and attachments if this message is currently displayed
+                    let (quoted_body, attachments) = if *window.imp().current_message_uid.borrow() == Some(uid) {
+                        let body = if let Some(body) = window.imp().current_body_text.borrow().as_ref() {
+                            format_forward_body(&from_for_quote, &to_for_quote, &date_for_quote, &subject_for_quote, body)
+                        } else {
+                            String::new()
+                        };
+                        let atts = window.imp().current_attachments.borrow().clone();
+                        (body, atts)
+                    } else {
+                        (String::new(), Vec::new())
+                    };
                     let mode = ComposeMode::Forward {
                         subject,
-                        quoted_body: String::new(),
-                        attachments: Vec::new(),
+                        quoted_body,
+                        attachments,
                     };
                     window.show_compose_dialog_with_mode(mode);
                 }
@@ -919,6 +974,8 @@ impl NorthMailWindow {
         if let Some(msg) = msg {
             // Track the currently displayed message
             *imp.current_message_uid.borrow_mut() = Some(uid);
+            *imp.current_body_text.borrow_mut() = None;
+            *imp.current_attachments.borrow_mut() = Vec::new();
 
             // Clear current content
             while let Some(child) = imp.message_view_box.first_child() {
@@ -1305,35 +1362,38 @@ impl NorthMailWindow {
                 });
             }
 
-            // Read/Unread toggle button (icon shows action)
-            let read_button = gtk4::ToggleButton::builder()
-                .icon_name(if msg.is_read { "mail-read-symbolic" } else { "mail-unread-symbolic" })
+            // Read/Unread button (icon shows the action, not current state)
+            let read_button = gtk4::Button::builder()
+                .icon_name(if msg.is_read { "mail-unread-symbolic" } else { "mail-read-symbolic" })
                 .tooltip_text(if msg.is_read { "Mark as Unread" } else { "Mark as Read" })
-                .active(msg.is_read)
-                .css_classes(["flat"])
+                .css_classes(["flat", "dim-label"])
                 .build();
+            // Track current read state in a Cell so clicked handler can toggle it
+            let is_read_state = Rc::new(Cell::new(msg.is_read));
 
-            // Connect read button toggle
+            // Connect read button click
             {
                 let window = self.clone();
                 let message_id = msg.id;
                 let msg_uid = msg.uid;
                 let msg_folder_id = msg.folder_id;
-                read_button.connect_toggled(move |button| {
-                    let is_read = button.is_active();
+                let state = is_read_state.clone();
+                read_button.connect_clicked(move |button| {
+                    let new_read = !state.get();
+                    state.set(new_read);
                     // Update icon and tooltip (icon shows action)
-                    button.set_icon_name(if is_read { "mail-read-symbolic" } else { "mail-unread-symbolic" });
-                    button.set_tooltip_text(Some(if is_read { "Mark as Unread" } else { "Mark as Read" }));
+                    button.set_icon_name(if new_read { "mail-unread-symbolic" } else { "mail-read-symbolic" });
+                    button.set_tooltip_text(Some(if new_read { "Mark as Unread" } else { "Mark as Read" }));
                     // Update database and IMAP via application
                     if let Some(app) = window.application() {
                         if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
-                            app.set_message_read(message_id, msg_uid, msg_folder_id, is_read);
+                            app.set_message_read(message_id, msg_uid, msg_folder_id, new_read);
                         }
                     }
                     // Update the message list indicator
                     let imp = window.imp();
                     if let Some(message_list) = imp.message_list.get() {
-                        message_list.update_message_read(msg_uid, is_read);
+                        message_list.update_message_read(msg_uid, new_read);
                     }
                 });
             }
@@ -1353,6 +1413,11 @@ impl NorthMailWindow {
             toolbar.append(&delete_button);
 
             header_card.append(&toolbar);
+
+            // Store button references so context menu actions can update them
+            imp.current_star_button.replace(Some(star_button.clone()));
+            imp.current_read_button.replace(Some(read_button.clone()));
+            imp.current_read_state.replace(Some(is_read_state.clone()));
 
             // Header content inside the card
             let header_content = gtk4::Box::builder()
@@ -1699,6 +1764,7 @@ impl NorthMailWindow {
             let attachment_box_ref = attachment_box.clone();
             let body_text_for_fetch = body_text.clone();
             let attachments_data_for_fetch = attachments_data.clone();
+            let window_for_fetch = self.clone();
             if let Some(app) = self.application() {
                 if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
                     let msg_folder_id = if msg.folder_id != 0 { Some(msg.folder_id) } else { None };
@@ -1719,13 +1785,17 @@ impl NorthMailWindow {
                                 } else {
                                     String::new()
                                 };
-                                *body_text_for_fetch.borrow_mut() = Some(plain_text);
+                                *body_text_for_fetch.borrow_mut() = Some(plain_text.clone());
 
                                 // Store attachments for forwarding
                                 let stored: Vec<(String, String, Vec<u8>)> = parsed.attachments.iter()
                                     .map(|a| (a.filename.clone(), a.mime_type.clone(), a.data.clone()))
                                     .collect();
-                                *attachments_data_for_fetch.borrow_mut() = stored;
+                                *attachments_data_for_fetch.borrow_mut() = stored.clone();
+
+                                // Also store in window imp for context menu reply/forward
+                                *window_for_fetch.imp().current_body_text.borrow_mut() = Some(plain_text);
+                                *window_for_fetch.imp().current_attachments.borrow_mut() = stored;
 
                                 // Prefer HTML if available, otherwise use plain text
                                 if let Some(html) = parsed.html {
@@ -3921,9 +3991,33 @@ impl NorthMailWindow {
         self.imp().message_view.get()
     }
 
+    /// Update the star button in the message view header (called from context menu)
+    pub fn update_message_view_starred(&self, uid: u32, is_starred: bool) {
+        if *self.imp().current_message_uid.borrow() == Some(uid) {
+            if let Some(btn) = self.imp().current_star_button.borrow().as_ref() {
+                btn.set_active(is_starred);
+            }
+        }
+    }
+
+    /// Update the read button in the message view header (called from context menu)
+    pub fn update_message_view_read(&self, uid: u32, is_read: bool) {
+        if *self.imp().current_message_uid.borrow() == Some(uid) {
+            if let Some(btn) = self.imp().current_read_button.borrow().as_ref() {
+                btn.set_icon_name(if is_read { "mail-unread-symbolic" } else { "mail-read-symbolic" });
+                btn.set_tooltip_text(Some(if is_read { "Mark as Unread" } else { "Mark as Read" }));
+            }
+            if let Some(state) = self.imp().current_read_state.borrow().as_ref() {
+                state.set(is_read);
+            }
+        }
+    }
+
     /// Clear the currently displayed message tracking (called when switching folders)
     pub fn clear_current_message(&self) {
         *self.imp().current_message_uid.borrow_mut() = None;
+        *self.imp().current_body_text.borrow_mut() = None;
+        *self.imp().current_attachments.borrow_mut() = Vec::new();
     }
 
     /// Show loading spinner in the message list area

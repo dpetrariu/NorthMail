@@ -360,18 +360,13 @@ impl MessageList {
                 background-color: alpha(@view_fg_color, 0.1);
                 border-radius: 50%;
             }
-            /* Context menu styling - force dark text to override inherited white from selected rows */
-            popover.message-context-menu * {
-                color: #1c1c1c;
+            button.context-menu-item {
+                padding: 4px 8px;
+                min-height: 28px;
+                border-radius: 6px;
             }
-            popover.message-context-menu modelbutton {
-                background: transparent;
-            }
-            popover.message-context-menu modelbutton:hover {
-                background-color: rgba(0, 0, 0, 0.08);
-            }
-            popover.message-context-menu modelbutton:focus:not(:hover) {
-                background: transparent;
+            button.context-menu-item:hover {
+                background-color: alpha(@view_fg_color, 0.08);
             }
             "
         );
@@ -1178,11 +1173,9 @@ impl MessageList {
                     tracing::debug!("Row activation handler connected");
                 }
 
-                // Restore selection if we had one, BUT not if a context menu is open
-                // (to prevent auto-selection bugs during background sync with menu open)
-                if imp.context_menu_open.get() {
-                    list_box.unselect_all();
-                } else if let Some(uid) = selected_uid {
+                // Restore user's selection if they had clicked a message,
+                // otherwise ensure nothing is selected (prevents auto-select of first row)
+                if let Some(uid) = selected_uid {
                     for (idx, msg) in visible.iter().enumerate() {
                         if msg.uid == uid {
                             if let Some(row) = list_box.row_at_index(idx as i32) {
@@ -1194,6 +1187,16 @@ impl MessageList {
                 }
 
                 scrolled.set_child(Some(list_box));
+
+                // If no user selection, deselect after layout to prevent GTK auto-selecting first row
+                if selected_uid.is_none() {
+                    let lb = imp.list_box.borrow().clone();
+                    glib::idle_add_local_once(move || {
+                        if let Some(list_box) = lb.as_ref() {
+                            list_box.unselect_all();
+                        }
+                    });
+                }
             }
         }
     }
@@ -1516,193 +1519,162 @@ impl MessageList {
         list_box.append(&row);
     }
 
-    /// Add native context menu to a message row using gio::Menu
+    /// Add context menu to a message row using a manual Popover + Box + Buttons.
+    /// We avoid PopoverMenu/gio::Menu because GTK4 inherits the selected row's
+    /// white text color into the popover, making menu items invisible.
     fn add_row_context_menu(&self, row: &gtk4::ListBoxRow, msg: &MessageInfo) {
-        use gtk4::gio;
-
         let msg_uid = msg.uid;
         let msg_id = msg.id;
         let msg_folder_id = msg.folder_id;
         let is_read = msg.is_read;
         let is_starred = msg.is_starred;
 
-        // Create menu model with sections
-        let menu = gio::Menu::new();
+        // Build menu content manually
+        let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        vbox.set_margin_top(4);
+        vbox.set_margin_bottom(4);
+
+        let popover = gtk4::Popover::new();
+        popover.set_parent(row);
+        popover.set_has_arrow(false);
+        popover.set_child(Some(&vbox));
+
+        // Helper to create a menu item button
+        let make_item = |label: &str| -> gtk4::Button {
+            let lbl = gtk4::Label::new(None);
+            lbl.set_markup(&format!("<span color='#1c1c1c' weight='normal'>{}</span>", glib::markup_escape_text(label)));
+            lbl.set_xalign(0.0);
+            let btn = gtk4::Button::new();
+            btn.set_child(Some(&lbl));
+            btn.add_css_class("flat");
+            btn.add_css_class("context-menu-item");
+            btn.set_hexpand(true);
+            btn.set_halign(gtk4::Align::Fill);
+            vbox.append(&btn);
+            btn
+        };
+
+        let make_separator = || {
+            let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+            sep.set_margin_top(4);
+            sep.set_margin_bottom(4);
+            vbox.append(&sep);
+        };
 
         // Read/Unread toggle
+        let widget = self.clone();
         if is_read {
-            menu.append(Some("Mark as Unread"), Some("msg.mark-unread"));
+            let btn = make_item("Mark as Unread");
+            let w = widget.clone();
+            let p = popover.clone();
+            btn.connect_clicked(move |_| {
+                p.popdown();
+                w.imp().context_menu_open.set(false);
+                w.emit_by_name::<()>("mark-read", &[&msg_uid, &msg_id, &msg_folder_id, &false]);
+            });
         } else {
-            menu.append(Some("Mark as Read"), Some("msg.mark-read"));
+            let btn = make_item("Mark as Read");
+            let w = widget.clone();
+            let p = popover.clone();
+            btn.connect_clicked(move |_| {
+                p.popdown();
+                w.imp().context_menu_open.set(false);
+                w.emit_by_name::<()>("mark-read", &[&msg_uid, &msg_id, &msg_folder_id, &true]);
+            });
         }
 
         // Star toggle
         if is_starred {
-            menu.append(Some("Unstar"), Some("msg.unstar"));
-        } else {
-            menu.append(Some("Star"), Some("msg.star"));
-        }
-
-        // Actions section
-        let actions_section = gio::Menu::new();
-        actions_section.append(Some("Reply"), Some("msg.reply"));
-        actions_section.append(Some("Reply All"), Some("msg.reply-all"));
-        actions_section.append(Some("Forward"), Some("msg.forward"));
-        menu.append_section(None, &actions_section);
-
-        // Move section
-        let move_section = gio::Menu::new();
-        move_section.append(Some("Archive"), Some("msg.archive"));
-        move_section.append(Some("Move to Trash"), Some("msg.trash"));
-        move_section.append(Some("Mark as Spam"), Some("msg.spam"));
-        menu.append_section(None, &move_section);
-
-        // Create popover menu from model
-        let popover = gtk4::PopoverMenu::from_model(Some(&menu));
-        popover.set_parent(row);
-        popover.set_has_arrow(false);
-        popover.add_css_class("message-context-menu");
-
-        // Create action group for menu items
-        let action_group = gio::SimpleActionGroup::new();
-        let widget = self.clone();
-
-        // Mark as Read action
-        {
-            let action = gio::SimpleAction::new("mark-read", None);
+            let btn = make_item("Unstar");
             let w = widget.clone();
-            let popover_ref = popover.clone();
-            action.connect_activate(move |_, _| {
-                popover_ref.popdown();
-                w.imp().context_menu_open.set(false);
-                w.emit_by_name::<()>("mark-read", &[&msg_uid, &msg_id, &msg_folder_id, &true]);
-            });
-            action_group.add_action(&action);
-        }
-
-        // Mark as Unread action
-        {
-            let action = gio::SimpleAction::new("mark-unread", None);
-            let w = widget.clone();
-            let popover_ref = popover.clone();
-            action.connect_activate(move |_, _| {
-                popover_ref.popdown();
-                w.imp().context_menu_open.set(false);
-                w.emit_by_name::<()>("mark-read", &[&msg_uid, &msg_id, &msg_folder_id, &false]);
-            });
-            action_group.add_action(&action);
-        }
-
-        // Star action
-        {
-            let action = gio::SimpleAction::new("star", None);
-            let w = widget.clone();
-            let popover_ref = popover.clone();
-            action.connect_activate(move |_, _| {
-                popover_ref.popdown();
-                w.imp().context_menu_open.set(false);
-                w.emit_by_name::<()>("star-toggled", &[&msg_uid, &msg_id, &msg_folder_id, &true]);
-            });
-            action_group.add_action(&action);
-        }
-
-        // Unstar action
-        {
-            let action = gio::SimpleAction::new("unstar", None);
-            let w = widget.clone();
-            let popover_ref = popover.clone();
-            action.connect_activate(move |_, _| {
-                popover_ref.popdown();
+            let p = popover.clone();
+            btn.connect_clicked(move |_| {
+                p.popdown();
                 w.imp().context_menu_open.set(false);
                 w.emit_by_name::<()>("star-toggled", &[&msg_uid, &msg_id, &msg_folder_id, &false]);
             });
-            action_group.add_action(&action);
+        } else {
+            let btn = make_item("Star");
+            let w = widget.clone();
+            let p = popover.clone();
+            btn.connect_clicked(move |_| {
+                p.popdown();
+                w.imp().context_menu_open.set(false);
+                w.emit_by_name::<()>("star-toggled", &[&msg_uid, &msg_id, &msg_folder_id, &true]);
+            });
         }
 
-        // Reply action
+        make_separator();
+
+        // Reply / Reply All / Forward
         {
-            let action = gio::SimpleAction::new("reply", None);
+            let btn = make_item("Reply");
             let w = widget.clone();
-            let popover_ref = popover.clone();
-            action.connect_activate(move |_, _| {
-                popover_ref.popdown();
+            let p = popover.clone();
+            btn.connect_clicked(move |_| {
+                p.popdown();
                 w.imp().context_menu_open.set(false);
                 w.emit_by_name::<()>("reply", &[&msg_uid]);
             });
-            action_group.add_action(&action);
         }
-
-        // Reply All action
         {
-            let action = gio::SimpleAction::new("reply-all", None);
+            let btn = make_item("Reply All");
             let w = widget.clone();
-            let popover_ref = popover.clone();
-            action.connect_activate(move |_, _| {
-                popover_ref.popdown();
+            let p = popover.clone();
+            btn.connect_clicked(move |_| {
+                p.popdown();
                 w.imp().context_menu_open.set(false);
                 w.emit_by_name::<()>("reply-all", &[&msg_uid]);
             });
-            action_group.add_action(&action);
         }
-
-        // Forward action
         {
-            let action = gio::SimpleAction::new("forward", None);
+            let btn = make_item("Forward");
             let w = widget.clone();
-            let popover_ref = popover.clone();
-            action.connect_activate(move |_, _| {
-                popover_ref.popdown();
+            let p = popover.clone();
+            btn.connect_clicked(move |_| {
+                p.popdown();
                 w.imp().context_menu_open.set(false);
                 w.emit_by_name::<()>("forward", &[&msg_uid]);
             });
-            action_group.add_action(&action);
         }
 
-        // Archive action
+        make_separator();
+
+        // Archive / Trash / Spam
         {
-            let action = gio::SimpleAction::new("archive", None);
+            let btn = make_item("Archive");
             let w = widget.clone();
-            let popover_ref = popover.clone();
-            action.connect_activate(move |_, _| {
-                popover_ref.popdown();
+            let p = popover.clone();
+            btn.connect_clicked(move |_| {
+                p.popdown();
                 w.imp().context_menu_open.set(false);
                 w.emit_by_name::<()>("archive", &[&msg_uid, &msg_id, &msg_folder_id]);
             });
-            action_group.add_action(&action);
         }
-
-        // Trash action
         {
-            let action = gio::SimpleAction::new("trash", None);
+            let btn = make_item("Move to Trash");
             let w = widget.clone();
-            let popover_ref = popover.clone();
-            action.connect_activate(move |_, _| {
-                popover_ref.popdown();
+            let p = popover.clone();
+            btn.connect_clicked(move |_| {
+                p.popdown();
                 w.imp().context_menu_open.set(false);
                 w.emit_by_name::<()>("trash", &[&msg_uid, &msg_id, &msg_folder_id]);
             });
-            action_group.add_action(&action);
         }
-
-        // Spam action
         {
-            let action = gio::SimpleAction::new("spam", None);
+            let btn = make_item("Mark as Spam");
             let w = widget.clone();
-            let popover_ref = popover.clone();
-            action.connect_activate(move |_, _| {
-                popover_ref.popdown();
+            let p = popover.clone();
+            btn.connect_clicked(move |_| {
+                p.popdown();
                 w.imp().context_menu_open.set(false);
                 w.emit_by_name::<()>("spam", &[&msg_uid, &msg_id, &msg_folder_id]);
             });
-            action_group.add_action(&action);
         }
 
-        // Insert action group into the row
-        row.insert_action_group("msg", Some(&action_group));
-
-        // Right-click gesture for context menu
+        // Right-click gesture
         let gesture = gtk4::GestureClick::new();
-        gesture.set_button(3); // Right click
+        gesture.set_button(3);
         let popover_clone = popover.clone();
         let widget_for_gesture = self.clone();
         gesture.connect_pressed(move |gesture, _n, x, y| {
@@ -1798,10 +1770,8 @@ impl MessageList {
                 imp.load_more_row.replace(Some(load_row));
             }
 
-            // Restore selection, BUT not if a context menu is open
-            if imp.context_menu_open.get() {
-                list_box.unselect_all();
-            } else if let Some(uid) = selected_uid {
+            // Restore user's selection or deselect
+            if let Some(uid) = selected_uid {
                 let filtered: Vec<&MessageInfo> = messages.iter()
                     .filter(|m| self.message_matches(m))
                     .collect();
@@ -1810,6 +1780,11 @@ impl MessageList {
                         list_box.select_row(Some(&row));
                     }
                 }
+            } else {
+                let lb = list_box.clone();
+                glib::idle_add_local_once(move || {
+                    lb.unselect_all();
+                });
             }
         }
     }
