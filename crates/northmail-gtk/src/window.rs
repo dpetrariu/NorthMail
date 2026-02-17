@@ -592,16 +592,16 @@ impl NorthMailWindow {
         };
 
         let calc_compose_margin = |outer_pos: i32, inner_pos: i32| -> i32 {
-            // Position compose button at left edge of message view
+            // Position compose button above the filter icon in the message list
             // When sidebar visible: needs to account for sidebar width
             // When sidebar hidden: message list starts at left edge
             if outer_pos == 0 {
                 // Sidebar collapsed - compose above filter button
-                let offset = 215; // header title + toggle button + padding
+                let offset = 205; // header title + toggle button + padding
                 inner_pos.saturating_sub(offset).max(8)
             } else {
                 // Sidebar visible - only inner_pos matters (toggle already at sidebar edge)
-                let offset = 58;
+                let offset = 54;
                 inner_pos.saturating_sub(offset).max(8)
             }
         };
@@ -2071,10 +2071,10 @@ impl NorthMailWindow {
             .warning { color: @warning_color; }
             .compose-send { min-height: 24px; padding-top: 2px; padding-bottom: 2px; }
             .format-bar { background-color: white; }
-            .format-bar button { min-height: 18px; min-width: 18px; padding: 1px; }
-            .format-bar button image { -gtk-icon-size: 14px; }
+            .format-bar button { min-height: 18px; min-width: 18px; padding: 4px; font-weight: 400; }
+            .format-bar button image { -gtk-icon-size: 12px; }
             .format-bar dropdown { min-height: 18px; }
-            .format-bar dropdown button { min-height: 18px; padding: 1px 4px; font-size: 0.85em; }
+            .format-bar dropdown button { min-height: 18px; padding: 4px 6px; font-size: 0.85em; font-weight: 400; }
             .format-bar .linked button:checked { background: @accent_bg_color; color: @accent_fg_color; }
             ",
         );
