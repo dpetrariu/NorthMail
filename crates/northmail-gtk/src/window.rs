@@ -616,7 +616,7 @@ impl NorthMailWindow {
             // When sidebar hidden: message list starts at left edge
             if outer_pos == 0 {
                 // Sidebar collapsed - compose above filter button
-                let offset = 205; // header title + toggle button + padding
+                let offset = 210; // header title + toggle button + padding
                 inner_pos.saturating_sub(offset).max(8)
             } else {
                 // Sidebar visible - only inner_pos matters (toggle already at sidebar edge)
