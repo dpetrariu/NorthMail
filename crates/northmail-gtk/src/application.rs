@@ -418,6 +418,15 @@ mod imp {
             app.init_idle_manager();
         }
 
+        fn shutdown(&self) {
+            info!("Application shutting down");
+            // Gracefully stop all IDLE workers
+            if let Some(idle_manager) = self.idle_manager.get() {
+                idle_manager.shutdown();
+            }
+            self.parent_shutdown();
+        }
+
         fn startup(&self) {
             self.parent_startup();
             info!("Application starting up");
@@ -6338,6 +6347,8 @@ impl NorthMailApplication {
         subject: String,
         body: String,
         attachments: Vec<(String, String, Vec<u8>)>, // (filename, mime_type, data)
+        in_reply_to: Option<String>,
+        references: Vec<String>,
         callback: impl FnOnce(Result<(), String>) + 'static,
     ) {
         let accounts = self.imp().accounts.borrow().clone();
@@ -6393,6 +6404,12 @@ impl NorthMailApplication {
             msg = msg.bcc(addr);
         }
         msg = msg.text(&body);
+        if let Some(ref reply_id) = in_reply_to {
+            msg = msg.reply_to_message(reply_id);
+        }
+        for ref_id in &references {
+            msg = msg.reference(ref_id);
+        }
         for (filename, mime_type, data) in attachments {
             msg = msg.attachment(filename, mime_type, data);
         }

@@ -832,6 +832,7 @@ impl NorthMailWindow {
                     let from_display = msg.from.clone();
                     let from_for_quote = msg.from.clone();
                     let date_for_quote = msg.date.clone();
+                    let orig_message_id = msg.message_id.clone();
                     let subject = if msg.subject.to_lowercase().starts_with("re:") {
                         msg.subject.clone()
                     } else {
@@ -848,13 +849,14 @@ impl NorthMailWindow {
                     } else {
                         String::new()
                     };
+                    let references = orig_message_id.iter().cloned().collect();
                     let mode = ComposeMode::Reply {
                         to: reply_to,
                         to_display: from_display,
                         subject,
                         quoted_body,
-                        in_reply_to: None,
-                        references: Vec::new(),
+                        in_reply_to: orig_message_id,
+                        references,
                     };
                     window.show_compose_dialog_with_mode(mode);
                 }
@@ -874,6 +876,7 @@ impl NorthMailWindow {
                     let from_display = msg.from.clone();
                     let from_for_quote = msg.from.clone();
                     let date_for_quote = msg.date.clone();
+                    let orig_message_id = msg.message_id.clone();
                     let to_addrs: Vec<(String, String)> = msg.to.split(',')
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
@@ -908,13 +911,14 @@ impl NorthMailWindow {
                     } else {
                         String::new()
                     };
+                    let references = orig_message_id.iter().cloned().collect();
                     let mode = ComposeMode::ReplyAll {
                         to: std::iter::once((reply_to, from_display)).chain(to_addrs).collect(),
                         cc: cc_addrs,
                         subject,
                         quoted_body,
-                        in_reply_to: None,
-                        references: Vec::new(),
+                        in_reply_to: orig_message_id,
+                        references,
                     };
                     window.show_compose_dialog_with_mode(mode);
                 }
@@ -1177,13 +1181,14 @@ impl NorthMailWindow {
                         format!("Re: {}", msg_clone.subject)
                     };
                     let quoted = format_quoted_body(&msg_clone.from, &msg_clone.date, &body);
+                    let references = msg_clone.message_id.iter().cloned().collect();
                     let mode = ComposeMode::Reply {
                         to: reply_to_email,
                         to_display: reply_to_display,
                         subject,
                         quoted_body: quoted,
-                        in_reply_to: None,
-                        references: Vec::new(),
+                        in_reply_to: msg_clone.message_id.clone(),
+                        references,
                     };
                     window.show_compose_dialog_with_mode(mode);
                 });
@@ -1223,13 +1228,14 @@ impl NorthMailWindow {
                         format!("Re: {}", msg_clone.subject)
                     };
                     let quoted = format_quoted_body(&msg_clone.from, &msg_clone.date, &body);
+                    let references = msg_clone.message_id.iter().cloned().collect();
                     let mode = ComposeMode::ReplyAll {
                         to: to_addrs,
                         cc: cc_addrs,
                         subject,
                         quoted_body: quoted,
-                        in_reply_to: None,
-                        references: Vec::new(),
+                        in_reply_to: msg_clone.message_id.clone(),
+                        references,
                     };
                     window.show_compose_dialog_with_mode(mode);
                 });
@@ -2945,6 +2951,17 @@ impl NorthMailWindow {
         content.append(&attachments_box);
 
         // Pre-fill fields based on compose mode
+        // Extract threading headers from mode for use in send
+        let (reply_in_reply_to, reply_references) = match &mode {
+            ComposeMode::Reply { in_reply_to, references, .. }
+            | ComposeMode::ReplyAll { in_reply_to, references, .. } => {
+                (in_reply_to.clone(), references.clone())
+            }
+            _ => (None, Vec::new()),
+        };
+        let reply_in_reply_to = Rc::new(reply_in_reply_to);
+        let reply_references = Rc::new(reply_references);
+
         match &mode {
             ComposeMode::New { to } => {
                 if let Some((email, display)) = to {
@@ -3515,6 +3532,8 @@ impl NorthMailWindow {
                         subject,
                         body,
                         att_list,
+                        (*reply_in_reply_to).clone(),
+                        (*reply_references).clone(),
                         move |result| {
                             match result {
                                 Ok(()) => {
@@ -3926,8 +3945,13 @@ impl NorthMailWindow {
                         list.select_row(Some(&row));
                         // Scroll the row into view
                         let adj = scrolled.vadjustment();
-                        let row_y = row.allocation().y() as f64;
-                        let row_h = row.allocation().height() as f64;
+                        let row_h = row.height() as f64;
+                        // Compute row position relative to the scrolled window's child
+                        let row_y = if let Some(point) = row.compute_point(&list, &gtk4::graphene::Point::new(0.0, 0.0)) {
+                            point.y() as f64
+                        } else {
+                            0.0
+                        };
                         let visible_top = adj.value();
                         let visible_h = adj.page_size();
                         if row_y < visible_top {
