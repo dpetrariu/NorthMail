@@ -308,13 +308,15 @@ struct SyncResult {
     folders: Vec<SyncedFolder>,
 }
 
-/// Folder info from IMAP LIST + STATUS
+/// Folder info from IMAP LIST + STATUS or Graph API
 struct SyncedFolder {
     name: String,
     full_path: String,
     folder_type: String,
     message_count: u32,
     unseen_count: u32,
+    /// Graph API folder ID (only set for ms_graph accounts)
+    graph_folder_id: Option<String>,
 }
 
 /// A single attachment extracted from an email
@@ -363,8 +365,8 @@ mod imp {
         pub(super) cache_folder_id: Cell<i64>,
         /// Current folder type (inbox, drafts, sent, etc.) for UI behavior
         pub(super) current_folder_type: RefCell<String>,
-        /// Cached contacts from EDS (preloaded at startup)
-        pub(super) contacts_cache: RefCell<Vec<(String, String)>>,
+        /// Cached contacts from EDS (preloaded at startup) — (name, email, photo_bytes)
+        pub(super) contacts_cache: RefCell<Vec<(String, String, Option<Vec<u8>>)>>,
         /// Timer source ID for periodic mail checking
         pub(super) sync_timer_source: RefCell<Option<glib::SourceId>>,
         /// Whether a sync is currently in progress (prevent overlapping syncs)
@@ -375,6 +377,8 @@ mod imp {
         pub(super) idle_manager: OnceCell<Arc<IdleManager>>,
         /// Receiver for IDLE manager events
         pub(super) idle_event_receiver: RefCell<Option<std::sync::mpsc::Receiver<IdleManagerEvent>>>,
+        /// Receiver for GOA account change events
+        pub(super) goa_event_receiver: RefCell<Option<std::sync::mpsc::Receiver<northmail_auth::GoaAccountEvent>>>,
         /// Accounts currently being synced (prevents duplicate concurrent syncs)
         pub(super) syncing_accounts: RefCell<std::collections::HashSet<String>>,
         /// UIDs pending IMAP deletion: (folder_id, uid) pairs
@@ -416,6 +420,9 @@ mod imp {
 
             // Initialize IDLE manager for real-time push notifications
             app.init_idle_manager();
+
+            // Monitor GOA account changes at runtime
+            app.start_goa_account_monitor();
         }
 
         fn shutdown(&self) {
@@ -742,6 +749,10 @@ impl NorthMailApplication {
                     }
                     Err(_) => 0,
                 }
+            }
+            "ms_graph" => {
+                // Graph API: get inbox count from DB cache (populated by sync)
+                self.get_inbox_count_for_account(&account.id).await
             }
             _ => {
                 // Password auth (iCloud, etc.)
@@ -1097,13 +1108,124 @@ impl NorthMailApplication {
                             // Will auto-reconnect via the worker
                         }
                         IdleManagerEvent::NotSupported { account_id } => {
-                            warn!("IDLE: Not supported for account {}", account_id);
-                            // Fall back to polling only for this account
+                            warn!("IDLE: Not supported for account {}, falling back to periodic sync", account_id);
+                            // Stop the IDLE worker - periodic sync timer handles polling
+                            if let Some(idle_mgr) = app.imp().idle_manager.get() {
+                                idle_mgr.stop_idle(&account_id);
+                            }
                         }
                     }
                 }
             }
             glib::ControlFlow::Continue
+        });
+    }
+
+    /// Start monitoring GOA account changes (additions/removals) at runtime
+    fn start_goa_account_monitor(&self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.imp().goa_event_receiver.replace(Some(rx));
+
+        // Spawn background thread with its own tokio runtime
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            if let Err(e) = rt.block_on(northmail_auth::GoaManager::watch_account_changes(tx)) {
+                warn!("GOA account watcher stopped with error: {}", e);
+            }
+        });
+
+        info!("GOA account monitor started");
+
+        // Poll for GOA events every 500ms (same pattern as IDLE event loop)
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+            let receiver = app.imp().goa_event_receiver.borrow();
+            if let Some(rx) = receiver.as_ref() {
+                while let Ok(event) = rx.try_recv() {
+                    match event {
+                        northmail_auth::GoaAccountEvent::AccountAdded => {
+                            info!("GOA: Account added, reloading accounts");
+                            app.reload_goa_accounts();
+                        }
+                        northmail_auth::GoaAccountEvent::AccountRemoved => {
+                            info!("GOA: Account removed, reloading accounts");
+                            app.reload_goa_accounts();
+                        }
+                    }
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    /// Reload GOA accounts after a runtime change (account added/removed)
+    fn reload_goa_accounts(&self) {
+        let app = self.clone();
+        glib::spawn_future_local(async move {
+            let auth_manager = match AuthManager::new().await {
+                Ok(am) => am,
+                Err(e) => {
+                    warn!("Failed to create auth manager during reload: {}", e);
+                    return;
+                }
+            };
+
+            let mut new_accounts = match auth_manager.list_goa_accounts().await {
+                Ok(accts) => accts,
+                Err(e) => {
+                    warn!("Failed to list GOA accounts during reload: {}", e);
+                    return;
+                }
+            };
+
+            new_accounts.sort_by(|a, b| a.email.to_lowercase().cmp(&b.email.to_lowercase()));
+
+            let old_accounts = app.imp().accounts.borrow().clone();
+
+            // Find added accounts (in new but not in old)
+            let added: Vec<_> = new_accounts
+                .iter()
+                .filter(|na| !old_accounts.iter().any(|oa| oa.id == na.id))
+                .collect();
+
+            // Find removed accounts (in old but not in new)
+            let removed: Vec<_> = old_accounts
+                .iter()
+                .filter(|oa| !new_accounts.iter().any(|na| na.id == oa.id))
+                .collect();
+
+            if added.is_empty() && removed.is_empty() {
+                debug!("GOA reload: no account changes detected");
+                return;
+            }
+
+            // Show toasts for changes
+            for acct in &added {
+                info!("GOA account added: {}", acct.email);
+                app.show_toast(&format!("Account added: {}", acct.email));
+            }
+            for acct in &removed {
+                info!("GOA account removed: {}", acct.email);
+                // Stop IDLE for removed account
+                if let Some(idle_mgr) = app.imp().idle_manager.get() {
+                    idle_mgr.stop_idle(&acct.id);
+                }
+                app.show_toast(&format!("Account removed: {}", acct.email));
+            }
+
+            // Save new accounts to DB
+            app.save_accounts_to_db(&new_accounts);
+
+            // Update stored accounts and sidebar
+            app.imp().accounts.replace(new_accounts.clone());
+            app.update_sidebar_with_accounts(&new_accounts);
+
+            // Start IDLE for newly added accounts
+            if !added.is_empty() {
+                app.start_idle_for_all_accounts();
+                // Sync the new accounts
+                app.sync_all_accounts();
+            }
         });
     }
 
@@ -1157,6 +1279,11 @@ impl NorthMailApplication {
         };
 
         let credentials = match account.provider_type.as_str() {
+            // ms_graph accounts use Graph API, not IMAP — skip IDLE entirely
+            "ms_graph" => {
+                info!("IDLE: Skipping ms_graph account {} (no IMAP, using sync timer)", account.email);
+                return;
+            }
             "google" => {
                 match auth_manager.get_xoauth2_token_for_goa(&account.id).await {
                     Ok((email, access_token)) => {
@@ -1361,6 +1488,17 @@ impl NorthMailApplication {
         self.imp().current_folder_type.borrow().clone()
     }
 
+    /// Get the email address of the currently selected account
+    pub fn current_account_email(&self) -> Option<String> {
+        let state = self.imp().folder_load_state.borrow();
+        if let Some(s) = state.as_ref() {
+            let accounts = self.imp().accounts.borrow();
+            accounts.iter().find(|a| a.id == s.account_id).map(|a| a.email.clone())
+        } else {
+            None
+        }
+    }
+
     /// Refresh the current folder if we're viewing drafts
     /// Called after saving a draft to update the message list
     pub fn refresh_if_viewing_drafts(&self) {
@@ -1382,7 +1520,12 @@ impl NorthMailApplication {
         self.imp().cache_offset.set(offset);
     }
 
-    /// Save GOA accounts to database for foreign key relationships
+    /// Save GOA accounts to database and remove stale accounts no longer in GOA.
+    ///
+    /// This reconciles the DB with the current GOA account list:
+    /// - Upserts all current GOA accounts
+    /// - Deletes any DB accounts whose IDs are not in the GOA list
+    ///   (cascading deletes clean up folders, messages, and attachments)
     fn save_accounts_to_db(&self, accounts: &[northmail_auth::GoaAccount]) {
         let Some(db) = self.database() else {
             return;
@@ -1395,11 +1538,35 @@ impl NorthMailApplication {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
+                // Collect current GOA account IDs
+                let goa_ids: std::collections::HashSet<String> =
+                    accounts.iter().map(|a| a.id.clone()).collect();
+
+                // Remove stale accounts from DB that are no longer in GOA
+                match db.get_accounts().await {
+                    Ok(db_accounts) => {
+                        for db_account in &db_accounts {
+                            if !goa_ids.contains(&db_account.id) {
+                                info!(
+                                    "Removing stale account {} ({}) from database — no longer in GOA",
+                                    db_account.email, db_account.id
+                                );
+                                if let Err(e) = db.delete_account(&db_account.id).await {
+                                    warn!("Failed to delete stale account {}: {}", db_account.id, e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to list DB accounts for reconciliation: {}", e);
+                    }
+                }
+
+                // Upsert current GOA accounts
                 for account in &accounts {
-                    // Convert GOA account to core Account
                     let config = if account.provider_type == "google" {
                         northmail_core::AccountConfig::gmail()
-                    } else if account.provider_type == "windows_live" || account.provider_type == "microsoft" {
+                    } else if account.provider_type == "windows_live" || account.provider_type == "microsoft" || account.provider_type == "ms_graph" {
                         northmail_core::AccountConfig::outlook()
                     } else {
                         northmail_core::AccountConfig {
@@ -1427,7 +1594,7 @@ impl NorthMailApplication {
                         debug!("Saved account {} to database", account.email);
                     }
                 }
-                info!("Saved {} accounts to database", accounts.len());
+                info!("Reconciled {} GOA accounts with database", accounts.len());
             });
         });
     }
@@ -1554,9 +1721,21 @@ impl NorthMailApplication {
         account.provider_type == "google"
     }
 
-    /// Check if an account is Microsoft (Outlook/Hotmail)
+    /// Check if an account is Microsoft (Outlook/Hotmail) — legacy IMAP-capable providers only
     fn is_microsoft_account(account: &northmail_auth::GoaAccount) -> bool {
-        account.provider_type == "windows_live" || account.provider_type == "microsoft"
+        account.provider_type == "windows_live"
+            || account.provider_type == "microsoft"
+    }
+
+    /// Check if an account uses Microsoft Graph API (ms_graph provider from GNOME Online Accounts).
+    /// These accounts have OAuth2 tokens scoped for Graph API, not IMAP XOAUTH2.
+    fn is_ms_graph_account(account: &northmail_auth::GoaAccount) -> bool {
+        account.provider_type == "ms_graph"
+    }
+
+    /// Check if a Microsoft account can send via Graph API (only ms_graph provider has mail.send scope)
+    fn can_send_microsoft(account: &northmail_auth::GoaAccount) -> bool {
+        account.provider_type == "ms_graph"
     }
 
     /// Check if an account supports OAuth2 (Gmail, Microsoft, etc.)
@@ -1571,7 +1750,7 @@ impl NorthMailApplication {
 
     /// Check if an account is supported
     fn is_supported_account(account: &northmail_auth::GoaAccount) -> bool {
-        Self::is_google_account(account) || Self::is_microsoft_account(account) || Self::is_password_account(account)
+        Self::is_google_account(account) || Self::is_microsoft_account(account) || Self::is_ms_graph_account(account) || Self::is_password_account(account)
     }
 
     /// Convert folder path to a friendly display name
@@ -1664,7 +1843,7 @@ impl NorthMailApplication {
     }
 
     /// Sync all accounts in the background
-    fn sync_all_accounts(&self) {
+    pub fn sync_all_accounts(&self) {
         let app = self.clone();
         let accounts = self.imp().accounts.borrow().clone();
 
@@ -1930,6 +2109,26 @@ impl NorthMailApplication {
                             None
                         }
                     }
+                } else if Self::is_ms_graph_account(&account) {
+                    match auth_manager.get_xoauth2_token_for_goa(&account.id).await {
+                        Ok((_email, access_token)) => {
+                            debug!("Got Graph API token for {}", account.email);
+                            match Self::fetch_inbox_graph_async(access_token, cached_folders.clone()).await {
+                                Ok(sr) => {
+                                    info!("Synced {} folders via Graph API for {}", sr.folders.len(), account.email);
+                                    Some(sr)
+                                }
+                                Err(e) => {
+                                    warn!("Failed to sync via Graph API {}: {}", account.email, e);
+                                    None
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to get Graph API token for {}: {}", account.email, e);
+                            None
+                        }
+                    }
                 } else if Self::is_microsoft_account(&account) {
                     match auth_manager.get_xoauth2_token_for_goa(&account.id).await {
                         Ok((email, access_token)) => {
@@ -1997,8 +2196,19 @@ impl NorthMailApplication {
                         let rt = tokio::runtime::Runtime::new().unwrap();
                         let result = rt.block_on(async {
                             for f in &folders {
-                                if let Err(e) = db
-                                    .upsert_folder_with_counts(
+                                let res = if let Some(ref gid) = f.graph_folder_id {
+                                    db.upsert_folder_graph(
+                                        &acct_id,
+                                        &f.name,
+                                        &f.full_path,
+                                        &f.folder_type,
+                                        Some(f.message_count as i64),
+                                        Some(f.unseen_count as i64),
+                                        gid,
+                                    )
+                                    .await
+                                } else {
+                                    db.upsert_folder_with_counts(
                                         &acct_id,
                                         &f.name,
                                         &f.full_path,
@@ -2007,7 +2217,8 @@ impl NorthMailApplication {
                                         Some(f.unseen_count as i64),
                                     )
                                     .await
-                                {
+                                };
+                                if let Err(e) = res {
                                     warn!("Failed to upsert folder {}: {}", f.full_path, e);
                                 }
                             }
@@ -2101,6 +2312,7 @@ impl NorthMailApplication {
                                 folder_type: ft,
                                 message_count: *msg_count,
                                 unseen_count: *unseen,
+                                graph_folder_id: None,
                             });
                         }
 
@@ -2176,6 +2388,7 @@ impl NorthMailApplication {
                                 folder_type: ft,
                                 message_count: *msg_count,
                                 unseen_count: *unseen,
+                                graph_folder_id: None,
                             });
                         }
 
@@ -2205,6 +2418,448 @@ impl NorthMailApplication {
                 }
             }
         }
+    }
+
+    /// Prefetch message bodies via Graph API for ms_graph accounts
+    async fn body_prefetch_graph(
+        db: &std::sync::Arc<northmail_core::Database>,
+        account_id: &str,
+        folder_path: &str,
+    ) {
+        // Get folder_id
+        let folder_id = {
+            let db_clone = db.clone();
+            let aid = account_id.to_string();
+            let fp = folder_path.to_string();
+            let (s, r) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result = rt.block_on(db_clone.get_or_create_folder_id(&aid, &fp));
+                let _ = s.send(result);
+            });
+            let start = std::time::Instant::now();
+            loop {
+                match r.try_recv() {
+                    Ok(Ok(fid)) => break fid,
+                    Ok(Err(e)) => {
+                        warn!("Body prefetch (graph): couldn't get folder_id: {}", e);
+                        return;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        if start.elapsed() > std::time::Duration::from_secs(5) { return; }
+                        glib::timeout_future(std::time::Duration::from_millis(20)).await;
+                    }
+                    Err(_) => return,
+                }
+            }
+        };
+
+        // Get messages needing bodies
+        let messages_to_fetch: Vec<(i64, bool)> = {
+            let db_clone = db.clone();
+            let (s, r) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result = rt.block_on(db_clone.get_messages_needing_body_prefetch(folder_id, 30, 50));
+                let _ = s.send(result);
+            });
+            let start = std::time::Instant::now();
+            loop {
+                match r.try_recv() {
+                    Ok(Ok(msgs)) => break msgs,
+                    Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        if start.elapsed() > std::time::Duration::from_secs(10) { return; }
+                        glib::timeout_future(std::time::Duration::from_millis(20)).await;
+                    }
+                }
+            }
+        };
+
+        if messages_to_fetch.is_empty() {
+            return;
+        }
+
+        info!("Body prefetch (graph): {} messages for {}/{}", messages_to_fetch.len(), account_id, folder_path);
+
+        // Get access token
+        let auth_manager = match AuthManager::new().await {
+            Ok(am) => am,
+            Err(_) => return,
+        };
+        let access_token = match auth_manager.get_xoauth2_token_for_goa(account_id).await {
+            Ok((_email, token)) => token,
+            Err(_) => return,
+        };
+
+        for (uid, _is_unread) in messages_to_fetch {
+            let uid_u32 = uid as u32;
+
+            // Get graph_message_id
+            let graph_id = {
+                let db_clone = db.clone();
+                let (s, r) = std::sync::mpsc::channel();
+                let fid = folder_id;
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    let result = rt.block_on(db_clone.get_graph_message_id(fid, uid));
+                    let _ = s.send(result);
+                });
+                let start = std::time::Instant::now();
+                loop {
+                    match r.try_recv() {
+                        Ok(Ok(id)) => break id,
+                        Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break None,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            if start.elapsed() > std::time::Duration::from_secs(5) { break None; }
+                            glib::timeout_future(std::time::Duration::from_millis(10)).await;
+                        }
+                    }
+                }
+            };
+
+            let Some(gid) = graph_id else { continue };
+
+            // Fetch MIME body
+            let token = access_token.clone();
+            let (s, r) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result = rt.block_on(async {
+                    let client = northmail_graph::GraphMailClient::new(token);
+                    client.fetch_mime_body(&gid).await.map_err(|e| e.to_string())
+                });
+                let _ = s.send(result);
+            });
+
+            let body_result = loop {
+                match r.try_recv() {
+                    Ok(r) => break r,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        glib::timeout_future(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(_) => break Err("Channel disconnected".to_string()),
+                }
+            };
+
+            if let Ok(raw_body) = body_result {
+                let parsed = Self::parse_email_body(&raw_body);
+                Self::save_body_to_cache(db, account_id, folder_path, uid_u32, &parsed);
+            }
+
+            // Small delay between fetches
+            glib::timeout_future(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Look up the Graph message ID from the database for a given UID
+    async fn get_graph_message_id_for_uid(
+        db: &std::sync::Arc<northmail_core::Database>,
+        account_id: &str,
+        folder_path: &str,
+        uid: u32,
+    ) -> Option<String> {
+        let db = db.clone();
+        let acct_id = account_id.to_string();
+        let fp = folder_path.to_string();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async {
+                let folder_id = db.get_or_create_folder_id(&acct_id, &fp).await.ok()?;
+                db.get_graph_message_id(folder_id, uid as i64).await.ok()?
+            });
+            let _ = sender.send(result);
+        });
+        loop {
+            match receiver.try_recv() {
+                Ok(result) => return result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    glib::timeout_future(std::time::Duration::from_millis(5)).await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
+            }
+        }
+    }
+
+    /// Hash a Graph API message ID to a 31-bit positive integer for use as a UID.
+    /// The real Graph ID is stored separately in graph_message_id for API operations.
+    fn graph_id_to_uid(graph_id: &str) -> u32 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        graph_id.hash(&mut hasher);
+        (hasher.finish() & 0x7FFF_FFFF) as u32
+    }
+
+    /// Convert a Graph API message envelope to a MessageInfo for display
+    fn graph_envelope_to_message_info(env: &northmail_graph::GraphMessageEnvelope, folder_id: i64) -> MessageInfo {
+        let uid = Self::graph_id_to_uid(&env.id);
+        let from_name = env.from.as_ref()
+            .and_then(|f| f.email_address.name.clone())
+            .unwrap_or_default();
+        let from_address = env.from.as_ref()
+            .and_then(|f| f.email_address.address.clone())
+            .unwrap_or_default();
+        let from_display = if from_name.is_empty() { from_address.clone() } else { from_name.clone() };
+
+        let to_addresses: Vec<String> = env.to_recipients.iter()
+            .filter_map(|r| r.email_address.address.clone())
+            .collect();
+
+        let cc_addresses: Vec<String> = env.cc_recipients.iter()
+            .filter_map(|r| r.email_address.address.clone())
+            .collect();
+
+        let date_str = env.received_date_time.clone().unwrap_or_default();
+        let date_epoch = chrono::DateTime::parse_from_rfc3339(&date_str)
+            .map(|dt| dt.timestamp())
+            .ok();
+
+        let is_starred = env.flag.as_ref()
+            .map(|f| f.flag_status == "flagged")
+            .unwrap_or(false);
+
+        MessageInfo {
+            id: 0, // Will be set by DB upsert
+            uid,
+            folder_id,
+            message_id: env.internet_message_id.clone(),
+            subject: env.subject.clone().unwrap_or_default(),
+            from: from_display,
+            from_address,
+            to: to_addresses.join(", "),
+            cc: cc_addresses.join(", "),
+            date: date_str,
+            date_epoch,
+            snippet: None,
+            is_read: env.is_read,
+            is_starred,
+            has_attachments: env.has_attachments,
+        }
+    }
+
+    /// Convert a Graph API message envelope to a DbMessage for database storage
+    fn graph_envelope_to_db_message(env: &northmail_graph::GraphMessageEnvelope) -> northmail_core::models::DbMessage {
+        let uid = Self::graph_id_to_uid(&env.id) as i64;
+        let from_name = env.from.as_ref()
+            .and_then(|f| f.email_address.name.clone());
+        let from_address = env.from.as_ref()
+            .and_then(|f| f.email_address.address.clone());
+
+        let to_addresses: Vec<String> = env.to_recipients.iter()
+            .filter_map(|r| r.email_address.address.clone())
+            .collect();
+
+        let cc_addresses: Vec<String> = env.cc_recipients.iter()
+            .filter_map(|r| r.email_address.address.clone())
+            .collect();
+
+        let date_str = env.received_date_time.clone();
+        let date_epoch = date_str.as_ref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.timestamp());
+
+        let is_starred = env.flag.as_ref()
+            .map(|f| f.flag_status == "flagged")
+            .unwrap_or(false);
+
+        northmail_core::models::DbMessage {
+            id: 0,
+            folder_id: 0, // Set by caller
+            uid,
+            message_id: env.internet_message_id.clone(),
+            subject: env.subject.clone(),
+            from_address,
+            from_name,
+            to_addresses: if to_addresses.is_empty() { None } else { Some(to_addresses.join(", ")) },
+            cc_addresses: if cc_addresses.is_empty() { None } else { Some(cc_addresses.join(", ")) },
+            date_sent: date_str,
+            date_epoch,
+            snippet: None,
+            is_read: env.is_read,
+            is_starred,
+            has_attachments: env.has_attachments,
+            size: 0,
+            maildir_path: None,
+            body_text: None,
+            body_html: None,
+        }
+    }
+
+    /// Stream inbox messages from Graph API to cache (background sync for ms_graph accounts)
+    async fn stream_inbox_to_cache_graph(
+        access_token: String,
+        account_id: &str,
+        db: Option<std::sync::Arc<northmail_core::Database>>,
+        sender: &std::sync::mpsc::Sender<FetchEvent>,
+    ) {
+        let client = northmail_graph::GraphMailClient::new(access_token);
+
+        // Get the Inbox folder ID
+        let folders = match client.list_folders().await {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = sender.send(FetchEvent::Error(format!("Graph list_folders failed: {}", e)));
+                return;
+            }
+        };
+
+        let inbox_folder = match folders.iter().find(|f| f.display_name == "Inbox") {
+            Some(f) => f,
+            None => {
+                let _ = sender.send(FetchEvent::Error("Inbox folder not found via Graph API".to_string()));
+                return;
+            }
+        };
+
+        let _ = sender.send(FetchEvent::FolderInfo {
+            total_count: inbox_folder.total_item_count as u32,
+        });
+
+        // Get folder_id from DB for this account's INBOX
+        let folder_id = if let Some(ref db) = db {
+            match db.get_or_create_folder_id(account_id, "INBOX").await {
+                Ok(id) => id,
+                Err(_) => 0,
+            }
+        } else {
+            0
+        };
+
+        // Fetch messages in batches of 50
+        let batch_size = 50u32;
+        let mut skip = 0u32;
+        let mut total_synced = 0u32;
+        let mut all_uids: Vec<i64> = Vec::new();
+        let mut is_first_batch = true;
+
+        loop {
+            let (messages, next_link) = match client.list_messages(&inbox_folder.id, batch_size, skip).await {
+                Ok(result) => result,
+                Err(e) => {
+                    warn!("Graph list_messages failed at skip={}: {}", skip, e);
+                    let _ = sender.send(FetchEvent::Error(format!("Graph list_messages failed: {}", e)));
+                    return;
+                }
+            };
+
+            if messages.is_empty() {
+                break;
+            }
+
+            let count = messages.len() as u32;
+
+            // Convert to MessageInfo for UI and DbMessage for DB
+            let message_infos: Vec<MessageInfo> = messages.iter()
+                .map(|env| Self::graph_envelope_to_message_info(env, folder_id))
+                .collect();
+
+            // Collect UIDs for stale cleanup
+            for info in &message_infos {
+                all_uids.push(info.uid as i64);
+            }
+
+            // Save to DB with graph_message_id
+            if let Some(ref db) = db {
+                let db_messages: Vec<(northmail_core::models::DbMessage, String)> = messages.iter()
+                    .map(|env| (Self::graph_envelope_to_db_message(env), env.id.clone()))
+                    .collect();
+                if let Err(e) = db.upsert_messages_batch_graph(folder_id, &db_messages).await {
+                    warn!("Failed to save Graph messages to cache: {}", e);
+                }
+            }
+
+            // Send to UI
+            if is_first_batch {
+                let _ = sender.send(FetchEvent::Messages(message_infos));
+                is_first_batch = false;
+            } else {
+                let _ = sender.send(FetchEvent::BackgroundMessages(message_infos));
+            }
+
+            total_synced += count;
+
+            let _ = sender.send(FetchEvent::SyncProgress {
+                synced: total_synced,
+                total: inbox_folder.total_item_count as u32,
+            });
+
+            if next_link.is_none() || count < batch_size {
+                break;
+            }
+
+            skip += batch_size;
+        }
+
+        // Signal completion
+        if is_first_batch {
+            // No messages at all
+            let _ = sender.send(FetchEvent::InitialBatchDone { lowest_seq: 0 });
+        } else {
+            let _ = sender.send(FetchEvent::InitialBatchDone { lowest_seq: 1 });
+        }
+    }
+
+    /// Map Graph API folder displayName to folder type string
+    fn graph_folder_type(display_name: &str) -> &'static str {
+        match display_name {
+            "Inbox" => "inbox",
+            "Sent Items" => "sent",
+            "Drafts" => "drafts",
+            "Deleted Items" => "trash",
+            "Junk Email" => "spam",
+            "Archive" => "archive",
+            _ => "other",
+        }
+    }
+
+    /// Fetch inbox folder list via Microsoft Graph API (for ms_graph accounts)
+    async fn fetch_inbox_graph_async(
+        access_token: String,
+        _cached_folders: Option<Vec<(String, String, String)>>,
+    ) -> Result<SyncResult, String> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async {
+                let client = northmail_graph::GraphMailClient::new(access_token);
+
+                let graph_folders = client.list_folders().await
+                    .map_err(|e| format!("Graph list_folders failed: {}", e))?;
+
+                let mut folders = Vec::new();
+                let mut inbox_count: usize = 0;
+
+                for gf in &graph_folders {
+                    let folder_type = Self::graph_folder_type(&gf.display_name);
+                    if folder_type == "inbox" {
+                        inbox_count = gf.total_item_count as usize;
+                    }
+                    // Normalize full_path: use "INBOX" to match IMAP convention
+                    let full_path = if folder_type == "inbox" {
+                        "INBOX".to_string()
+                    } else {
+                        gf.display_name.clone()
+                    };
+                    folders.push(SyncedFolder {
+                        name: gf.display_name.clone(),
+                        full_path,
+                        folder_type: folder_type.to_string(),
+                        message_count: gf.total_item_count as u32,
+                        unseen_count: gf.unread_item_count as u32,
+                        graph_folder_id: Some(gf.id.clone()),
+                    });
+                }
+
+                Ok(SyncResult { inbox_count, folders })
+            });
+
+            let _ = sender.send(result);
+        });
+
+        Self::poll_result_channel(receiver).await
     }
 
     /// Fetch inbox messages asynchronously using password auth (for iCloud, generic IMAP)
@@ -2262,6 +2917,7 @@ impl NorthMailApplication {
                                 folder_type: ft.clone(),
                                 message_count: msg_count,
                                 unseen_count: unseen,
+                                graph_folder_id: None,
                             });
                         }
 
@@ -2934,6 +3590,7 @@ impl NorthMailApplication {
         let account_id_clone = account.id.clone();
         let is_google = Self::is_google_account(&account);
         let is_microsoft = Self::is_microsoft_account(&account);
+        let is_ms_graph = Self::is_ms_graph_account(&account);
         let imap_host = account.imap_host.clone();
         let imap_username = account.imap_username.clone();
 
@@ -3068,7 +3725,34 @@ impl NorthMailApplication {
 
             match AuthManager::new().await {
                 Ok(auth_manager) => {
-                    if is_google {
+                    if is_ms_graph {
+                        // Microsoft Graph API (no IMAP)
+                        match auth_manager
+                            .get_xoauth2_token_for_goa(&account_id_clone)
+                            .await
+                        {
+                            Ok((_email, access_token)) => {
+                                debug!("Got Graph API token for folder fetch");
+                                let result = Self::fetch_folder_graph(
+                                    account_id_clone.clone(),
+                                    access_token,
+                                    folder_path.clone(),
+                                    has_cache,
+                                    generation,
+                                    &app,
+                                ).await;
+
+                                if let Err(e) = result {
+                                    error!("Failed to fetch messages via Graph: {}", e);
+                                    app.show_error(&format!("Failed to fetch messages: {}", e));
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to get Graph API token: {}", e);
+                                app.show_error(&format!("Authentication failed: {}", e));
+                            }
+                        }
+                    } else if is_google {
                         // Google OAuth2 auth
                         match auth_manager
                             .get_xoauth2_token_for_goa(&account_id_clone)
@@ -3175,6 +3859,7 @@ impl NorthMailApplication {
 
         let is_google = Self::is_google_account(&account);
         let is_microsoft = Self::is_microsoft_account(&account);
+        let is_ms_graph = Self::is_ms_graph_account(&account);
         let imap_host = account.imap_host.clone();
         let imap_username = account.imap_username.clone();
         let account_id = account.id.clone();
@@ -3184,7 +3869,11 @@ impl NorthMailApplication {
 
             match AuthManager::new().await {
                 Ok(auth_manager) => {
-                    if is_google {
+                    if is_ms_graph {
+                        // Graph API pagination is handled via cache — load more from DB
+                        info!("load_more_messages: ms_graph accounts load from cache");
+                        app.load_more_from_cache();
+                    } else if is_google {
                         match auth_manager.get_xoauth2_token_for_goa(&account_id).await {
                             Ok((email, access_token)) => {
                                 let result = Self::load_more_google(email, access_token, state, &app).await;
@@ -3286,6 +3975,121 @@ impl NorthMailApplication {
         });
 
         Self::handle_fetch_events(receiver, &account_id, &folder_path, has_cache, generation, app).await
+    }
+
+    /// Fetch folder messages via Microsoft Graph API
+    async fn fetch_folder_graph(
+        account_id: String,
+        access_token: String,
+        folder_path: String,
+        has_cache: bool,
+        generation: u64,
+        app: &NorthMailApplication,
+    ) -> Result<(), String> {
+        let (sender, receiver) = std::sync::mpsc::channel::<FetchEvent>();
+        let folder_path_clone = folder_path.clone();
+        let account_id_clone = account_id.clone();
+        let db = app.database().cloned();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let client = northmail_graph::GraphMailClient::new(access_token);
+
+                // Resolve Graph folder ID from display name
+                let graph_folder_id = match Self::resolve_graph_folder_id(&client, &folder_path_clone).await {
+                    Ok(id) => id,
+                    Err(e) => {
+                        let _ = sender.send(FetchEvent::Error(e));
+                        return;
+                    }
+                };
+
+                // Get DB folder_id
+                let folder_id = if let Some(ref db) = db {
+                    db.get_or_create_folder_id(&account_id_clone, &folder_path_clone).await.unwrap_or(0)
+                } else {
+                    0
+                };
+
+                // Fetch messages
+                let batch_size = 50u32;
+                let mut skip = 0u32;
+                let mut is_first = true;
+                let mut total_fetched = 0u32;
+
+                loop {
+                    let (messages, next_link) = match client.list_messages(&graph_folder_id, batch_size, skip).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let _ = sender.send(FetchEvent::Error(format!("Graph list_messages: {}", e)));
+                            return;
+                        }
+                    };
+
+                    if messages.is_empty() {
+                        break;
+                    }
+
+                    let count = messages.len() as u32;
+                    total_fetched += count;
+                    let message_infos: Vec<MessageInfo> = messages.iter()
+                        .map(|env| Self::graph_envelope_to_message_info(env, folder_id))
+                        .collect();
+
+                    // Save to DB
+                    if let Some(ref db) = db {
+                        let db_messages: Vec<(northmail_core::models::DbMessage, String)> = messages.iter()
+                            .map(|env| (Self::graph_envelope_to_db_message(env), env.id.clone()))
+                            .collect();
+                        let _ = db.upsert_messages_batch_graph(folder_id, &db_messages).await;
+                    }
+
+                    if is_first {
+                        let _ = sender.send(FetchEvent::Messages(message_infos));
+                        is_first = false;
+                    } else {
+                        let _ = sender.send(FetchEvent::BackgroundMessages(message_infos));
+                    }
+
+                    if next_link.is_none() || count < batch_size {
+                        break;
+                    }
+                    skip += batch_size;
+                }
+
+                let _ = sender.send(FetchEvent::InitialBatchDone { lowest_seq: 0 });
+                let _ = sender.send(FetchEvent::FullSyncDone { total_synced: total_fetched });
+            });
+        });
+
+        Self::handle_fetch_events(receiver, &account_id, &folder_path, has_cache, generation, app).await
+    }
+
+    /// Resolve a Graph API folder ID from a display name
+    async fn resolve_graph_folder_id(
+        client: &northmail_graph::GraphMailClient,
+        folder_display_name: &str,
+    ) -> Result<String, String> {
+        // Well-known folder names can be used directly as IDs in Graph API
+        match folder_display_name {
+            "Inbox" | "INBOX" => return Ok("Inbox".to_string()),
+            "Drafts" => return Ok("Drafts".to_string()),
+            "Sent Items" => return Ok("SentItems".to_string()),
+            "Deleted Items" => return Ok("DeletedItems".to_string()),
+            "Junk Email" => return Ok("JunkEmail".to_string()),
+            "Archive" => return Ok("Archive".to_string()),
+            _ => {}
+        }
+
+        // For other folders, look up by listing
+        let folders = client.list_folders().await
+            .map_err(|e| format!("Failed to list folders: {}", e))?;
+
+        folders.iter()
+            .find(|f| f.display_name == folder_display_name)
+            .map(|f| f.id.clone())
+            .ok_or_else(|| format!("Folder '{}' not found", folder_display_name))
     }
 
     /// Fetch folder with streaming updates using password auth
@@ -3567,6 +4371,7 @@ impl NorthMailApplication {
         }
         let is_google = Self::is_google_account(account);
         let is_microsoft = Self::is_microsoft_account(account);
+        let is_ms_graph = Self::is_ms_graph_account(account);
         let is_password = Self::is_password_account(account);
         let imap_username = account.imap_username.clone();
         let imap_host = account.imap_host.clone();
@@ -3582,7 +4387,26 @@ impl NorthMailApplication {
 
         let (sender, receiver) = std::sync::mpsc::channel::<FetchEvent>();
 
-        if is_google || is_microsoft {
+        if is_ms_graph {
+            // Microsoft Graph API path — no IMAP
+            match auth_manager.get_xoauth2_token_for_goa(&account_id).await {
+                Ok((_email_addr, access_token)) => {
+                    let db = self.database().cloned();
+                    let acct_id = account_id.clone();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        rt.block_on(async {
+                            Self::stream_inbox_to_cache_graph(access_token, &acct_id, db, &sender).await;
+                        });
+                    });
+                }
+                Err(e) => {
+                    warn!("Failed to get Graph API token for {}: {}", email, e);
+                    self.imp().syncing_accounts.borrow_mut().remove(&account_id);
+                    return;
+                }
+            }
+        } else if is_google || is_microsoft {
             match auth_manager.get_xoauth2_token_for_goa(&account_id).await {
                 Ok((email_addr, access_token)) => {
                     let is_gmail = is_google;
@@ -4774,6 +5598,7 @@ impl NorthMailApplication {
         let folder_path = resolved_folder_path;
         let is_google = Self::is_google_account(&account);
         let is_microsoft = Self::is_microsoft_account(&account);
+        let is_ms_graph = Self::is_ms_graph_account(&account);
         let imap_host = account.imap_host.clone();
         let imap_username = account.imap_username.clone();
         let account_id = account.id.clone();
@@ -4789,15 +5614,145 @@ impl NorthMailApplication {
                 None
             };
 
-            // If we have cached body, return it immediately (attachments fetched lazily when needed)
-            if let Some(cached) = cached_body {
-                info!("📧 Using cached body for message {} (instant)", uid);
-                callback(Ok(cached));
+            // If we have cached body, check if attachments need data
+            let mut cached_body = cached_body;
+            if let Some(mut cached) = cached_body.take() {
+                let has_empty_attachments = cached.attachments.iter().any(|a| a.data.is_empty() && a.size > 0);
+                if !has_empty_attachments {
+                    info!("📧 Using cached body for message {} (instant, all attachment data present)", uid);
+                    callback(Ok(cached));
+                    return;
+                }
+
+                // Attachments have metadata but no data — fetch data from server
+                if is_ms_graph {
+                    // Use Graph API list_attachments to get actual data
+                    info!("📧 Cached body for message {} has {} attachments with empty data, fetching via Graph API",
+                        uid, cached.attachments.len());
+                    let graph_msg_id = if let Some(ref db) = db {
+                        Self::get_graph_message_id_for_uid(db, &account_id, &folder_path, uid).await
+                    } else { None };
+
+                    if let Some(graph_id) = graph_msg_id {
+                        match AuthManager::new().await {
+                            Ok(auth_manager) => {
+                                if let Ok(token) = auth_manager.get_goa_token(&account_id).await {
+                                    let (sender, receiver) = std::sync::mpsc::channel();
+                                    std::thread::spawn(move || {
+                                        let rt = tokio::runtime::Runtime::new().unwrap();
+                                        let result = rt.block_on(async {
+                                            let client = northmail_graph::GraphMailClient::new(token);
+                                            client.list_attachments(&graph_id).await
+                                                .map_err(|e| format!("Graph list_attachments failed: {}", e))
+                                        });
+                                        let _ = sender.send(result);
+                                    });
+
+                                    let att_result = loop {
+                                        match receiver.try_recv() {
+                                            Ok(r) => break r,
+                                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                                glib::timeout_future(std::time::Duration::from_millis(10)).await;
+                                            }
+                                            Err(_) => break Err("Channel disconnected".to_string()),
+                                        }
+                                    };
+
+                                    if let Ok(server_attachments) = att_result {
+                                        // Match server attachments to cached ones by filename
+                                        for cached_att in &mut cached.attachments {
+                                            if cached_att.data.is_empty() {
+                                                if let Some((_, _, data)) = server_attachments.iter()
+                                                    .find(|(name, _, _)| name == &cached_att.filename)
+                                                {
+                                                    cached_att.data = data.clone();
+                                                    cached_att.size = data.len();
+                                                    info!("📎 Filled attachment data for '{}': {} bytes",
+                                                        cached_att.filename, data.len());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => warn!("Auth error fetching attachments: {}", e),
+                        }
+                    }
+                    callback(Ok(cached));
+                    return;
+                }
+
+                // For IMAP: fall through to re-fetch full body from server
+                // (the cache text/html is fine, but we need attachment data from IMAP BODY.PEEK[])
+                info!("📧 Cached body for message {} has empty attachment data, re-fetching from IMAP", uid);
+            }
+
+            // No cache - fetch from server
+            if is_ms_graph {
+                // Graph API path: fetch raw MIME via $value endpoint
+                info!("Fetching body from Graph API for message {}", uid);
+                match AuthManager::new().await {
+                    Ok(auth_manager) => {
+                        match auth_manager.get_goa_token(&account_id).await {
+                            Ok(access_token) => {
+                                // Look up graph_message_id from DB
+                                let graph_msg_id = if let Some(ref db) = db {
+                                    Self::get_graph_message_id_for_uid(db, &account_id, &folder_path, uid).await
+                                } else {
+                                    None
+                                };
+
+                                if let Some(graph_id) = graph_msg_id {
+                                    let (sender, receiver) = std::sync::mpsc::channel();
+                                    std::thread::spawn(move || {
+                                        let rt = tokio::runtime::Runtime::new().unwrap();
+                                        let result = rt.block_on(async {
+                                            let client = northmail_graph::GraphMailClient::new(access_token);
+                                            client.fetch_mime_body(&graph_id).await
+                                                .map_err(|e| format!("Graph fetch body failed: {}", e))
+                                        });
+                                        let _ = sender.send(result);
+                                    });
+
+                                    // Poll for result
+                                    let body_result = loop {
+                                        match receiver.try_recv() {
+                                            Ok(r) => break r,
+                                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                                glib::timeout_future(std::time::Duration::from_millis(10)).await;
+                                            }
+                                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                                break Err("Channel disconnected".to_string());
+                                            }
+                                        }
+                                    };
+
+                                    match body_result {
+                                        Ok(raw_body) => {
+                                            let parsed = Self::parse_email_body(&raw_body);
+                                            // Save to DB cache
+                                            if let Some(ref db) = db {
+                                                Self::save_body_to_cache(db, &account_id, &folder_path, uid, &parsed);
+                                            }
+                                            callback(Ok(parsed));
+                                        }
+                                        Err(e) => {
+                                            callback(Err(e));
+                                        }
+                                    }
+                                } else {
+                                    callback(Err("Graph message ID not found in cache".to_string()));
+                                }
+                            }
+                            Err(e) => callback(Err(format!("Auth failed: {}", e))),
+                        }
+                    }
+                    Err(e) => callback(Err(format!("Auth manager failed: {}", e))),
+                }
                 return;
             }
 
-            // No cache - fetch from IMAP
-            info!("🌐 Fetching body from IMAP for message {} (no cache)", uid);
+            info!("Fetching body from IMAP for message {} (no cache)", uid);
 
             match AuthManager::new().await {
                 Ok(auth_manager) => {
@@ -4872,22 +5827,24 @@ impl NorthMailApplication {
                             if let Some(ref db) = db {
                                 Self::save_body_to_cache(db, &account_id, &folder_path, uid, &body);
 
-                                // Correct has_attachments flag based on actual parsed attachments
-                                // (BODYSTRUCTURE heuristic may differ from mail-parser extraction)
-                                let has_attachments = !body.attachments.is_empty();
-                                let db_clone = db.clone();
-                                let aid = account_id.clone();
-                                let fp = folder_path.clone();
-                                std::thread::spawn(move || {
-                                    let rt = tokio::runtime::Runtime::new().unwrap();
-                                    rt.block_on(async {
-                                        if let Ok(fid) = db_clone.get_or_create_folder_id(&aid, &fp).await {
-                                            let _ = db_clone.set_message_has_attachments_by_uid(
-                                                fid, uid as i64, has_attachments,
-                                            ).await;
-                                        }
+                                // Only upgrade has_attachments to true if we found attachments.
+                                // Never downgrade to false — the envelope's flag from the server
+                                // is authoritative and our MIME parser may miss some types.
+                                if !body.attachments.is_empty() {
+                                    let db_clone = db.clone();
+                                    let aid = account_id.clone();
+                                    let fp = folder_path.clone();
+                                    std::thread::spawn(move || {
+                                        let rt = tokio::runtime::Runtime::new().unwrap();
+                                        rt.block_on(async {
+                                            if let Ok(fid) = db_clone.get_or_create_folder_id(&aid, &fp).await {
+                                                let _ = db_clone.set_message_has_attachments_by_uid(
+                                                    fid, uid as i64, true,
+                                                ).await;
+                                            }
+                                        });
                                     });
-                                });
+                                }
                             }
                             callback(Ok(body));
                         }
@@ -4949,7 +5906,10 @@ impl NorthMailApplication {
             loop {
                 match response_rx.try_recv() {
                     Ok(ImapResponse::Body(body)) => {
-                        info!("fetch_body_via_pool: got body, {} bytes", body.len());
+                        info!("fetch_body_via_pool: got body, {} bytes for uid={}", body.len(), uid);
+                        if body.is_empty() {
+                            warn!("fetch_body_via_pool: EMPTY body returned for uid={}", uid);
+                        }
                         return Ok(Self::parse_email_body(&body));
                     }
                     Ok(ImapResponse::Error(e)) => {
@@ -5026,15 +5986,19 @@ impl NorthMailApplication {
                             return None;
                         }
                         info!("📧 Body cache HIT: Found cached body for message {} ({} attachments)", uid, attachments.len());
-                        // Convert cached attachment metadata to ParsedAttachment
+                        // Convert cached attachment metadata+data to ParsedAttachment
                         let cached_attachments: Vec<ParsedAttachment> = attachments
                             .into_iter()
-                            .map(|a| ParsedAttachment {
-                                filename: a.filename,
-                                mime_type: a.mime_type,
-                                data: Vec::new(), // Data fetched on demand from IMAP
-                                size: a.size as usize,
-                                content_id: a.content_id,
+                            .map(|a| {
+                                let data = a.data.unwrap_or_default();
+                                let size = if data.is_empty() { a.size as usize } else { data.len() };
+                                ParsedAttachment {
+                                    filename: a.filename,
+                                    mime_type: a.mime_type,
+                                    data,
+                                    size,
+                                    content_id: a.content_id,
+                                }
                             })
                             .collect();
                         return Some(ParsedEmailBody {
@@ -5074,7 +6038,7 @@ impl NorthMailApplication {
         let folder_path = folder_path.to_string();
         let body_text = body.text.clone();
         let body_html = body.html.clone();
-        // Convert attachments to AttachmentInfo for saving
+        // Convert attachments to AttachmentInfo for saving (includes data)
         let attachments: Vec<northmail_core::models::AttachmentInfo> = body
             .attachments
             .iter()
@@ -5084,6 +6048,7 @@ impl NorthMailApplication {
                 size: a.size,
                 content_id: a.content_id.clone(),
                 is_inline: a.content_id.is_some(),
+                data: a.data.clone(),
             })
             .collect();
 
@@ -5135,6 +6100,17 @@ impl NorthMailApplication {
             }
         };
 
+        // ms_graph: prefetch bodies via Graph API
+        if Self::is_ms_graph_account(&account) {
+            let account_id = account_id.to_string();
+            let folder_path = folder_path.to_string();
+            let db_clone = db.clone();
+            glib::spawn_future_local(async move {
+                Self::body_prefetch_graph(&db_clone, &account_id, &folder_path).await;
+            });
+            return;
+        }
+
         let pool = self.imap_pool();
         let account_id = account_id.to_string();
         let folder_path = folder_path.to_string();
@@ -5144,7 +6120,7 @@ impl NorthMailApplication {
         let imap_username = account.imap_username.clone();
         let account_email = account.email.clone();
 
-        info!("📦 Starting body prefetch for {}/{}", account_id, folder_path);
+        info!("Starting body prefetch for {}/{}", account_id, folder_path);
 
         glib::spawn_future_local(async move {
             // Get folder_id first
@@ -5297,6 +6273,7 @@ impl NorthMailApplication {
                                 size: a.size,
                                 content_id: a.content_id.clone(),
                                 is_inline: a.content_id.is_some(),
+                                data: a.data.clone(),
                             })
                             .collect();
 
@@ -5552,14 +6529,24 @@ impl NorthMailApplication {
 
         let mut result = ParsedEmailBody::default();
 
+        debug!("parse_email_body: raw input {} bytes", raw.len());
+
         let message = match mail_parser::MessageParser::default().parse(raw.as_bytes()) {
             Some(msg) => msg,
-            None => return result,
+            None => {
+                warn!("parse_email_body: mail_parser returned None for {} byte input", raw.len());
+                return result;
+            }
         };
 
         // Extract text and HTML body
         result.text = message.body_text(0).map(|s| s.into_owned());
         result.html = message.body_html(0).map(|s| s.into_owned());
+
+        debug!("parse_email_body: text={} html={} attachment_parts={}",
+            result.text.as_ref().map(|t| t.len()).unwrap_or(0),
+            result.html.as_ref().map(|h| h.len()).unwrap_or(0),
+            message.attachments().count());
 
         // Collect inline images (Content-ID parts) for cid: replacement in HTML
         // and separate real attachments from inline resources
@@ -5577,23 +6564,26 @@ impl NorthMailApplication {
                 .unwrap_or_else(|| "application/octet-stream".to_string());
             let mime_lower = mime_type.to_lowercase();
 
+            let att_name = attachment.attachment_name().unwrap_or("(unnamed)");
+            debug!("parse_email_body: attachment part: name={}, type={}, cid={:?}, data_len={}",
+                att_name, mime_type, attachment.content_id(), attachment.contents().len());
+
             // Skip S/MIME and PGP signatures — not user-facing attachments
             if mime_lower == "application/pkcs7-signature"
                 || mime_lower == "application/x-pkcs7-signature"
                 || mime_lower == "application/pgp-signature"
             {
+                debug!("parse_email_body: skipping signature part: {}", mime_type);
                 continue;
             }
 
             let data = attachment.contents().to_vec();
-            if data.is_empty() {
-                continue;
-            }
 
             // Parts with Content-ID are inline resources for the HTML body (images, etc.)
             // Collect them for cid: replacement, don't show as attachment pills
             if let Some(cid) = attachment.content_id() {
                 let cid_clean = cid.trim_start_matches('<').trim_end_matches('>').to_string();
+                debug!("parse_email_body: inline CID part: {} ({})", cid_clean, mime_type);
                 cid_map.push((cid_clean, mime_type, data));
                 continue;
             }
@@ -5660,6 +6650,12 @@ impl NorthMailApplication {
                 }
             }
         }
+
+        debug!("parse_email_body: RESULT: {} text, {} html, {} attachments, {} inline CIDs",
+            result.text.as_ref().map(|t| format!("{} bytes", t.len())).unwrap_or_else(|| "None".to_string()),
+            result.html.as_ref().map(|h| format!("{} bytes", h.len())).unwrap_or_else(|| "None".to_string()),
+            result.attachments.len(),
+            cid_map.len());
 
         result
     }
@@ -5939,8 +6935,19 @@ impl NorthMailApplication {
                     Ok(accounts) => {
                         if let Some(goa_account) = accounts.iter().find(|a| a.id == account_id) {
                             info!("Adding GOA account: {}", goa_account.email);
+
+                            // Add to in-memory account list
+                            app.imp().accounts.borrow_mut().push(goa_account.clone());
+
+                            // Save to database
+                            app.save_accounts_to_db(&[goa_account.clone()]);
+
+                            // Update sidebar and trigger sync
+                            let all_accounts = app.imp().accounts.borrow().clone();
+                            app.update_sidebar_with_accounts(&all_accounts);
+                            app.sync_all_accounts();
+
                             app.show_toast(&format!("Added account: {}", goa_account.email));
-                            // TODO: Save to database and start sync
                         }
                     }
                     Err(e) => {
@@ -6383,10 +7390,10 @@ impl NorthMailApplication {
             Some(real_name)
         };
 
-        eprintln!("[send] account: {} ({}) smtp: {} auth: {:?}", email, account.provider_type, smtp_host, auth_type);
-        eprintln!("[send] to: {:?}, cc: {:?}, bcc: {:?}, subject: {:?}", to, cc, bcc, subject);
+        debug!("Send: account={} ({}) smtp={} auth={:?}", email, account.provider_type, smtp_host, auth_type);
+        debug!("Send: to={:?}, cc={:?}, bcc={:?}, subject={:?}", to, cc, bcc, subject);
         if let Some(ref name) = from_name {
-            eprintln!("[send] from_name: {:?}", name);
+            debug!("Send: from_name={:?}", name);
         }
 
         // Build OutgoingMessage
@@ -6430,26 +7437,26 @@ impl NorthMailApplication {
 
                         let smtp_client = northmail_smtp::SmtpClient::new(&smtp_host, 587);
 
-                        // Microsoft/Outlook OAuth2 tokens from GOA don't have SMTP.Send scope,
-                        // so we need to use password auth for SMTP with Microsoft accounts
-                        let is_microsoft = provider_type == "windows_live" || provider_type == "microsoft";
+                        let is_ms_graph = provider_type == "ms_graph";
+                        let is_microsoft = is_ms_graph || provider_type == "windows_live" || provider_type == "microsoft";
                         let is_gmail = provider_type == "google";
 
-                        let smtp_result = if is_microsoft {
-                            // Try password auth for Microsoft accounts
-                            match auth_manager.get_goa_password(&account_id).await {
-                                Ok(password) => {
-                                    eprintln!("[send] Using password auth for Microsoft SMTP");
-                                    smtp_client
-                                        .send_password(&email, &password, msg)
-                                        .await
-                                        .map_err(|e| format!("Send failed: {}", e))
-                                }
-                                Err(e) => {
-                                    Err(format!("Microsoft accounts require an app password for SMTP. \
-                                        GOA OAuth2 tokens don't have SMTP permissions. Error: {}", e))
-                                }
-                            }
+                        let smtp_result = if is_ms_graph {
+                            // Use Microsoft Graph API — ms_graph provider has mail.send scope
+                            info!("Sending via Microsoft Graph API (ms_graph provider)");
+                            let token = auth_manager
+                                .get_goa_token(&account_id)
+                                .await
+                                .map_err(|e| format!("Failed to get token: {}", e))?;
+                            northmail_smtp::msgraph::send_via_graph(&token, msg)
+                                .await
+                                .map_err(|e| format!("Graph API send failed: {}", e))
+                        } else if provider_type == "windows_live" {
+                            // Legacy windows_live provider uses wl.* scopes — incompatible with
+                            // both Graph API (wrong audience) and SMTP XOAUTH2 (no SMTP.Send scope).
+                            error!("Cannot send from windows_live account — token lacks mail.send scope");
+                            Err("This Microsoft account uses a legacy authentication method that doesn't support sending. \
+                                Please remove and re-add it in GNOME Settings → Online Accounts as \"Microsoft 365\".".to_string())
                         } else {
                             match auth_type.clone() {
                                 northmail_auth::GoaAuthType::OAuth2 => {
@@ -6478,9 +7485,9 @@ impl NorthMailApplication {
                             }
                         };
 
-                        // If SMTP succeeded and not Gmail (Gmail auto-saves to Sent), save to Sent folder
-                        if smtp_result.is_ok() && !is_gmail {
-                            eprintln!("[send] Saving to Sent folder...");
+                        // If send succeeded and not Gmail/Microsoft (both auto-save to Sent), save to Sent folder
+                        if smtp_result.is_ok() && !is_gmail && !is_microsoft {
+                            debug!("Saving to Sent folder...");
                             if let Err(e) = Self::save_to_sent_folder(
                                 &auth_manager,
                                 &account_id,
@@ -6492,17 +7499,17 @@ impl NorthMailApplication {
                                 &msg_for_sent,
                             ).await {
                                 // Log but don't fail the send - message was sent successfully
-                                eprintln!("[send] Warning: failed to save to Sent folder: {}", e);
+                                warn!("Failed to save to Sent folder: {}", e);
                             } else {
-                                eprintln!("[send] Saved to Sent folder");
+                                info!("Saved to Sent folder");
                             }
                         }
 
                         smtp_result
                     }.await;
                     match &result {
-                        Ok(()) => eprintln!("[send] success!"),
-                        Err(e) => eprintln!("[send] error: {}", e),
+                        Ok(()) => info!("Email sent successfully"),
+                        Err(e) => error!("Send failed: {}", e),
                     }
                     let _ = sender.send(result);
                 });
@@ -6527,10 +7534,33 @@ impl NorthMailApplication {
 
     /// Save a draft to the account's IMAP Drafts folder via APPEND.
     /// Returns the UID of the saved draft (if server provides APPENDUID).
+    /// For ms_graph accounts with an existing_draft_uid, uses PATCH to update
+    /// the existing draft (preserving server-side attachments) instead of creating new.
     pub fn save_draft(
         &self,
         account_index: u32,
         msg: northmail_smtp::OutgoingMessage,
+        callback: impl FnOnce(Result<Option<u32>, String>) + 'static,
+    ) {
+        self.save_draft_inner(account_index, msg, None, callback);
+    }
+
+    /// Save a draft, optionally updating an existing ms_graph draft by UID.
+    pub fn save_draft_update(
+        &self,
+        account_index: u32,
+        msg: northmail_smtp::OutgoingMessage,
+        existing_draft_uid: u32,
+        callback: impl FnOnce(Result<Option<u32>, String>) + 'static,
+    ) {
+        self.save_draft_inner(account_index, msg, Some(existing_draft_uid), callback);
+    }
+
+    fn save_draft_inner(
+        &self,
+        account_index: u32,
+        msg: northmail_smtp::OutgoingMessage,
+        existing_draft_uid: Option<u32>,
         callback: impl FnOnce(Result<Option<u32>, String>) + 'static,
     ) {
         let accounts = self.imp().accounts.borrow().clone();
@@ -6557,6 +7587,8 @@ impl NorthMailApplication {
         let imap_host = account.imap_host.clone();
         let imap_username = account.imap_username.clone();
 
+        let is_ms_graph = provider_type == "ms_graph";
+
         glib::spawn_future_local(async move {
             let (sender, receiver) = std::sync::mpsc::channel();
 
@@ -6564,68 +7596,134 @@ impl NorthMailApplication {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
                     let result = async {
-                        // Build RFC 2822 message bytes
-                        let lettre_msg = northmail_smtp::build_lettre_message(&msg)
-                            .map_err(|e| format!("Failed to build message: {}", e))?;
-                        let message_bytes = lettre_msg.formatted();
-
-                        // Find drafts folder path from DB
-                        let drafts_path = db
-                            .get_drafts_folder(&account_id)
-                            .await
-                            .map_err(|e| format!("DB error: {}", e))?
-                            .unwrap_or_else(|| "Drafts".to_string());
-
-                        // Connect a SimpleImapClient and APPEND
                         let auth_manager = AuthManager::new()
                             .await
                             .map_err(|e| format!("Auth init failed: {}", e))?;
 
-                        let mut client = SimpleImapClient::new();
+                        if is_ms_graph {
+                            // Use Graph API for drafts
+                            let token = auth_manager
+                                .get_goa_token(&account_id)
+                                .await
+                                .map_err(|e| format!("Failed to get token: {}", e))?;
 
-                        match auth_type {
-                            northmail_auth::GoaAuthType::OAuth2 => {
-                                let (_email, token) = auth_manager
-                                    .get_xoauth2_token_for_goa(&account_id)
+                            // Filter out the account's own email from recipients
+                            let to_filtered: Vec<String> = msg.to.iter()
+                                .filter(|addr| !addr.eq_ignore_ascii_case(&email))
+                                .cloned()
+                                .collect();
+                            let cc_filtered: Vec<String> = msg.cc.iter()
+                                .filter(|addr| !addr.eq_ignore_ascii_case(&email))
+                                .cloned()
+                                .collect();
+
+                            let client = northmail_graph::GraphMailClient::new(token);
+
+                            // If updating an existing draft, use PATCH to preserve attachments
+                            if let Some(old_uid) = existing_draft_uid {
+                                // Look up graph_message_id from DB
+                                let drafts_folder = db.get_drafts_folder(&account_id).await
+                                    .map_err(|e| format!("DB error: {}", e))?
+                                    .unwrap_or_else(|| "Drafts".to_string());
+                                let folder_id = db.get_or_create_folder_id(&account_id, &drafts_folder).await
+                                    .map_err(|e| format!("DB error: {}", e))?;
+
+                                if let Ok(Some(graph_id)) = db.get_graph_message_id(folder_id, old_uid as i64).await {
+                                    info!("Updating existing ms_graph draft via PATCH: {}", graph_id);
+                                    client.update_draft(
+                                        &graph_id,
+                                        &msg.subject,
+                                        msg.text_body.as_deref().unwrap_or(""),
+                                        &to_filtered,
+                                        &cc_filtered,
+                                    )
                                     .await
-                                    .map_err(|e| format!("Failed to get token: {}", e))?;
+                                    .map_err(|e| format!("Graph update draft failed: {}", e))?;
 
-                                match provider_type.as_str() {
-                                    "google" => client.connect_gmail(&email, &token).await,
-                                    _ => client.connect_outlook(&email, &token).await,
+                                    // Return the same UID since the draft wasn't recreated
+                                    return Ok(Some(old_uid));
                                 }
-                                .map_err(|e| format!("IMAP connect failed: {}", e))?;
+                                // If graph_id not found, fall through to create new
+                                warn!("No graph_message_id found for uid {}, creating new draft", old_uid);
                             }
-                            northmail_auth::GoaAuthType::Password => {
-                                let password = auth_manager
-                                    .get_goa_password(&account_id)
-                                    .await
-                                    .map_err(|e| format!("Failed to get password: {}", e))?;
 
-                                let host = imap_host
-                                    .as_deref()
-                                    .unwrap_or("imap.mail.me.com");
-                                let username = imap_username
-                                    .as_deref()
-                                    .unwrap_or(&email);
+                            // Create new draft (includes attachments)
+                            let attachments: Vec<(String, String, Vec<u8>)> = msg.attachments.iter()
+                                .filter(|att| !att.data.is_empty()) // Only include attachments with actual data
+                                .map(|att| (att.filename.clone(), att.mime_type.clone(), att.data.clone()))
+                                .collect();
 
-                                client
-                                    .connect_login(host, 993, username, &password)
-                                    .await
-                                    .map_err(|e| format!("IMAP connect failed: {}", e))?;
-                            }
-                            northmail_auth::GoaAuthType::Unknown => {
-                                return Err("Unsupported auth type".to_string());
-                            }
-                        }
-
-                        let uid = client
-                            .append(&drafts_path, &["\\Draft", "\\Seen"], &message_bytes)
+                            client.create_draft_from_message(
+                                &msg.subject,
+                                msg.text_body.as_deref().unwrap_or(""),
+                                &to_filtered,
+                                &cc_filtered,
+                                &attachments,
+                            )
                             .await
-                            .map_err(|e| format!("APPEND failed: {}", e))?;
+                            .map_err(|e| format!("Graph create draft failed: {}", e))?;
 
-                        let _ = client.logout().await;
-                        Ok(uid)
+                            // Graph drafts don't return a UID
+                            Ok(None)
+                        } else {
+                            // Build RFC 2822 message bytes
+                            let lettre_msg = northmail_smtp::build_lettre_message(&msg)
+                                .map_err(|e| format!("Failed to build message: {}", e))?;
+                            let message_bytes = lettre_msg.formatted();
+                            // Find drafts folder path from DB
+                            let drafts_path = db
+                                .get_drafts_folder(&account_id)
+                                .await
+                                .map_err(|e| format!("DB error: {}", e))?
+                                .unwrap_or_else(|| "Drafts".to_string());
+
+                            // Connect a SimpleImapClient and APPEND
+                            let mut client = SimpleImapClient::new();
+
+                            match auth_type {
+                                northmail_auth::GoaAuthType::OAuth2 => {
+                                    let (_email, token) = auth_manager
+                                        .get_xoauth2_token_for_goa(&account_id)
+                                        .await
+                                        .map_err(|e| format!("Failed to get token: {}", e))?;
+
+                                    match provider_type.as_str() {
+                                        "google" => client.connect_gmail(&email, &token).await,
+                                        _ => client.connect_outlook(&email, &token).await,
+                                    }
+                                    .map_err(|e| format!("IMAP connect failed: {}", e))?;
+                                }
+                                northmail_auth::GoaAuthType::Password => {
+                                    let password = auth_manager
+                                        .get_goa_password(&account_id)
+                                        .await
+                                        .map_err(|e| format!("Failed to get password: {}", e))?;
+
+                                    let host = imap_host
+                                        .as_deref()
+                                        .unwrap_or("imap.mail.me.com");
+                                    let username = imap_username
+                                        .as_deref()
+                                        .unwrap_or(&email);
+
+                                    client
+                                        .connect_login(host, 993, username, &password)
+                                        .await
+                                        .map_err(|e| format!("IMAP connect failed: {}", e))?;
+                                }
+                                northmail_auth::GoaAuthType::Unknown => {
+                                    return Err("Unsupported auth type".to_string());
+                                }
+                            }
+
+                            let uid = client
+                                .append(&drafts_path, &["\\Draft", "\\Seen"], &message_bytes)
+                                .await
+                                .map_err(|e| format!("APPEND failed: {}", e))?;
+
+                            let _ = client.logout().await;
+                            Ok(uid)
+                        }
                     }
                     .await;
 
@@ -6756,6 +7854,7 @@ impl NorthMailApplication {
         let provider_type = account.provider_type.clone();
         let imap_host = account.imap_host.clone();
         let imap_username = account.imap_username.clone();
+        let is_ms_graph = provider_type == "ms_graph";
 
         glib::spawn_future_local(async move {
             let (sender, receiver) = std::sync::mpsc::channel();
@@ -6764,15 +7863,37 @@ impl NorthMailApplication {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
                     let result = async {
+                        let auth_manager = AuthManager::new()
+                            .await
+                            .map_err(|e| format!("Auth init failed: {}", e))?;
+
+                        if is_ms_graph {
+                            // Use Graph API to delete the draft
+                            let token = auth_manager
+                                .get_goa_token(&account_id)
+                                .await
+                                .map_err(|e| format!("Failed to get token: {}", e))?;
+
+                            // Look up the Graph message ID from the UID hash
+                            let graph_id = db
+                                .get_graph_message_id_by_uid(draft_uid as i64)
+                                .await
+                                .map_err(|e| format!("DB error: {}", e))?
+                                .ok_or_else(|| format!("No graph_message_id for uid {}", draft_uid))?;
+
+                            let client = northmail_graph::GraphMailClient::new(token);
+                            client.delete_message(&graph_id)
+                                .await
+                                .map_err(|e| format!("Graph delete draft failed: {}", e))?;
+
+                            return Ok(());
+                        }
+
                         let drafts_path = db
                             .get_drafts_folder(&account_id)
                             .await
                             .map_err(|e| format!("DB error: {}", e))?
                             .unwrap_or_else(|| "Drafts".to_string());
-
-                        let auth_manager = AuthManager::new()
-                            .await
-                            .map_err(|e| format!("Auth init failed: {}", e))?;
 
                         let mut client = SimpleImapClient::new();
 
@@ -6875,7 +7996,7 @@ impl NorthMailApplication {
                 }
             };
 
-            eprintln!("[eds] preloaded {} contacts", results.len());
+            debug!("EDS: preloaded {} contacts", results.len());
             *app.imp().contacts_cache.borrow_mut() = results;
         });
     }
@@ -6890,45 +8011,55 @@ impl NorthMailApplication {
         let cache = self.imp().contacts_cache.borrow();
         let results: Vec<(String, String)> = cache
             .iter()
-            .filter(|(name, email)| {
+            .filter(|(name, email, _)| {
                 name.to_lowercase().contains(&prefix_lower)
                     || email.to_lowercase().contains(&prefix_lower)
             })
-            .cloned()
+            .map(|(name, email, _)| (name.clone(), email.clone()))
             .collect();
         callback(results);
     }
 
+    /// Look up a contact photo by email address (case-insensitive)
+    pub fn get_contact_photo(&self, email: &str) -> Option<Vec<u8>> {
+        let email_lower = email.to_lowercase();
+        let cache = self.imp().contacts_cache.borrow();
+        cache
+            .iter()
+            .find(|(_, e, _)| e.to_lowercase() == email_lower)
+            .and_then(|(_, _, photo)| photo.clone())
+    }
+
     /// Fetch ALL contacts from EDS address books (called once at startup)
-    async fn eds_fetch_all_contacts() -> Vec<(String, String)> {
+    async fn eds_fetch_all_contacts() -> Vec<(String, String, Option<Vec<u8>>)> {
         let mut results = Vec::new();
 
         let conn = match zbus::Connection::session().await {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("[eds] session bus error: {}", e);
+                debug!("EDS: session bus error: {}", e);
                 return results;
             }
         };
 
         let (sources_bus, addressbook_bus) = match Self::eds_discover_services(&conn).await {
             Some(pair) => {
-                eprintln!("[eds] services: {} / {}", pair.0, pair.1);
+                debug!("EDS: services: {} / {}", pair.0, pair.1);
                 pair
             }
             None => {
-                eprintln!("[eds] EDS services not found");
+                debug!("EDS: services not found");
                 return results;
             }
         };
 
         let source_uids = match Self::eds_get_address_book_uids(&conn, &sources_bus).await {
             Ok(uids) => {
-                eprintln!("[eds] {} address books found", uids.len());
+                debug!("EDS: {} address books found", uids.len());
                 uids
             }
             Err(e) => {
-                eprintln!("[eds] get UIDs error: {}", e);
+                debug!("EDS: get UIDs error: {}", e);
                 return results;
             }
         };
@@ -6937,11 +8068,11 @@ impl NorthMailApplication {
         for uid in &source_uids {
             match Self::eds_query_address_book(&conn, &addressbook_bus, uid, "").await {
                 Ok(contacts) => {
-                    eprintln!("[eds] {} contacts from {}", contacts.len(), uid);
+                    debug!("EDS: {} contacts from {}", contacts.len(), uid);
                     results.extend(contacts);
                 }
                 Err(e) => {
-                    eprintln!("[eds] fetch error for {}: {}", uid, e);
+                    debug!("EDS: fetch error for {}: {}", uid, e);
                 }
             }
         }
@@ -7065,7 +8196,7 @@ impl NorthMailApplication {
         addressbook_bus: &str,
         uid: &str,
         sexp: &str,
-    ) -> Result<Vec<(String, String)>, String> {
+    ) -> Result<Vec<(String, String, Option<Vec<u8>>)>, String> {
         // Open the address book via the factory
         let factory_proxy = Self::eds_build_proxy(
             conn,
@@ -7113,25 +8244,45 @@ impl NorthMailApplication {
         Ok(contacts)
     }
 
-    /// Parse a vCard string to extract name and email pairs
-    fn parse_vcard_contacts(vcard: &str) -> Vec<(String, String)> {
+    /// Parse a vCard string to extract name, email, and optional photo
+    fn parse_vcard_contacts(vcard: &str) -> Vec<(String, String, Option<Vec<u8>>)> {
+        use base64::Engine;
         let mut name = String::new();
         let mut emails = Vec::new();
+        let mut photo_b64 = String::new();
+        let mut in_photo = false;
 
         for line in vcard.lines() {
-            let line = line.trim();
-            if line.starts_with("FN:") || line.starts_with("FN;") {
-                // Full name - handle FN;CHARSET=...: or plain FN:
-                if let Some(val) = line.splitn(2, ':').nth(1) {
+            let line_trimmed = line.trim_end();
+            // Continuation lines in vCards start with a space or tab
+            if in_photo {
+                if line.starts_with(' ') || line.starts_with('\t') {
+                    photo_b64.push_str(line_trimmed.trim());
+                    continue;
+                } else {
+                    in_photo = false;
+                }
+            }
+            let lt = line_trimmed.trim();
+            if lt.starts_with("FN:") || lt.starts_with("FN;") {
+                if let Some(val) = lt.splitn(2, ':').nth(1) {
                     name = val.trim().to_string();
                 }
-            } else if line.starts_with("EMAIL") {
-                // EMAIL;TYPE=...: or EMAIL:
-                if let Some(val) = line.splitn(2, ':').nth(1) {
+            } else if lt.starts_with("EMAIL") {
+                if let Some(val) = lt.splitn(2, ':').nth(1) {
                     let email = val.trim().to_string();
                     if !email.is_empty() {
                         emails.push(email);
                     }
+                }
+            } else if lt.starts_with("PHOTO") {
+                // PHOTO;ENCODING=b;TYPE=JPEG:<base64> or PHOTO;VALUE=uri:data:...;base64,...
+                // Use find(':') to get everything after first colon, preserving URIs with colons
+                if let Some(colon_pos) = lt.find(':') {
+                    let val = &lt[colon_pos + 1..];
+                    photo_b64.clear();
+                    photo_b64.push_str(val.trim());
+                    in_photo = true;
                 }
             }
         }
@@ -7140,9 +8291,45 @@ impl NorthMailApplication {
             name = "Unknown".to_string();
         }
 
+        let photo = if !photo_b64.is_empty() {
+            if photo_b64.starts_with("file://") {
+                // File URI — read photo from disk
+                let path = photo_b64.strip_prefix("file://").unwrap();
+                match std::fs::read(path) {
+                    Ok(bytes) if !bytes.is_empty() => {
+                        Some(bytes)
+                    }
+                    Ok(_) => None,
+                    Err(e) => {
+                        debug!("EDS: failed to read photo file for '{}': {}", name, e);
+                        None
+                    }
+                }
+            } else {
+                // Inline base64 (or data URI with base64)
+                let b64_data = if let Some(pos) = photo_b64.find("base64,") {
+                    &photo_b64[pos + 7..]
+                } else {
+                    &photo_b64
+                };
+                match base64::engine::general_purpose::STANDARD.decode(b64_data) {
+                    Ok(bytes) if !bytes.is_empty() => {
+                        Some(bytes)
+                    }
+                    Ok(_) => None,
+                    Err(e) => {
+                        debug!("EDS: base64 decode failed for '{}': {}", name, e);
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
         emails
             .into_iter()
-            .map(|email| (name.clone(), email))
+            .map(|email| (name.clone(), email, photo.clone()))
             .collect()
     }
 
@@ -7239,6 +8426,84 @@ impl NorthMailApplication {
                 return;
             }
         };
+
+        // ms_graph: sync flags via Graph API instead of IMAP
+        if Self::is_ms_graph_account(&account) {
+            let db = self.database().cloned();
+            let flag = flag.to_string();
+            let acct_id = account.id.clone();
+            let folder_path_clone = folder_path.clone();
+            glib::spawn_future_local(async move {
+                let auth_manager = match AuthManager::new().await {
+                    Ok(am) => am,
+                    Err(e) => {
+                        error!("sync_flag_to_imap (graph): Failed to create auth manager: {}", e);
+                        return;
+                    }
+                };
+                let access_token = match auth_manager.get_xoauth2_token_for_goa(&acct_id).await {
+                    Ok((_email, token)) => token,
+                    Err(e) => {
+                        error!("sync_flag_to_imap (graph): Failed to get token: {}", e);
+                        return;
+                    }
+                };
+
+                // Look up graph_message_id
+                let graph_msg_id = if let Some(ref db) = db {
+                    Self::get_graph_message_id_for_uid(db, &acct_id, &folder_path_clone, uid).await
+                } else {
+                    None
+                };
+
+                let Some(graph_id) = graph_msg_id else {
+                    error!("sync_flag_to_imap (graph): No graph_message_id for uid {}", uid);
+                    return;
+                };
+
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let flag_for_log = flag.clone();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    let result = rt.block_on(async {
+                        let client = northmail_graph::GraphMailClient::new(access_token);
+                        match flag.as_str() {
+                            "\\Seen" => client.set_read(&graph_id, add).await,
+                            "\\Flagged" => client.set_flagged(&graph_id, add).await,
+                            _ => {
+                                tracing::warn!("sync_flag_to_imap (graph): Unknown flag: {}", flag);
+                                Ok(())
+                            }
+                        }
+                    });
+                    let _ = sender.send(result);
+                });
+
+                // Poll with timeout
+                let start = std::time::Instant::now();
+                loop {
+                    match receiver.try_recv() {
+                        Ok(Ok(())) => {
+                            info!("sync_flag_to_imap (graph): Synced {} for uid {}", flag_for_log, uid);
+                            break;
+                        }
+                        Ok(Err(e)) => {
+                            error!("sync_flag_to_imap (graph): Graph API error: {}", e);
+                            break;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            if start.elapsed() > std::time::Duration::from_secs(10) {
+                                error!("sync_flag_to_imap (graph): Timeout");
+                                break;
+                            }
+                            glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+            });
+            return;
+        }
 
         let pool = self.imap_pool();
         let is_google = Self::is_google_account(&account);
@@ -7466,14 +8731,30 @@ impl NorthMailApplication {
         let account_id_clone = account_id.clone();
         let source_folder_clone = source_folder.clone();
 
-        // Use std::thread with Tokio for database operations
         let fid = effective_folder_id;
         let u = uid as i64;
+
+        // Check if this is an ms_graph account
+        let is_ms_graph = {
+            let accs = self.imp().accounts.borrow();
+            accs.iter()
+                .find(|a| a.id == account_id)
+                .map(|a| Self::is_ms_graph_account(a))
+                .unwrap_or(false)
+        };
+
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                // Delete from local database by folder_id + uid (reliable)
+                // For ms_graph: look up graph_message_id BEFORE deleting from DB
+                let graph_id = if is_ms_graph {
+                    db.get_graph_message_id(fid, u).await.ok().flatten()
+                } else {
+                    None
+                };
+
+                // Delete from local database by folder_id + uid
                 if let Err(e) = db.delete_message_by_uid(fid, u).await {
                     error!("delete_message: Failed to delete from database: {}", e);
                 }
@@ -7486,28 +8767,86 @@ impl NorthMailApplication {
                     }
                     Ok(None) => {
                         warn!("delete_message: No trash folder found for account {}, using fallback", account_id_clone);
-                        "Trash".to_string()  // Fallback
+                        "Trash".to_string()
                     }
                     Err(e) => {
                         warn!("delete_message: Failed to lookup trash folder: {}, using fallback", e);
-                        "Trash".to_string()  // Fallback
+                        "Trash".to_string()
                     }
                 };
 
-                let _ = tx.send(trash_folder);
+                let result: (String, Option<String>) = (trash_folder, graph_id);
+                let _ = tx.send(result);
             });
         });
 
-        // Wait for trash folder lookup and then move on IMAP
+        // Wait for trash folder lookup and then move via IMAP or Graph
         glib::spawn_future_local(async move {
-            // Poll for result with timeout
             let start = std::time::Instant::now();
             let timeout = std::time::Duration::from_secs(5);
             loop {
                 match rx.try_recv() {
-                    Ok(trash_folder) => {
-                        // Move on IMAP using the actual trash folder path
-                        app.move_message_imap_direct(&account_id, &source_folder_clone, uid, &trash_folder);
+                    Ok((trash_folder, graph_id)) => {
+                        if let Some(graph_id) = graph_id {
+                            // ms_graph: move via Graph API directly
+                            let acct_id = account_id.clone();
+                            glib::spawn_future_local(async move {
+                                let auth_manager = match AuthManager::new().await {
+                                    Ok(am) => am,
+                                    Err(e) => {
+                                        error!("delete_message (graph): Auth failed: {}", e);
+                                        return;
+                                    }
+                                };
+                                let token = match auth_manager.get_goa_token(&acct_id).await {
+                                    Ok(t) => t,
+                                    Err(e) => {
+                                        error!("delete_message (graph): Token failed: {}", e);
+                                        return;
+                                    }
+                                };
+                                let graph_dest = match trash_folder.as_str() {
+                                    "Deleted Items" => "DeletedItems",
+                                    "Trash" => "DeletedItems",
+                                    other => other,
+                                };
+                                let (stx, srx) = std::sync::mpsc::channel();
+                                let graph_dest_owned = graph_dest.to_string();
+                                std::thread::spawn(move || {
+                                    let rt = tokio::runtime::Runtime::new().unwrap();
+                                    let result = rt.block_on(async {
+                                        let client = northmail_graph::GraphMailClient::new(token);
+                                        client.move_message(&graph_id, &graph_dest_owned).await
+                                    });
+                                    let _ = stx.send(result);
+                                });
+                                // Wait for result
+                                let start = std::time::Instant::now();
+                                loop {
+                                    match srx.try_recv() {
+                                        Ok(Ok(new_id)) => {
+                                            info!("delete_message (graph): Moved to {}, new_id={}", trash_folder, new_id);
+                                            break;
+                                        }
+                                        Ok(Err(e)) => {
+                                            error!("delete_message (graph): Move failed: {}", e);
+                                            break;
+                                        }
+                                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                            if start.elapsed() > std::time::Duration::from_secs(10) {
+                                                error!("delete_message (graph): Timeout");
+                                                break;
+                                            }
+                                            glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                            });
+                        } else {
+                            // IMAP: use existing move path
+                            app.move_message_imap(&account_id, &source_folder_clone, uid, &trash_folder);
+                        }
                         break;
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -7601,6 +8940,86 @@ impl NorthMailApplication {
                 return;
             }
         };
+
+        // ms_graph: move via Graph API
+        if Self::is_ms_graph_account(&account) {
+            let db = self.database().cloned();
+            let dest_hint = dest_folder_hint.to_string();
+            let acct_id = account_id.clone();
+            let src_folder = source_folder.clone();
+            glib::spawn_future_local(async move {
+                let auth_manager = match AuthManager::new().await {
+                    Ok(am) => am,
+                    Err(e) => {
+                        error!("move_message_imap (graph): Failed to create auth manager: {}", e);
+                        return;
+                    }
+                };
+                let access_token = match auth_manager.get_goa_token(&acct_id).await {
+                    Ok(token) => token,
+                    Err(e) => {
+                        error!("move_message_imap (graph): Failed to get token: {}", e);
+                        return;
+                    }
+                };
+
+                // Look up graph_message_id
+                let graph_msg_id = if let Some(ref db) = db {
+                    Self::get_graph_message_id_for_uid(db, &acct_id, &src_folder, uid).await
+                } else {
+                    None
+                };
+
+                let Some(graph_id) = graph_msg_id else {
+                    error!("move_message_imap (graph): No graph_message_id for uid {}", uid);
+                    return;
+                };
+
+                // Map dest hint to Graph well-known folder IDs
+                let graph_dest = match dest_hint.as_str() {
+                    "Archive" => "Archive",
+                    "Trash" => "DeletedItems",
+                    "Spam" | "Junk Email" => "JunkEmail",
+                    "Inbox" | "INBOX" => "Inbox",
+                    _ => &dest_hint,
+                };
+
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let graph_dest_owned = graph_dest.to_string();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    let result = rt.block_on(async {
+                        let client = northmail_graph::GraphMailClient::new(access_token);
+                        client.move_message(&graph_id, &graph_dest_owned).await
+                            .map_err(|e| format!("Graph move failed: {}", e))
+                    });
+                    let _ = sender.send(result);
+                });
+
+                let start = std::time::Instant::now();
+                loop {
+                    match receiver.try_recv() {
+                        Ok(Ok(new_id)) => {
+                            info!("move_message_imap (graph): Moved uid {} to {}, new id={}", uid, graph_dest, new_id);
+                            break;
+                        }
+                        Ok(Err(e)) => {
+                            error!("move_message_imap (graph): {}", e);
+                            break;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            if start.elapsed() > std::time::Duration::from_secs(30) {
+                                error!("move_message_imap (graph): Timeout");
+                                break;
+                            }
+                            glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+            });
+            return;
+        }
 
         let pool = self.imap_pool();
         let is_google = Self::is_google_account(&account);

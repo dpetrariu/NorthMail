@@ -1,6 +1,6 @@
 //! Main application window
 
-use crate::application::{NorthMailApplication, ParsedAttachment};
+use crate::application::{NorthMailApplication, ParsedAttachment, ParsedEmailBody};
 use crate::widgets::{FolderSidebar, MessageList, MessageView};
 use gtk4::{gio, glib, prelude::*, subclass::prelude::*};
 use libadwaita as adw;
@@ -41,6 +41,7 @@ pub enum ComposeMode {
         cc: Vec<String>,       // cc emails
         subject: String,
         body: String,
+        attachments: Vec<(String, String, Vec<u8>)>, // (filename, mime_type, data)
         draft_uid: u32,        // UID of draft to delete after sending
         account_index: u32,    // Account the draft belongs to
     },
@@ -144,8 +145,62 @@ fn get_initials(name: &str, email: &str) -> String {
     }
 }
 
-/// Create an avatar widget with initials
-fn create_avatar(name: &str, email: &str) -> gtk4::Widget {
+/// Create an avatar widget with contact photo or colored initials
+fn create_avatar(name: &str, email: &str, photo: Option<&[u8]>) -> gtk4::Widget {
+    // Try to create a texture from photo bytes
+    let texture = photo.and_then(|bytes| {
+        let gbytes = glib::Bytes::from(bytes);
+        gtk4::gdk::Texture::from_bytes(&gbytes).ok()
+    });
+
+    if let Some(tex) = texture {
+        // Download texture pixels to a Cairo ImageSurface (ARGB32 premultiplied)
+        let tw = tex.width();
+        let th = tex.height();
+        let stride = gtk4::cairo::Format::ARgb32.stride_for_width(tw as u32).unwrap_or(tw * 4);
+        let mut pixel_data = vec![0u8; (stride * th) as usize];
+        tex.download(&mut pixel_data, stride as usize);
+        if let Ok(surface) = gtk4::cairo::ImageSurface::create_for_data(
+            pixel_data,
+            gtk4::cairo::Format::ARgb32,
+            tw,
+            th,
+            stride,
+        ) {
+            let drawing_area = gtk4::DrawingArea::builder()
+                .width_request(40)
+                .height_request(40)
+                .valign(gtk4::Align::Center)
+                .build();
+
+            drawing_area.set_draw_func(move |_, cr, width, height| {
+                let size = width.min(height) as f64;
+                let radius = size / 2.0;
+                let cx = width as f64 / 2.0;
+                let cy = height as f64 / 2.0;
+
+                // Clip to circle
+                cr.arc(cx, cy, radius, 0.0, 2.0 * std::f64::consts::PI);
+                let _ = cr.clip();
+
+                // Scale and paint surface
+                let surf_w = surface.width() as f64;
+                let surf_h = surface.height() as f64;
+                let scale = size / surf_w.min(surf_h);
+                let offset_x = cx - (surf_w * scale) / 2.0;
+                let offset_y = cy - (surf_h * scale) / 2.0;
+
+                cr.translate(offset_x, offset_y);
+                cr.scale(scale, scale);
+                cr.set_source_surface(&surface, 0.0, 0.0).expect("set_source_surface");
+                let _ = cr.paint();
+            });
+
+            return drawing_area.upcast();
+        }
+    }
+
+    // Fallback: colored initials
     let initials = get_initials(name, email);
     let (r, g, b) = string_to_avatar_color(email);
 
@@ -156,7 +211,6 @@ fn create_avatar(name: &str, email: &str) -> gtk4::Widget {
         .build();
 
     drawing_area.set_draw_func(move |_, cr, width, height| {
-        // Draw circle
         let radius = (width.min(height) as f64) / 2.0;
         let cx = width as f64 / 2.0;
         let cy = height as f64 / 2.0;
@@ -165,7 +219,6 @@ fn create_avatar(name: &str, email: &str) -> gtk4::Widget {
         cr.set_source_rgb(r, g, b);
         let _ = cr.fill();
 
-        // Draw text
         cr.set_source_rgb(1.0, 1.0, 1.0);
         cr.select_font_face("Sans", gtk4::cairo::FontSlant::Normal, gtk4::cairo::FontWeight::Bold);
         cr.set_font_size(16.0);
@@ -309,6 +362,8 @@ mod imp {
         pub loading_progress_label: std::cell::RefCell<Option<gtk4::Label>>,
         /// Currently displayed message UID (to avoid reloading the same message)
         pub current_message_uid: std::cell::RefCell<Option<u32>>,
+        /// Timer to auto-mark message as read after 2 seconds
+        pub auto_read_timer: std::cell::RefCell<Option<glib::SourceId>>,
         /// Star button in the currently displayed message view header
         pub current_star_button: std::cell::RefCell<Option<gtk4::ToggleButton>>,
         /// Read button in the currently displayed message view header
@@ -424,9 +479,16 @@ impl NorthMailWindow {
                  padding: 8px 12px;
                  border-bottom: 1px solid alpha(black, 0.06);
              }
-             .message-action-bar button {
+             .message-action-bar button:not(.suggested-action) {
                  background: transparent;
                  box-shadow: none;
+             }
+             .draft-open-btn {
+                 padding: 0px 8px;
+                 min-height: 0;
+                 min-width: 0;
+                 border-radius: 999px;
+                 font-size: 13px;
              }
              .message-header-content {
                  padding: 12px 16px;
@@ -1105,10 +1167,40 @@ impl NorthMailWindow {
         drop(messages); // Release borrow
 
         if let Some(msg) = msg {
+            // Cancel any pending auto-read timer
+            if let Some(source_id) = imp.auto_read_timer.borrow_mut().take() {
+                source_id.remove();
+            }
+
             // Track the currently displayed message
             *imp.current_message_uid.borrow_mut() = Some(uid);
             *imp.current_body_text.borrow_mut() = None;
             *imp.current_attachments.borrow_mut() = Vec::new();
+
+            // Auto-mark as read after 2 seconds if currently unread
+            if !msg.is_read {
+                let window = self.clone();
+                let msg_id = msg.id;
+                let folder_id = msg.folder_id;
+                let list = message_list.clone();
+                let source_id = glib::timeout_add_local_once(
+                    std::time::Duration::from_secs(2),
+                    move || {
+                        // Verify we're still showing the same message
+                        if *window.imp().current_message_uid.borrow() == Some(uid) {
+                            list.update_message_read(uid, true);
+                            window.update_message_view_read(uid, true);
+                            if let Some(app) = window.application() {
+                                if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                                    app.set_message_read(msg_id, uid, folder_id, true);
+                                }
+                            }
+                        }
+                        window.imp().auto_read_timer.borrow_mut().take();
+                    },
+                );
+                *imp.auto_read_timer.borrow_mut() = Some(source_id);
+            }
 
             // Clear current content
             while let Some(child) = imp.message_view_box.first_child() {
@@ -1318,11 +1410,12 @@ impl NorthMailWindow {
                 .css_classes(["flat"])
                 .build();
 
-            // Edit button (only visible for drafts) - blue accent color
+            // Open button (only visible for drafts) - styled as compact prominent action
             let edit_button = gtk4::Button::builder()
-                .label("Edit")
-                .css_classes(["suggested-action"])
+                .label("Open")
                 .build();
+            edit_button.add_css_class("suggested-action");
+            edit_button.add_css_class("draft-open-btn");
 
             // Check if we're viewing drafts folder
             let is_drafts = if let Some(app) = self.application() {
@@ -1341,6 +1434,7 @@ impl NorthMailWindow {
                 let window = self.clone();
                 let msg_clone = msg.clone();
                 let body_text = body_text.clone();
+                let attachments_for_edit = attachments_data.clone();
                 edit_button.connect_clicked(move |_| {
                     // Check if body is loaded yet
                     let body = match body_text.borrow().clone() {
@@ -1372,13 +1466,33 @@ impl NorthMailWindow {
                     // For now, CC is not stored in message view - would need to parse from raw headers
                     let cc: Vec<String> = Vec::new();
 
+                    // Determine account index by matching the draft's From address to accounts
+                    // Fall back to the currently selected account if from is empty (Graph API drafts)
+                    let account_index = if let Some(app) = window.application() {
+                        if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                            let accs = app.imp().accounts.borrow();
+                            let from_email = extract_email_address(&msg_clone.from);
+                            if !from_email.is_empty() {
+                                accs.iter()
+                                    .position(|a| a.email.eq_ignore_ascii_case(&from_email))
+                                    .unwrap_or(0) as u32
+                            } else if let Some(acct_email) = app.current_account_email() {
+                                accs.iter()
+                                    .position(|a| a.email.eq_ignore_ascii_case(&acct_email))
+                                    .unwrap_or(0) as u32
+                            } else { 0 }
+                        } else { 0 }
+                    } else { 0 };
+
+                    let draft_attachments = attachments_for_edit.borrow().clone();
                     let mode = ComposeMode::EditDraft {
                         to,
                         cc,
                         subject: msg_clone.subject.clone(),
                         body,
+                        attachments: draft_attachments,
                         draft_uid: msg_clone.uid,
-                        account_index: 0, // TODO: get correct account index
+                        account_index,
                     };
                     window.show_compose_dialog_with_mode(mode);
                 });
@@ -1536,11 +1650,10 @@ impl NorthMailWindow {
             // Star and read on left, actions on right
             toolbar.append(&star_button);
             toolbar.append(&read_button);
-            toolbar.append(&spacer);
-            // For drafts, show Edit first; for others, show Reply/Forward
             if is_drafts {
                 toolbar.append(&edit_button);
             }
+            toolbar.append(&spacer);
             toolbar.append(&reply_button);
             toolbar.append(&reply_all_button);
             toolbar.append(&forward_button);
@@ -1557,7 +1670,7 @@ impl NorthMailWindow {
             // Header content inside the card
             let header_content = gtk4::Box::builder()
                 .orientation(gtk4::Orientation::Vertical)
-                .spacing(8)
+                .spacing(2)
                 .css_classes(["message-header-content"])
                 .build();
 
@@ -1567,14 +1680,33 @@ impl NorthMailWindow {
                 .spacing(12)
                 .build();
 
-            // Avatar with initials
-            let from_email = if !msg.from_address.is_empty() {
-                msg.from_address.clone()
-            } else {
-                extract_email_address(&msg.from)
+            // Avatar with initials — fall back to account email for drafts with no sender
+            let (from_email, from_name) = {
+                let mut email = if !msg.from_address.is_empty() {
+                    msg.from_address.clone()
+                } else {
+                    extract_email_address(&msg.from)
+                };
+                let mut name = msg.from.clone();
+
+                // If from is empty (e.g. Graph API drafts), use the current account's email
+                if email.is_empty() && name.is_empty() {
+                    if let Some(app) = self.application() {
+                        if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                            if let Some(acct_email) = app.current_account_email() {
+                                email = acct_email.clone();
+                                name = acct_email;
+                            }
+                        }
+                    }
+                }
+
+                (email, name)
             };
-            let from_name = msg.from.clone();
-            let avatar = create_avatar(&from_name, &from_email);
+            let contact_photo = self.application()
+                .and_then(|app| app.downcast_ref::<NorthMailApplication>().cloned())
+                .and_then(|app| app.get_contact_photo(&from_email));
+            let avatar = create_avatar(&from_name, &from_email, contact_photo.as_deref());
             sender_row.append(&avatar);
 
             // Sender name and email (clickable to compose)
@@ -1750,12 +1882,37 @@ impl NorthMailWindow {
             sender_row.append(&sender_chip);
 
             // To: row (separate from clickable sender)
-            let to_display = if msg.to.is_empty() { "(sync to update)".to_string() } else { msg.to.clone() };
+            let to_display = if msg.to.is_empty() && !is_drafts {
+                "(sync to update)".to_string()
+            } else if msg.to.is_empty() {
+                String::new()
+            } else if is_drafts {
+                // For drafts, filter out the account's own email (added as placeholder for IMAP)
+                let account_email = if let Some(app) = self.application() {
+                    app.downcast_ref::<NorthMailApplication>()
+                        .and_then(|a| a.current_account_email())
+                } else {
+                    None
+                };
+                let filtered: Vec<&str> = msg.to.split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| {
+                        if let Some(ref acct) = account_email {
+                            !extract_email_address(s).eq_ignore_ascii_case(acct)
+                        } else {
+                            true
+                        }
+                    })
+                    .collect();
+                if filtered.is_empty() { String::new() } else { filtered.join(", ") }
+            } else {
+                msg.to.clone()
+            };
             let to_row = gtk4::Box::builder()
                 .orientation(gtk4::Orientation::Horizontal)
                 .spacing(4)
                 .margin_start(62) // Align with sender text (40px avatar + 12px spacing + 10px chip padding)
-                .margin_top(4)
+                .margin_top(0)
                 .build();
             let to_label = gtk4::Label::builder()
                 .label("To:")
@@ -1911,192 +2068,306 @@ impl NorthMailWindow {
 
                         match result {
                             Ok(parsed) => {
-                                // Store plain text for reply/forward
-                                // Prefer text version, fall back to stripped HTML
-                                let plain_text = if let Some(ref text) = parsed.text {
-                                    text.clone()
-                                } else if let Some(ref html) = parsed.html {
-                                    NorthMailApplication::strip_html_tags_public(html)
-                                } else {
-                                    String::new()
-                                };
-                                *body_text_for_fetch.borrow_mut() = Some(plain_text.clone());
-
-                                // Store attachments for forwarding
-                                let stored: Vec<(String, String, Vec<u8>)> = parsed.attachments.iter()
-                                    .map(|a| (a.filename.clone(), a.mime_type.clone(), a.data.clone()))
-                                    .collect();
-                                *attachments_data_for_fetch.borrow_mut() = stored.clone();
-
-                                // Also store in window imp for context menu reply/forward
-                                *window_for_fetch.imp().current_body_text.borrow_mut() = Some(plain_text);
-                                *window_for_fetch.imp().current_attachments.borrow_mut() = stored;
-
-                                // Prefer HTML if available, otherwise use plain text
-                                if let Some(html) = parsed.html {
-                                    #[cfg(feature = "webkit")]
-                                    {
-                                        // Use WebKitWebView for HTML rendering
-                                        use webkit6::prelude::WebViewExt;
-
-                                        let web_view = webkit6::WebView::new();
-                                        web_view.set_vexpand(true);
-                                        web_view.set_hexpand(true);
-
-                                        // Security settings for email display
-                                        if let Some(settings) = WebViewExt::settings(&web_view) {
-                                            settings.set_enable_javascript(false);
-                                            settings.set_auto_load_images(true);
-                                            settings.set_allow_modal_dialogs(false);
-                                            settings.set_enable_html5_database(false);
-                                            settings.set_enable_html5_local_storage(false);
-                                        }
-
-                                        // Handle WebKit process crash - show plain text fallback
-                                        let body_box_crash = body_box_ref.clone();
-                                        let html_fallback = html.clone();
-                                        web_view.connect_web_process_terminated(move |_wv, _reason| {
-                                            tracing::warn!("WebKit process crashed, falling back to plain text");
-                                            while let Some(child) = body_box_crash.first_child() {
-                                                body_box_crash.remove(&child);
-                                            }
-                                            let text = NorthMailApplication::strip_html_tags_public(&html_fallback);
-                                            let text_view = gtk4::TextView::builder()
-                                                .editable(false)
-                                                .cursor_visible(false)
-                                                .wrap_mode(gtk4::WrapMode::Word)
-                                                .vexpand(true)
-                                                .build();
-                                            text_view.buffer().set_text(&text);
-                                            body_box_crash.append(&text_view);
-                                        });
-
-                                        // Load the HTML content
-                                        web_view.load_html(&html, None);
-
-                                        body_box_ref.append(&web_view);
-                                    }
-
-                                    #[cfg(not(feature = "webkit"))]
-                                    {
-                                        // Fallback: strip HTML tags and show as plain text
-                                        let text = NorthMailApplication::strip_html_tags_public(&html);
-                                        let text_view = gtk4::TextView::builder()
-                                            .editable(false)
-                                            .cursor_visible(false)
-                                            .wrap_mode(gtk4::WrapMode::Word)
-                                            .vexpand(true)
-                                            .build();
-
-                                        text_view.buffer().set_text(&text);
-                                        body_box_ref.append(&text_view);
-                                    }
-                                } else if let Some(text) = parsed.text {
-                                    // Show plain text
-                                    let text_view = gtk4::TextView::builder()
-                                        .editable(false)
-                                        .cursor_visible(false)
-                                        .wrap_mode(gtk4::WrapMode::Word)
-                                        .vexpand(true)
-                                        .build();
-
-                                    text_view.buffer().set_text(&text);
-                                    body_box_ref.append(&text_view);
-                                } else {
-                                    let label = gtk4::Label::builder()
-                                        .label("No content available")
-                                        .css_classes(["dim-label"])
-                                        .build();
-                                    body_box_ref.append(&label);
-                                }
-
-                                // Show attachment dropdown in header if any
-                                if !parsed.attachments.is_empty() {
-                                    let count = parsed.attachments.len();
-
-                                    // Build button content: attachment icon + count
-                                    let btn_content = gtk4::Box::builder()
-                                        .orientation(gtk4::Orientation::Horizontal)
-                                        .spacing(4)
-                                        .build();
-                                    btn_content.append(&gtk4::Image::from_icon_name("mail-attachment-symbolic"));
-                                    btn_content.append(&gtk4::Label::builder()
-                                        .label(&format!("{}", count))
-                                        .css_classes(["caption"])
-                                        .build());
-
-                                    let menu_btn = gtk4::MenuButton::builder()
-                                        .child(&btn_content)
-                                        .tooltip_text(&format!("{} attachment{}", count, if count == 1 { "" } else { "s" }))
-                                        .css_classes(["flat"])
-                                        .direction(gtk4::ArrowType::Down)
-                                        .build();
-
-                                    let popover = gtk4::Popover::builder()
-                                        .halign(gtk4::Align::End)
-                                        .build();
-                                    popover.set_position(gtk4::PositionType::Bottom);
-                                    let popover_box = gtk4::Box::builder()
-                                        .orientation(gtk4::Orientation::Vertical)
-                                        .spacing(0)
-                                        .build();
-
-                                    let list_box = gtk4::ListBox::builder()
-                                        .selection_mode(gtk4::SelectionMode::None)
-                                        .css_classes(["boxed-list"])
-                                        .build();
-
-                                    for attachment in parsed.attachments {
-                                        let row = build_attachment_row(attachment);
-                                        list_box.append(&row);
-                                    }
-
-                                    if count > 5 {
-                                        let scrolled = gtk4::ScrolledWindow::builder()
-                                            .max_content_height(300)
-                                            .propagate_natural_height(true)
-                                            .build();
-                                        scrolled.set_child(Some(&list_box));
-                                        popover_box.append(&scrolled);
-                                    } else {
-                                        popover_box.append(&list_box);
-                                    }
-
-                                    popover.set_child(Some(&popover_box));
-                                    menu_btn.set_popover(Some(&popover));
-                                    attachment_box_ref.append(&menu_btn);
-                                }
+                                Self::display_parsed_body(&body_box_ref, &attachment_box_ref, &body_text_for_fetch, &attachments_data_for_fetch, &window_for_fetch, parsed, uid, msg_folder_id);
                             }
                             Err(e) => {
-                                debug!("Failed to fetch body: {}", e);
-                                let error_box = gtk4::Box::builder()
+                                debug!("Failed to fetch body: {}, auto-retrying...", e);
+                                // Show spinner while retrying
+                                let retry_spinner = gtk4::Spinner::builder()
+                                    .spinning(true)
+                                    .width_request(32)
+                                    .height_request(32)
+                                    .build();
+                                let retry_label = gtk4::Label::builder()
+                                    .label("Retrying...")
+                                    .css_classes(["dim-label"])
+                                    .build();
+                                let retry_box = gtk4::Box::builder()
                                     .orientation(gtk4::Orientation::Vertical)
                                     .valign(gtk4::Align::Center)
                                     .halign(gtk4::Align::Center)
                                     .vexpand(true)
-                                    .spacing(8)
+                                    .spacing(12)
                                     .build();
+                                retry_box.append(&retry_spinner);
+                                retry_box.append(&retry_label);
+                                body_box_ref.append(&retry_box);
 
-                                let icon = gtk4::Image::builder()
-                                    .icon_name("dialog-error-symbolic")
-                                    .pixel_size(48)
-                                    .css_classes(["dim-label"])
-                                    .build();
-
-                                let label = gtk4::Label::builder()
-                                    .label("Failed to load message body")
-                                    .css_classes(["dim-label"])
-                                    .build();
-
-                                error_box.append(&icon);
-                                error_box.append(&label);
-                                body_box_ref.append(&error_box);
+                                // Auto-retry after 1 second
+                                let body_box_retry = body_box_ref.clone();
+                                let attachment_box_retry = attachment_box_ref.clone();
+                                let body_text_retry = body_text_for_fetch.clone();
+                                let attachments_data_retry = attachments_data_for_fetch.clone();
+                                let window_retry = window_for_fetch.clone();
+                                let uid_retry = uid;
+                                let folder_id_retry = msg_folder_id;
+                                glib::timeout_add_local_once(std::time::Duration::from_secs(1), move || {
+                                    if let Some(app) = window_retry.application() {
+                                        if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                                            app.fetch_message_body(uid_retry, folder_id_retry, move |result| {
+                                                while let Some(child) = body_box_retry.first_child() {
+                                                    body_box_retry.remove(&child);
+                                                }
+                                                match result {
+                                                    Ok(parsed) => {
+                                                        Self::display_parsed_body(&body_box_retry, &attachment_box_retry, &body_text_retry, &attachments_data_retry, &window_retry, parsed, uid_retry, folder_id_retry);
+                                                    }
+                                                    Err(e2) => {
+                                                        debug!("Retry also failed: {}", e2);
+                                                        Self::show_body_error(&body_box_retry, &window_retry, uid_retry, folder_id_retry, &body_text_retry, &attachments_data_retry, &attachment_box_retry);
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
+                                });
                             }
                         }
                     });
                 }
             }
         }
+    }
+
+    /// Display parsed email body content in the body box
+    fn display_parsed_body(
+        body_box: &gtk4::Box,
+        attachment_box: &gtk4::Box,
+        body_text_store: &Rc<std::cell::RefCell<Option<String>>>,
+        attachments_store: &Rc<std::cell::RefCell<Vec<(String, String, Vec<u8>)>>>,
+        window: &Self,
+        parsed: ParsedEmailBody,
+        _uid: u32,
+        _msg_folder_id: Option<i64>,
+    ) {
+        // Store plain text for reply/forward
+        let plain_text = if let Some(ref text) = parsed.text {
+            text.clone()
+        } else if let Some(ref html) = parsed.html {
+            NorthMailApplication::strip_html_tags_public(html)
+        } else {
+            String::new()
+        };
+        *body_text_store.borrow_mut() = Some(plain_text.clone());
+
+        let stored: Vec<(String, String, Vec<u8>)> = parsed.attachments.iter()
+            .map(|a| (a.filename.clone(), a.mime_type.clone(), a.data.clone()))
+            .collect();
+        *attachments_store.borrow_mut() = stored.clone();
+        *window.imp().current_body_text.borrow_mut() = Some(plain_text);
+        *window.imp().current_attachments.borrow_mut() = stored;
+
+        if let Some(html) = parsed.html {
+            #[cfg(feature = "webkit")]
+            {
+                use webkit6::prelude::WebViewExt;
+                let web_view = webkit6::WebView::new();
+                web_view.set_vexpand(true);
+                web_view.set_hexpand(true);
+                if let Some(settings) = WebViewExt::settings(&web_view) {
+                    settings.set_enable_javascript(false);
+                    settings.set_auto_load_images(true);
+                    settings.set_allow_modal_dialogs(false);
+                    settings.set_enable_html5_database(false);
+                    settings.set_enable_html5_local_storage(false);
+                }
+                let body_box_crash = body_box.clone();
+                let html_fallback = html.clone();
+                web_view.connect_web_process_terminated(move |_wv, _reason| {
+                    tracing::warn!("WebKit process crashed, falling back to plain text");
+                    while let Some(child) = body_box_crash.first_child() {
+                        body_box_crash.remove(&child);
+                    }
+                    let text = NorthMailApplication::strip_html_tags_public(&html_fallback);
+                    let text_view = gtk4::TextView::builder()
+                        .editable(false)
+                        .cursor_visible(false)
+                        .wrap_mode(gtk4::WrapMode::Word)
+                        .vexpand(true)
+                        .build();
+                    text_view.buffer().set_text(&text);
+                    body_box_crash.append(&text_view);
+                });
+                web_view.load_html(&html, None);
+                body_box.append(&web_view);
+            }
+            #[cfg(not(feature = "webkit"))]
+            {
+                let text = NorthMailApplication::strip_html_tags_public(&html);
+                let text_view = gtk4::TextView::builder()
+                    .editable(false)
+                    .cursor_visible(false)
+                    .wrap_mode(gtk4::WrapMode::Word)
+                    .vexpand(true)
+                    .build();
+                text_view.buffer().set_text(&text);
+                body_box.append(&text_view);
+            }
+        } else if let Some(text) = parsed.text {
+            let text_view = gtk4::TextView::builder()
+                .editable(false)
+                .cursor_visible(false)
+                .wrap_mode(gtk4::WrapMode::Word)
+                .vexpand(true)
+                .build();
+            text_view.buffer().set_text(&text);
+            body_box.append(&text_view);
+        } else {
+            let label = gtk4::Label::builder()
+                .label("No content available")
+                .css_classes(["dim-label"])
+                .build();
+            body_box.append(&label);
+        }
+
+        // Show attachment dropdown if any
+        if !parsed.attachments.is_empty() {
+            let count = parsed.attachments.len();
+            let btn_content = gtk4::Box::builder()
+                .orientation(gtk4::Orientation::Horizontal)
+                .spacing(4)
+                .build();
+            btn_content.append(&gtk4::Image::from_icon_name("mail-attachment-symbolic"));
+            btn_content.append(&gtk4::Label::builder()
+                .label(&format!("{}", count))
+                .css_classes(["caption"])
+                .build());
+
+            let menu_btn = gtk4::MenuButton::builder()
+                .child(&btn_content)
+                .tooltip_text(&format!("{} attachment{}", count, if count == 1 { "" } else { "s" }))
+                .css_classes(["flat"])
+                .direction(gtk4::ArrowType::Down)
+                .build();
+
+            let popover = gtk4::Popover::builder()
+                .halign(gtk4::Align::End)
+                .build();
+            popover.set_position(gtk4::PositionType::Bottom);
+            let popover_box = gtk4::Box::builder()
+                .orientation(gtk4::Orientation::Vertical)
+                .spacing(0)
+                .build();
+            let list_box = gtk4::ListBox::builder()
+                .selection_mode(gtk4::SelectionMode::None)
+                .css_classes(["boxed-list"])
+                .width_request(360)
+                .build();
+            for attachment in parsed.attachments {
+                let row = build_attachment_row(attachment);
+                list_box.append(&row);
+            }
+            if count > 5 {
+                let scrolled = gtk4::ScrolledWindow::builder()
+                    .max_content_height(300)
+                    .propagate_natural_height(true)
+                    .propagate_natural_width(true)
+                    .width_request(360)
+                    .build();
+                scrolled.set_child(Some(&list_box));
+                popover_box.append(&scrolled);
+            } else {
+                popover_box.append(&list_box);
+            }
+            popover.set_child(Some(&popover_box));
+            menu_btn.set_popover(Some(&popover));
+            attachment_box.append(&menu_btn);
+        }
+    }
+
+    /// Show error state with a Retry button for body fetch failures
+    fn show_body_error(
+        body_box: &gtk4::Box,
+        window: &Self,
+        uid: u32,
+        msg_folder_id: Option<i64>,
+        body_text_store: &Rc<std::cell::RefCell<Option<String>>>,
+        attachments_store: &Rc<std::cell::RefCell<Vec<(String, String, Vec<u8>)>>>,
+        attachment_box: &gtk4::Box,
+    ) {
+        let error_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .valign(gtk4::Align::Center)
+            .halign(gtk4::Align::Center)
+            .vexpand(true)
+            .spacing(8)
+            .build();
+
+        let icon = gtk4::Image::builder()
+            .icon_name("dialog-error-symbolic")
+            .pixel_size(48)
+            .css_classes(["dim-label"])
+            .build();
+
+        let label = gtk4::Label::builder()
+            .label("Failed to load message body")
+            .css_classes(["dim-label"])
+            .build();
+
+        let retry_btn = gtk4::Button::builder()
+            .label("Retry")
+            .css_classes(["suggested-action", "pill"])
+            .halign(gtk4::Align::Center)
+            .build();
+
+        let body_box_for_retry = body_box.clone();
+        let attachment_box_for_retry = attachment_box.clone();
+        let body_text_for_retry = body_text_store.clone();
+        let attachments_for_retry = attachments_store.clone();
+        let window_for_retry = window.clone();
+        retry_btn.connect_clicked(move |_| {
+            // Clear error and show loading
+            while let Some(child) = body_box_for_retry.first_child() {
+                body_box_for_retry.remove(&child);
+            }
+            let spinner = gtk4::Spinner::builder()
+                .spinning(true)
+                .width_request(32)
+                .height_request(32)
+                .build();
+            let loading_label = gtk4::Label::builder()
+                .label("Loading message...")
+                .css_classes(["dim-label"])
+                .build();
+            let loading_box = gtk4::Box::builder()
+                .orientation(gtk4::Orientation::Vertical)
+                .valign(gtk4::Align::Center)
+                .halign(gtk4::Align::Center)
+                .vexpand(true)
+                .spacing(12)
+                .build();
+            loading_box.append(&spinner);
+            loading_box.append(&loading_label);
+            body_box_for_retry.append(&loading_box);
+
+            let bb = body_box_for_retry.clone();
+            let ab = attachment_box_for_retry.clone();
+            let bt = body_text_for_retry.clone();
+            let at = attachments_for_retry.clone();
+            let w = window_for_retry.clone();
+            if let Some(app) = window_for_retry.application() {
+                if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                    app.fetch_message_body(uid, msg_folder_id, move |result| {
+                        while let Some(child) = bb.first_child() {
+                            bb.remove(&child);
+                        }
+                        match result {
+                            Ok(parsed) => {
+                                Self::display_parsed_body(&bb, &ab, &bt, &at, &w, parsed, uid, msg_folder_id);
+                            }
+                            Err(_) => {
+                                Self::show_body_error(&bb, &w, uid, msg_folder_id, &bt, &at, &ab);
+                            }
+                        }
+                    });
+                }
+            }
+        });
+
+        error_box.append(&icon);
+        error_box.append(&label);
+        error_box.append(&retry_btn);
+        body_box.append(&error_box);
     }
 
     fn setup_actions(&self) {
@@ -2249,16 +2520,19 @@ impl NorthMailWindow {
             .build();
 
         // --- From dropdown in header ---
-        // Track which accounts can send (Microsoft consumer OAuth2 accounts cannot)
+        // Track which accounts can send:
+        // - ms_graph: Graph API (has mail.send scope)
+        // - google: SMTP XOAUTH2
+        // - imap_smtp / password: SMTP password
+        // - windows_live: CANNOT send (legacy wl.* scopes, no SMTP or Graph support)
         let mut sendable_accounts: Vec<bool> = Vec::new();
         let from_model = gtk4::StringList::new(&[]);
         if let Some(app) = self.application() {
             if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
                 let accs = app.imp().accounts.borrow();
                 for acc in accs.iter() {
-                    let is_microsoft_oauth2 = (acc.provider_type == "windows_live" || acc.provider_type == "microsoft")
-                        && acc.auth_type == northmail_auth::GoaAuthType::OAuth2;
-                    sendable_accounts.push(!is_microsoft_oauth2);
+                    let can_send = acc.provider_type != "windows_live";
+                    sendable_accounts.push(can_send);
                     from_model.append(&acc.email);
                 }
             }
@@ -2995,7 +3269,7 @@ impl NorthMailWindow {
                     ));
                 }
             }
-            ComposeMode::EditDraft { to, cc, subject, body, .. } => {
+            ComposeMode::EditDraft { to, cc, subject, body, attachments: draft_atts, account_index, .. } => {
                 for email in to {
                     to_add_chip(email, email);
                 }
@@ -3004,6 +3278,16 @@ impl NorthMailWindow {
                 }
                 subject_entry.set_text(subject);
                 text_view.buffer().set_text(body);
+                from_dropdown.set_selected(*account_index);
+                // Restore attachments
+                for (filename, mime_type, data) in draft_atts {
+                    attachments.borrow_mut().push((
+                        filename.clone(),
+                        mime_type.clone(),
+                        data.clone(),
+                        None,
+                    ));
+                }
             }
         }
 
@@ -3259,6 +3543,7 @@ impl NorthMailWindow {
             let from_dropdown_save = from_dropdown.clone();
             let main_window = self.clone();
             let toast_overlay_save = toast_overlay.clone();
+            let attachments_save = attachments.clone();
 
             move || {
                 eprintln!("[draft] Reset timer called - scheduling 5s auto-save");
@@ -3282,6 +3567,7 @@ impl NorthMailWindow {
                 let from_dropdown_timer = from_dropdown_save.clone();
                 let main_window_timer = main_window.clone();
                 let toast_overlay_timer = toast_overlay_save.clone();
+                let attachments_timer = attachments_save.clone();
 
                 glib::timeout_add_seconds_local_once(5, move || {
                     // Check if this timer is still valid (not superseded)
@@ -3345,6 +3631,11 @@ impl NorthMailWindow {
                     }
                     msg = msg.text(&body);
 
+                    // Include attachments
+                    for (filename, mime_type, data, _path) in attachments_timer.borrow().iter() {
+                        msg = msg.attachment(filename, mime_type, data.clone());
+                    }
+
                     save_in_progress_timer.set(true);
 
                     // Delete old draft first (if any), then save new one
@@ -3353,38 +3644,74 @@ impl NorthMailWindow {
                     let save_in_progress_cb = save_in_progress_timer.clone();
 
                     if let Some((old_acct, old_uid)) = old_state {
-                        let app_delete = app.clone();
                         let app_save = app.clone();
                         let app_refresh = app.clone();
                         let toast_cb = toast_overlay_timer.clone();
-                        eprintln!("[draft] Deleting old draft uid={} then saving new", old_uid);
-                        app_delete.delete_draft(old_acct, old_uid, move |_| {
-                            // Ignore delete errors — old draft may already be gone
-                            let toast_inner = toast_cb.clone();
-                            let app_refresh_inner = app_refresh.clone();
-                            eprintln!("[draft] Calling save_draft (after delete) for account {}", account_index);
-                            app_save.save_draft(account_index, msg, move |result| {
+
+                        // For ms_graph accounts, use PATCH to update existing draft
+                        // (preserves server-side attachments instead of delete+recreate)
+                        let is_ms_graph = {
+                            let accs = app.imp().accounts.borrow();
+                            accs.get(old_acct as usize)
+                                .map(|a| a.provider_type == "ms_graph")
+                                .unwrap_or(false)
+                        };
+
+                        if is_ms_graph {
+                            eprintln!("[draft] Updating existing ms_graph draft uid={}", old_uid);
+                            app_save.save_draft_update(account_index, msg, old_uid, move |result| {
                                 save_in_progress_cb.set(false);
                                 match result {
                                     Ok(Some(uid)) => {
-                                        eprintln!("[draft] Saved! uid={}", uid);
+                                        eprintln!("[draft] Updated! uid={}", uid);
                                         *draft_state_cb.borrow_mut() = Some((account_index, uid));
-                                        toast_inner.add_toast(adw::Toast::new("Draft saved"));
-                                        app_refresh_inner.refresh_if_viewing_drafts();
+                                        toast_cb.add_toast(adw::Toast::new("Draft saved"));
+                                        app_refresh.refresh_if_viewing_drafts();
                                     }
                                     Ok(None) => {
-                                        eprintln!("[draft] Saved (no uid returned)");
+                                        eprintln!("[draft] Updated (no uid returned)");
                                         *draft_state_cb.borrow_mut() = None;
-                                        toast_inner.add_toast(adw::Toast::new("Draft saved"));
-                                        app_refresh_inner.refresh_if_viewing_drafts();
+                                        toast_cb.add_toast(adw::Toast::new("Draft saved"));
+                                        app_refresh.refresh_if_viewing_drafts();
                                     }
                                     Err(e) => {
-                                        eprintln!("[draft] Save FAILED: {}", e);
-                                        toast_inner.add_toast(adw::Toast::new("Failed to save draft"));
+                                        eprintln!("[draft] Update FAILED: {}", e);
+                                        toast_cb.add_toast(adw::Toast::new("Failed to save draft"));
                                     }
                                 }
                             });
-                        });
+                        } else {
+                            // For IMAP accounts: delete old draft, then save new one
+                            let app_delete = app.clone();
+                            let app_refresh_inner = app_refresh.clone();
+                            let toast_inner = toast_cb.clone();
+                            eprintln!("[draft] Deleting old draft uid={} then saving new", old_uid);
+                            app_delete.delete_draft(old_acct, old_uid, move |_| {
+                                // Ignore delete errors — old draft may already be gone
+                                eprintln!("[draft] Calling save_draft (after delete) for account {}", account_index);
+                                app_save.save_draft(account_index, msg, move |result| {
+                                    save_in_progress_cb.set(false);
+                                    match result {
+                                        Ok(Some(uid)) => {
+                                            eprintln!("[draft] Saved! uid={}", uid);
+                                            *draft_state_cb.borrow_mut() = Some((account_index, uid));
+                                            toast_inner.add_toast(adw::Toast::new("Draft saved"));
+                                            app_refresh_inner.refresh_if_viewing_drafts();
+                                        }
+                                        Ok(None) => {
+                                            eprintln!("[draft] Saved (no uid returned)");
+                                            *draft_state_cb.borrow_mut() = None;
+                                            toast_inner.add_toast(adw::Toast::new("Draft saved"));
+                                            app_refresh_inner.refresh_if_viewing_drafts();
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[draft] Save FAILED: {}", e);
+                                            toast_inner.add_toast(adw::Toast::new("Failed to save draft"));
+                                        }
+                                    }
+                                });
+                            });
+                        }
                     } else {
                         let app_save = app.clone();
                         let app_refresh = app.clone();
@@ -3466,7 +3793,7 @@ impl NorthMailWindow {
             warning_button.connect_clicked(move |_| {
                 let dialog = adw::AlertDialog::builder()
                     .heading("Cannot Send from This Account")
-                    .body("Microsoft/Hotmail consumer accounts don't support OAuth2 for sending emails. This is a Microsoft limitation.\n\nTo send from this account, you can:\n1. Go to GNOME Settings → Online Accounts\n2. Remove this account\n3. Re-add it as \"IMAP and SMTP\" with your email and an App Password\n\nYou can generate an App Password in your Microsoft account security settings (requires 2-factor authentication).")
+                    .body("This Microsoft account uses a legacy authentication method (Windows Live) that doesn't support sending emails.\n\nTo fix this, remove the account in GNOME Settings → Online Accounts, then re-add it as \"Microsoft 365\".")
                     .build();
                 dialog.add_response("ok", "OK");
                 dialog.set_default_response(Some("ok"));
@@ -4042,13 +4369,19 @@ impl NorthMailWindow {
 
     fn refresh_messages(&self) {
         debug!("Refreshing messages");
-        // TODO: Trigger sync via SyncCommand
-        self.add_toast(adw::Toast::new("Refreshing..."));
+        if let Some(app) = self.application() {
+            if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                app.sync_all_accounts();
+            }
+        }
     }
 
     fn toggle_search(&self) {
         debug!("Toggling search");
-        // TODO: Show/hide search bar
+        let imp = self.imp();
+        if let Some(message_list) = imp.message_list.get() {
+            message_list.focus_search();
+        }
     }
 
     /// Handle FTS search-requested signal from message list
@@ -4347,7 +4680,8 @@ fn build_attachment_row(attachment: ParsedAttachment) -> adw::ActionRow {
     let data = Rc::new(attachment.data);
     let filename = attachment.filename;
     let mime_type = attachment.mime_type;
-    let size = data.len();
+    // Use stored size if data is empty (loaded from cache), otherwise use actual data length
+    let size = if data.is_empty() { attachment.size } else { data.len() };
 
     let row = adw::ActionRow::builder()
         .title(&filename)
