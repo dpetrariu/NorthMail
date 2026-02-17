@@ -169,6 +169,59 @@ impl FolderSidebar {
         )
     }
 
+    /// Parse drop data (single or multi) and emit message-dropped for each message.
+    /// Returns true if at least one message was processed.
+    fn handle_drop_data(&self, data: &str, target_account_id: &str, target_folder_path: &str) -> bool {
+        if data.starts_with("multi|") {
+            // Multi-message drop: "multi|uid:msg_id:acct:folder|uid:msg_id:acct:folder|..."
+            let mut handled = false;
+            for entry in data.split('|').skip(1) {
+                let parts: Vec<&str> = entry.split(':').collect();
+                if parts.len() >= 4 {
+                    if let (Ok(uid), Ok(msg_id)) = (
+                        parts[0].parse::<u32>(),
+                        parts[1].parse::<i64>(),
+                    ) {
+                        let source_account_id = parts[2].to_string();
+                        let source_folder_path = parts[3..].join(":");
+                        tracing::debug!(
+                            "Multi-drop message: uid={} from {}/{} to {}/{}",
+                            uid, source_account_id, source_folder_path, target_account_id, target_folder_path
+                        );
+                        self.emit_by_name::<()>(
+                            "message-dropped",
+                            &[&uid, &msg_id, &source_account_id, &source_folder_path, &target_account_id.to_string(), &target_folder_path.to_string()],
+                        );
+                        handled = true;
+                    }
+                }
+            }
+            handled
+        } else {
+            // Single message: "uid:msg_id:source_account_id:source_folder_path"
+            let parts: Vec<&str> = data.split(':').collect();
+            if parts.len() >= 4 {
+                if let (Ok(uid), Ok(msg_id)) = (
+                    parts[0].parse::<u32>(),
+                    parts[1].parse::<i64>(),
+                ) {
+                    let source_account_id = parts[2].to_string();
+                    let source_folder_path = parts[3..].join(":");
+                    tracing::debug!(
+                        "Message dropped: uid={} from {}/{} to {}/{}",
+                        uid, source_account_id, source_folder_path, target_account_id, target_folder_path
+                    );
+                    self.emit_by_name::<()>(
+                        "message-dropped",
+                        &[&uid, &msg_id, &source_account_id, &source_folder_path, &target_account_id.to_string(), &target_folder_path.to_string()],
+                    );
+                    return true;
+                }
+            }
+            false
+        }
+    }
+
     // ── UI setup ─────────────────────────────────────────────────────
 
     fn setup_ui(&self) {
@@ -682,27 +735,7 @@ impl FolderSidebar {
 
             drop_target.connect_drop(move |_target, value, _x, _y| {
                 if let Ok(data) = value.get::<String>() {
-                    // Parse "uid:msg_id:source_account_id:source_folder_path"
-                    let parts: Vec<&str> = data.split(':').collect();
-                    if parts.len() >= 4 {
-                        if let (Ok(uid), Ok(msg_id)) = (
-                            parts[0].parse::<u32>(),
-                            parts[1].parse::<i64>(),
-                        ) {
-                            let source_account_id = parts[2].to_string();
-                            // folder_path may contain colons, so join remaining parts
-                            let source_folder_path = parts[3..].join(":");
-                            tracing::debug!(
-                                "Message dropped on inbox: uid={} from {}/{} to {}/INBOX",
-                                uid, source_account_id, source_folder_path, target_account_id
-                            );
-                            sidebar.emit_by_name::<()>(
-                                "message-dropped",
-                                &[&uid, &msg_id, &source_account_id, &source_folder_path, &target_account_id, &"INBOX".to_string()],
-                            );
-                            return true;
-                        }
-                    }
+                    return sidebar.handle_drop_data(&data, &target_account_id, "INBOX");
                 }
                 false
             });
@@ -792,27 +825,7 @@ impl FolderSidebar {
 
         drop_target.connect_drop(move |_target, value, _x, _y| {
             if let Ok(data) = value.get::<String>() {
-                // Parse "uid:msg_id:source_account_id:source_folder_path"
-                let parts: Vec<&str> = data.split(':').collect();
-                if parts.len() >= 4 {
-                    if let (Ok(uid), Ok(msg_id)) = (
-                        parts[0].parse::<u32>(),
-                        parts[1].parse::<i64>(),
-                    ) {
-                        let source_account_id = parts[2].to_string();
-                        // folder_path may contain colons, so join remaining parts
-                        let source_folder_path = parts[3..].join(":");
-                        tracing::debug!(
-                            "Message dropped: uid={} from {}/{} to {}/{}",
-                            uid, source_account_id, source_folder_path, target_account_id, target_folder_path
-                        );
-                        sidebar.emit_by_name::<()>(
-                            "message-dropped",
-                            &[&uid, &msg_id, &source_account_id, &source_folder_path, &target_account_id, &target_folder_path],
-                        );
-                        return true;
-                    }
-                }
+                return sidebar.handle_drop_data(&data, &target_account_id, &target_folder_path);
             }
             false
         });

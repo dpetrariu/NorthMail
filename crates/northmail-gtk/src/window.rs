@@ -79,6 +79,25 @@ fn format_forward_body(from: &str, to: &[String], date: &str, subject: &str, bod
     fwd
 }
 
+/// Parse bulk action data "uid:msg_id:folder_id|uid:msg_id:folder_id|..." into Vec<(u32, i64, i64)>
+fn parse_bulk_data(data: &str) -> Vec<(u32, i64, i64)> {
+    data.split('|')
+        .filter_map(|entry| {
+            let parts: Vec<&str> = entry.split(':').collect();
+            if parts.len() >= 3 {
+                if let (Ok(uid), Ok(msg_id), Ok(folder_id)) = (
+                    parts[0].parse::<u32>(),
+                    parts[1].parse::<i64>(),
+                    parts[2].parse::<i64>(),
+                ) {
+                    return Some((uid, msg_id, folder_id));
+                }
+            }
+            None
+        })
+        .collect()
+}
+
 /// Generate a color from a string (for avatar background)
 fn string_to_avatar_color(s: &str) -> (f64, f64, f64) {
     let colors: [(f64, f64, f64); 12] = [
@@ -942,6 +961,116 @@ impl NorthMailWindow {
                     };
                     window.show_compose_dialog_with_mode(mode);
                 }
+            }),
+        );
+
+        // Connect bulk-archive signal
+        let window = self.clone();
+        message_list.connect_closure(
+            "bulk-archive",
+            false,
+            glib::closure_local!(move |list: &MessageList, data: String| {
+                let items = parse_bulk_data(&data);
+                let count = items.len();
+                debug!("Bulk archive: {} messages", count);
+                let uids: Vec<u32> = items.iter().map(|(uid, _, _)| *uid).collect();
+                list.remove_messages(&uids);
+                if let Some(app) = window.application() {
+                    if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                        for (uid, msg_id, folder_id) in &items {
+                            app.archive_message(*msg_id, *uid, *folder_id);
+                        }
+                    }
+                }
+                window.add_toast(adw::Toast::new(&format!("Archived {} messages", count)));
+            }),
+        );
+
+        // Connect bulk-trash signal
+        let window = self.clone();
+        message_list.connect_closure(
+            "bulk-trash",
+            false,
+            glib::closure_local!(move |list: &MessageList, data: String| {
+                let items = parse_bulk_data(&data);
+                let count = items.len();
+                debug!("Bulk trash: {} messages", count);
+                let uids: Vec<u32> = items.iter().map(|(uid, _, _)| *uid).collect();
+                list.remove_messages(&uids);
+                if let Some(app) = window.application() {
+                    if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                        for (uid, msg_id, folder_id) in &items {
+                            app.delete_message(*msg_id, *uid, *folder_id);
+                        }
+                    }
+                }
+                window.add_toast(adw::Toast::new(&format!("Moved {} messages to Trash", count)));
+            }),
+        );
+
+        // Connect bulk-spam signal
+        let window = self.clone();
+        message_list.connect_closure(
+            "bulk-spam",
+            false,
+            glib::closure_local!(move |list: &MessageList, data: String| {
+                let items = parse_bulk_data(&data);
+                let count = items.len();
+                debug!("Bulk spam: {} messages", count);
+                let uids: Vec<u32> = items.iter().map(|(uid, _, _)| *uid).collect();
+                list.remove_messages(&uids);
+                if let Some(app) = window.application() {
+                    if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                        for (uid, msg_id, folder_id) in &items {
+                            app.move_to_spam(*msg_id, *uid, *folder_id);
+                        }
+                    }
+                }
+                window.add_toast(adw::Toast::new(&format!("Marked {} messages as Spam", count)));
+            }),
+        );
+
+        // Connect bulk-mark-read signal
+        let window = self.clone();
+        message_list.connect_closure(
+            "bulk-mark-read",
+            false,
+            glib::closure_local!(move |list: &MessageList, data: String, is_read: bool| {
+                let items = parse_bulk_data(&data);
+                let count = items.len();
+                debug!("Bulk mark read: {} messages, is_read={}", count, is_read);
+                for (uid, msg_id, folder_id) in &items {
+                    list.update_message_read(*uid, is_read);
+                    if let Some(app) = window.application() {
+                        if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                            app.set_message_read(*msg_id, *uid, *folder_id, is_read);
+                        }
+                    }
+                }
+                let label = if is_read { "read" } else { "unread" };
+                window.add_toast(adw::Toast::new(&format!("Marked {} messages as {}", count, label)));
+            }),
+        );
+
+        // Connect bulk-star signal
+        let window = self.clone();
+        message_list.connect_closure(
+            "bulk-star",
+            false,
+            glib::closure_local!(move |list: &MessageList, data: String, is_starred: bool| {
+                let items = parse_bulk_data(&data);
+                let count = items.len();
+                debug!("Bulk star: {} messages, is_starred={}", count, is_starred);
+                for (uid, msg_id, folder_id) in &items {
+                    list.update_message_starred(*uid, is_starred);
+                    if let Some(app) = window.application() {
+                        if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                            app.set_message_starred(*msg_id, *uid, *folder_id, is_starred);
+                        }
+                    }
+                }
+                let label = if is_starred { "starred" } else { "unstarred" };
+                window.add_toast(adw::Toast::new(&format!("{} {} messages", label.chars().next().unwrap().to_uppercase().collect::<String>() + &label[1..], count)));
             }),
         );
 

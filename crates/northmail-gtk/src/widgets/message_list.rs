@@ -147,8 +147,8 @@ mod imp {
         pub filter_state: RefCell<FilterState>,
         /// Current text search query (as-you-type)
         pub search_query: RefCell<String>,
-        /// Currently selected message UID (to preserve selection across rebuilds)
-        pub selected_uid: Cell<Option<u32>>,
+        /// Currently selected message UIDs (to preserve selection across rebuilds)
+        pub selected_uids: RefCell<Vec<u32>>,
         /// Current folder context for drag-and-drop (account_id)
         pub current_account_id: RefCell<String>,
         /// Current folder context for drag-and-drop (folder_path)
@@ -157,6 +157,8 @@ mod imp {
         pub is_loading: Cell<bool>,
         /// Whether a context menu is currently open (prevents auto-selection during rebuilds)
         pub context_menu_open: Cell<bool>,
+        /// Anchor row index for Shift+click range selection
+        pub anchor_index: Cell<Option<i32>>,
     }
 
     #[glib::object_subclass]
@@ -201,6 +203,22 @@ mod imp {
                         .build(),
                     Signal::builder("forward")
                         .param_types([u32::static_type()])
+                        .build(),
+                    // Bulk action signals: data is pipe-delimited "uid:msg_id:folder_id|..."
+                    Signal::builder("bulk-archive")
+                        .param_types([String::static_type()])
+                        .build(),
+                    Signal::builder("bulk-trash")
+                        .param_types([String::static_type()])
+                        .build(),
+                    Signal::builder("bulk-spam")
+                        .param_types([String::static_type()])
+                        .build(),
+                    Signal::builder("bulk-mark-read")
+                        .param_types([String::static_type(), bool::static_type()])
+                        .build(),
+                    Signal::builder("bulk-star")
+                        .param_types([String::static_type(), bool::static_type()])
                         .build(),
                 ]
             })
@@ -278,7 +296,7 @@ impl MessageList {
             .build();
 
         let list_box = gtk4::ListBox::builder()
-            .selection_mode(gtk4::SelectionMode::Single)
+            .selection_mode(gtk4::SelectionMode::Multiple)
             .css_classes(["message-list"])
             .build();
 
@@ -1112,8 +1130,8 @@ impl MessageList {
         let messages = sorted_messages;
 
         if let (Some(scrolled), Some(list_box)) = (scrolled.as_ref(), list_box.as_ref()) {
-            // Remember selected UID before clearing
-            let selected_uid = imp.selected_uid.get();
+            // Remember selected UIDs before clearing
+            let selected_uids = imp.selected_uids.borrow().clone();
 
             // Clear existing rows
             while let Some(child) = list_box.first_child() {
@@ -1149,47 +1167,141 @@ impl MessageList {
                     self.add_message_row(list_box, msg);
                 }
 
-                // Connect row activation handler only once
+                // Connect click gesture handler only once
+                // With SelectionMode::Multiple, we use GestureClick to distinguish
+                // plain click (select one + show message) from Ctrl/Shift click (multi-select)
                 if !imp.row_handler_connected.get() {
                     let widget = self.clone();
-                    list_box.connect_row_activated(move |_, row| {
-                        let index = row.index() as usize;
-                        // Map display index to actual message via filtered list
+                    let gesture = gtk4::GestureClick::new();
+                    gesture.set_button(1); // Left click only
+                    gesture.connect_released(move |gesture, _n, _x, y| {
+                        let lb = {
+                            let lb_ref = widget.imp().list_box.borrow();
+                            match lb_ref.as_ref() {
+                                Some(lb) => lb.clone(),
+                                None => return,
+                            }
+                        };
+
+                        // Find which row was clicked
+                        let row = if let Some(row) = lb.row_at_y(y as i32) {
+                            row
+                        } else {
+                            return;
+                        };
+
+                        // Check modifier state for Ctrl/Shift
+                        let (has_ctrl, has_shift) = if let Some(event) = gesture.last_event(gesture.current_sequence().as_ref()) {
+                            let state = event.modifier_state();
+                            (
+                                state.contains(gtk4::gdk::ModifierType::CONTROL_MASK),
+                                state.contains(gtk4::gdk::ModifierType::SHIFT_MASK),
+                            )
+                        } else {
+                            (false, false)
+                        };
+
+                        let index = row.index();
                         let imp = widget.imp();
                         let messages = imp.messages.borrow();
                         let filtered: Vec<&MessageInfo> = messages.iter()
                             .filter(|m| widget.message_matches(m))
                             .collect();
-                        if let Some(msg) = filtered.get(index) {
-                            tracing::debug!("Row activated: index={}, uid={}", index, msg.uid);
-                            // Store selected UID for preservation across rebuilds
-                            imp.selected_uid.set(Some(msg.uid));
-                            widget.emit_by_name::<()>("message-selected", &[&msg.uid]);
+
+                        if has_shift {
+                            // Shift+click: range select from anchor to clicked row
+                            let anchor = imp.anchor_index.get().unwrap_or(0);
+                            let start = anchor.min(index);
+                            let end = anchor.max(index);
+
+                            // If Ctrl isn't also held, clear existing selection first
+                            if !has_ctrl {
+                                lb.unselect_all();
+                            }
+
+                            // Select all rows in the range
+                            let mut uids = imp.selected_uids.borrow_mut();
+                            if !has_ctrl {
+                                uids.clear();
+                            }
+                            for i in start..=end {
+                                if let Some(r) = lb.row_at_index(i) {
+                                    lb.select_row(Some(&r));
+                                    if let Some(msg) = filtered.get(i as usize) {
+                                        if !uids.contains(&msg.uid) {
+                                            uids.push(msg.uid);
+                                        }
+                                    }
+                                }
+                            }
+                            // Don't update anchor on shift-click (preserve it for further shift-clicks)
+                            tracing::debug!("Shift-select: {} messages selected (range {}..={})", uids.len(), start, end);
+                        } else if has_ctrl {
+                            // Ctrl+click: toggle individual row in selection
+                            let is_selected = lb.selected_rows().iter().any(|r| r.index() == index);
+                            let mut uids = imp.selected_uids.borrow_mut();
+
+                            if is_selected {
+                                // GTK already selected it; if we want toggle behavior, unselect
+                                lb.unselect_row(&row);
+                                if let Some(msg) = filtered.get(index as usize) {
+                                    uids.retain(|u| *u != msg.uid);
+                                }
+                            } else {
+                                lb.select_row(Some(&row));
+                                if let Some(msg) = filtered.get(index as usize) {
+                                    if !uids.contains(&msg.uid) {
+                                        uids.push(msg.uid);
+                                    }
+                                }
+                            }
+                            imp.anchor_index.set(Some(index));
+                            tracing::debug!("Ctrl-select: {} messages selected", uids.len());
                         } else {
-                            tracing::warn!("Row activated but no message at index {}", index);
+                            // Plain click: select only this row, show message
+                            lb.unselect_all();
+                            lb.select_row(Some(&row));
+                            imp.anchor_index.set(Some(index));
+                            let clicked_uid = filtered.get(index as usize).map(|m| m.uid);
+                            drop(filtered);
+                            drop(messages);
+                            if let Some(uid) = clicked_uid {
+                                tracing::debug!("Row clicked: index={}, uid={}", index, uid);
+                                let mut uids = imp.selected_uids.borrow_mut();
+                                uids.clear();
+                                uids.push(uid);
+                                drop(uids);
+                                widget.emit_by_name::<()>("message-selected", &[&uid]);
+                            }
                         }
                     });
+                    list_box.add_controller(gesture);
                     imp.row_handler_connected.set(true);
-                    tracing::debug!("Row activation handler connected");
-                }
-
-                // Restore user's selection if they had clicked a message,
-                // otherwise ensure nothing is selected (prevents auto-select of first row)
-                if let Some(uid) = selected_uid {
-                    for (idx, msg) in visible.iter().enumerate() {
-                        if msg.uid == uid {
-                            if let Some(row) = list_box.row_at_index(idx as i32) {
-                                list_box.select_row(Some(&row));
-                            }
-                            break;
-                        }
-                    }
+                    tracing::debug!("Click gesture handler connected");
                 }
 
                 scrolled.set_child(Some(list_box));
 
-                // If no user selection, deselect after layout to prevent GTK auto-selecting first row
-                if selected_uid.is_none() {
+                // Restore user's selection AFTER re-parenting (set_child resets GTK selection state)
+                if !selected_uids.is_empty() {
+                    let lb = imp.list_box.borrow().clone();
+                    let uids = selected_uids.clone();
+                    let msgs: Vec<(usize, u32)> = visible.iter().enumerate()
+                        .filter(|(_, m)| uids.contains(&m.uid))
+                        .map(|(idx, m)| (idx, m.uid))
+                        .collect();
+                    glib::idle_add_local_once(move || {
+                        if let Some(list_box) = lb.as_ref() {
+                            list_box.unselect_all();
+                            for (idx, _uid) in &msgs {
+                                if let Some(row) = list_box.row_at_index(*idx as i32) {
+                                    list_box.select_row(Some(&row));
+                                }
+                            }
+                        }
+                    });
+                } else {
+                    // If no user selection, deselect after layout to prevent GTK auto-selecting first row
                     let lb = imp.list_box.borrow().clone();
                     glib::idle_add_local_once(move || {
                         if let Some(list_box) = lb.as_ref() {
@@ -1417,17 +1529,31 @@ impl MessageList {
 
         // Store message data for drag (use folder context from MessageList, not msg.folder_id which may be 0)
         let (account_id, folder_path) = self.folder_context();
-        let drag_data = Rc::new((msg.uid, msg.id, account_id.clone(), folder_path.clone(), msg.subject.clone()));
-        let drag_data_for_prepare = drag_data.clone();
+        let drag_msg_uid = msg.uid;
+        let drag_msg_id = msg.id;
+        let drag_account_id = account_id.clone();
+        let drag_folder_path = folder_path.clone();
 
+        let widget_for_prepare = self.clone();
         drag_source.connect_prepare(move |_source, _x, _y| {
-            // Create content with message info as string: "uid:msg_id:account_id:folder_path"
-            let data = format!("{}:{}:{}:{}",
-                drag_data_for_prepare.0,
-                drag_data_for_prepare.1,
-                drag_data_for_prepare.2,
-                drag_data_for_prepare.3);
-            Some(gtk4::gdk::ContentProvider::for_value(&data.to_value()))
+            let selected_uids = widget_for_prepare.imp().selected_uids.borrow();
+            let is_multi = selected_uids.len() > 1 && selected_uids.contains(&drag_msg_uid);
+
+            if is_multi {
+                // Encode all selected messages: "multi|uid:msg_id:acct:folder|uid:msg_id:acct:folder|..."
+                let messages = widget_for_prepare.imp().messages.borrow();
+                let (acct, fpath) = widget_for_prepare.folder_context();
+                let entries: Vec<String> = messages.iter()
+                    .filter(|m| selected_uids.contains(&m.uid))
+                    .map(|m| format!("{}:{}:{}:{}", m.uid, m.id, acct, fpath))
+                    .collect();
+                let data = format!("multi|{}", entries.join("|"));
+                Some(gtk4::gdk::ContentProvider::for_value(&data.to_value()))
+            } else {
+                // Single message: "uid:msg_id:account_id:folder_path"
+                let data = format!("{}:{}:{}:{}", drag_msg_uid, drag_msg_id, drag_account_id, drag_folder_path);
+                Some(gtk4::gdk::ContentProvider::for_value(&data.to_value()))
+            }
         });
 
         // Show message info as drag icon (handle UTF-8 properly)
@@ -1452,7 +1578,11 @@ impl MessageList {
 
         // Use the row itself as the drag icon source for proper rendering
         let row_weak = row.downgrade();
-        drag_source.connect_drag_begin(move |source, _drag| {
+        let widget_for_begin = self.clone();
+        drag_source.connect_drag_begin(move |_source, _drag| {
+            let selected_uids = widget_for_begin.imp().selected_uids.borrow();
+            let is_multi = selected_uids.len() > 1 && selected_uids.contains(&drag_msg_uid);
+
             // Create a styled container for the drag preview
             let drag_widget = gtk4::Box::builder()
                 .orientation(gtk4::Orientation::Horizontal)
@@ -1468,43 +1598,79 @@ impl MessageList {
                 .build();
             drag_widget.append(&icon);
 
-            // Text container
-            let text_box = gtk4::Box::builder()
-                .orientation(gtk4::Orientation::Vertical)
-                .spacing(2)
-                .build();
+            if is_multi {
+                // Multi-drag: show badge with count
+                let count = selected_uids.len();
+                let label = gtk4::Label::builder()
+                    .label(&format!("{} Messages", count))
+                    .xalign(0.0)
+                    .css_classes(["heading"])
+                    .build();
+                drag_widget.append(&label);
 
-            let from_label = gtk4::Label::builder()
-                .label(&from_for_drag)
-                .xalign(0.0)
-                .css_classes(["heading"])
-                .build();
+                // Make all selected rows semi-transparent
+                if let Some(lb) = widget_for_begin.imp().list_box.borrow().as_ref() {
+                    let messages = widget_for_begin.imp().messages.borrow();
+                    let filtered: Vec<&super::MessageInfo> = messages.iter()
+                        .filter(|m| widget_for_begin.message_matches(m))
+                        .collect();
+                    for (idx, msg) in filtered.iter().enumerate() {
+                        if selected_uids.contains(&msg.uid) {
+                            if let Some(row) = lb.row_at_index(idx as i32) {
+                                row.set_opacity(0.4);
+                                row.add_css_class("dragging");
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Single drag: show from + subject
+                let text_box = gtk4::Box::builder()
+                    .orientation(gtk4::Orientation::Vertical)
+                    .spacing(2)
+                    .build();
 
-            let subject_label = gtk4::Label::builder()
-                .label(&subject_for_drag)
-                .xalign(0.0)
-                .css_classes(["dim-label"])
-                .build();
+                let from_label = gtk4::Label::builder()
+                    .label(&from_for_drag)
+                    .xalign(0.0)
+                    .css_classes(["heading"])
+                    .build();
 
-            text_box.append(&from_label);
-            text_box.append(&subject_label);
-            drag_widget.append(&text_box);
+                let subject_label = gtk4::Label::builder()
+                    .label(&subject_for_drag)
+                    .xalign(0.0)
+                    .css_classes(["dim-label"])
+                    .build();
+
+                text_box.append(&from_label);
+                text_box.append(&subject_label);
+                drag_widget.append(&text_box);
+
+                // Make the original row semi-transparent during drag
+                if let Some(row) = row_weak.upgrade() {
+                    row.set_opacity(0.4);
+                    row.add_css_class("dragging");
+                }
+            }
 
             // Get the DragIcon from the drag and set content directly
             let drag_icon = gtk4::DragIcon::for_drag(_drag);
             drag_icon.set_child(Some(&drag_widget));
-
-            // Make the original row semi-transparent during drag
-            if let Some(row) = row_weak.upgrade() {
-                row.set_opacity(0.4);
-                row.add_css_class("dragging");
-            }
         });
 
         // Restore opacity when drag ends
         let row_weak2 = row.downgrade();
+        let widget_for_end = self.clone();
         drag_source.connect_drag_end(move |_source, _drag, _delete| {
-            if let Some(row) = row_weak2.upgrade() {
+            // Restore all rows (handles both single and multi-drag)
+            if let Some(lb) = widget_for_end.imp().list_box.borrow().as_ref() {
+                let mut idx = 0;
+                while let Some(row) = lb.row_at_index(idx) {
+                    row.set_opacity(1.0);
+                    row.remove_css_class("dragging");
+                    idx += 1;
+                }
+            } else if let Some(row) = row_weak2.upgrade() {
                 row.set_opacity(1.0);
                 row.remove_css_class("dragging");
             }
@@ -1519,17 +1685,37 @@ impl MessageList {
         list_box.append(&row);
     }
 
-    /// Add context menu to a message row using a manual Popover + Box + Buttons.
-    /// We avoid PopoverMenu/gio::Menu because GTK4 inherits the selected row's
-    /// white text color into the popover, making menu items invisible.
-    fn add_row_context_menu(&self, row: &gtk4::ListBoxRow, msg: &MessageInfo) {
+    /// Helper to create a context menu item button in a popover vbox
+    fn make_context_menu_item(vbox: &gtk4::Box, label: &str) -> gtk4::Button {
+        let lbl = gtk4::Label::new(None);
+        lbl.set_markup(&format!("<span color='#1c1c1c' weight='normal'>{}</span>", glib::markup_escape_text(label)));
+        lbl.set_xalign(0.0);
+        let btn = gtk4::Button::new();
+        btn.set_child(Some(&lbl));
+        btn.add_css_class("flat");
+        btn.add_css_class("context-menu-item");
+        btn.set_hexpand(true);
+        btn.set_halign(gtk4::Align::Fill);
+        vbox.append(&btn);
+        btn
+    }
+
+    /// Helper to add a separator to a context menu vbox
+    fn add_context_menu_separator(vbox: &gtk4::Box) {
+        let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        sep.set_margin_top(4);
+        sep.set_margin_bottom(4);
+        vbox.append(&sep);
+    }
+
+    /// Build the single-message context menu popover (used when right-clicking one message)
+    fn build_single_context_menu(&self, row: &gtk4::ListBoxRow, msg: &MessageInfo) -> gtk4::Popover {
         let msg_uid = msg.uid;
         let msg_id = msg.id;
         let msg_folder_id = msg.folder_id;
         let is_read = msg.is_read;
         let is_starred = msg.is_starred;
 
-        // Build menu content manually
         let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         vbox.set_margin_top(4);
         vbox.set_margin_bottom(4);
@@ -1539,32 +1725,10 @@ impl MessageList {
         popover.set_has_arrow(false);
         popover.set_child(Some(&vbox));
 
-        // Helper to create a menu item button
-        let make_item = |label: &str| -> gtk4::Button {
-            let lbl = gtk4::Label::new(None);
-            lbl.set_markup(&format!("<span color='#1c1c1c' weight='normal'>{}</span>", glib::markup_escape_text(label)));
-            lbl.set_xalign(0.0);
-            let btn = gtk4::Button::new();
-            btn.set_child(Some(&lbl));
-            btn.add_css_class("flat");
-            btn.add_css_class("context-menu-item");
-            btn.set_hexpand(true);
-            btn.set_halign(gtk4::Align::Fill);
-            vbox.append(&btn);
-            btn
-        };
-
-        let make_separator = || {
-            let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
-            sep.set_margin_top(4);
-            sep.set_margin_bottom(4);
-            vbox.append(&sep);
-        };
-
         // Read/Unread toggle
         let widget = self.clone();
         if is_read {
-            let btn = make_item("Mark as Unread");
+            let btn = Self::make_context_menu_item(&vbox, "Mark as Unread");
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1573,7 +1737,7 @@ impl MessageList {
                 w.emit_by_name::<()>("mark-read", &[&msg_uid, &msg_id, &msg_folder_id, &false]);
             });
         } else {
-            let btn = make_item("Mark as Read");
+            let btn = Self::make_context_menu_item(&vbox, "Mark as Read");
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1585,7 +1749,7 @@ impl MessageList {
 
         // Star toggle
         if is_starred {
-            let btn = make_item("Unstar");
+            let btn = Self::make_context_menu_item(&vbox, "Unstar");
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1594,7 +1758,7 @@ impl MessageList {
                 w.emit_by_name::<()>("star-toggled", &[&msg_uid, &msg_id, &msg_folder_id, &false]);
             });
         } else {
-            let btn = make_item("Star");
+            let btn = Self::make_context_menu_item(&vbox, "Star");
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1604,11 +1768,11 @@ impl MessageList {
             });
         }
 
-        make_separator();
+        Self::add_context_menu_separator(&vbox);
 
         // Reply / Reply All / Forward
         {
-            let btn = make_item("Reply");
+            let btn = Self::make_context_menu_item(&vbox, "Reply");
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1618,7 +1782,7 @@ impl MessageList {
             });
         }
         {
-            let btn = make_item("Reply All");
+            let btn = Self::make_context_menu_item(&vbox, "Reply All");
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1628,7 +1792,7 @@ impl MessageList {
             });
         }
         {
-            let btn = make_item("Forward");
+            let btn = Self::make_context_menu_item(&vbox, "Forward");
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1638,11 +1802,11 @@ impl MessageList {
             });
         }
 
-        make_separator();
+        Self::add_context_menu_separator(&vbox);
 
         // Archive / Trash / Spam
         {
-            let btn = make_item("Archive");
+            let btn = Self::make_context_menu_item(&vbox, "Archive");
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1652,7 +1816,7 @@ impl MessageList {
             });
         }
         {
-            let btn = make_item("Move to Trash");
+            let btn = Self::make_context_menu_item(&vbox, "Move to Trash");
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1662,7 +1826,7 @@ impl MessageList {
             });
         }
         {
-            let btn = make_item("Mark as Spam");
+            let btn = Self::make_context_menu_item(&vbox, "Mark as Spam");
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1672,24 +1836,166 @@ impl MessageList {
             });
         }
 
+        popover
+    }
+
+    /// Build a bulk context menu popover for multiple selected messages
+    fn build_bulk_context_menu(&self, row: &gtk4::ListBoxRow, count: usize) -> gtk4::Popover {
+        let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        vbox.set_margin_top(4);
+        vbox.set_margin_bottom(4);
+
+        let popover = gtk4::Popover::new();
+        popover.set_parent(row);
+        popover.set_has_arrow(false);
+        popover.set_child(Some(&vbox));
+
+        let widget = self.clone();
+
+        // Mark as Read / Mark as Unread
+        {
+            let btn = Self::make_context_menu_item(&vbox, &format!("Mark {} as Read", count));
+            let w = widget.clone();
+            let p = popover.clone();
+            btn.connect_clicked(move |_| {
+                p.popdown();
+                w.imp().context_menu_open.set(false);
+                let data = w.encode_bulk_data();
+                w.emit_by_name::<()>("bulk-mark-read", &[&data, &true]);
+            });
+        }
+        {
+            let btn = Self::make_context_menu_item(&vbox, &format!("Mark {} as Unread", count));
+            let w = widget.clone();
+            let p = popover.clone();
+            btn.connect_clicked(move |_| {
+                p.popdown();
+                w.imp().context_menu_open.set(false);
+                let data = w.encode_bulk_data();
+                w.emit_by_name::<()>("bulk-mark-read", &[&data, &false]);
+            });
+        }
+
+        // Star / Unstar
+        {
+            let btn = Self::make_context_menu_item(&vbox, &format!("Star {}", count));
+            let w = widget.clone();
+            let p = popover.clone();
+            btn.connect_clicked(move |_| {
+                p.popdown();
+                w.imp().context_menu_open.set(false);
+                let data = w.encode_bulk_data();
+                w.emit_by_name::<()>("bulk-star", &[&data, &true]);
+            });
+        }
+        {
+            let btn = Self::make_context_menu_item(&vbox, &format!("Unstar {}", count));
+            let w = widget.clone();
+            let p = popover.clone();
+            btn.connect_clicked(move |_| {
+                p.popdown();
+                w.imp().context_menu_open.set(false);
+                let data = w.encode_bulk_data();
+                w.emit_by_name::<()>("bulk-star", &[&data, &false]);
+            });
+        }
+
+        Self::add_context_menu_separator(&vbox);
+
+        // Archive / Trash / Spam
+        {
+            let btn = Self::make_context_menu_item(&vbox, &format!("Archive {} Messages", count));
+            let w = widget.clone();
+            let p = popover.clone();
+            btn.connect_clicked(move |_| {
+                p.popdown();
+                w.imp().context_menu_open.set(false);
+                let data = w.encode_bulk_data();
+                w.emit_by_name::<()>("bulk-archive", &[&data]);
+            });
+        }
+        {
+            let btn = Self::make_context_menu_item(&vbox, &format!("Move {} to Trash", count));
+            let w = widget.clone();
+            let p = popover.clone();
+            btn.connect_clicked(move |_| {
+                p.popdown();
+                w.imp().context_menu_open.set(false);
+                let data = w.encode_bulk_data();
+                w.emit_by_name::<()>("bulk-trash", &[&data]);
+            });
+        }
+        {
+            let btn = Self::make_context_menu_item(&vbox, &format!("Mark {} as Spam", count));
+            let w = widget.clone();
+            let p = popover.clone();
+            btn.connect_clicked(move |_| {
+                p.popdown();
+                w.imp().context_menu_open.set(false);
+                let data = w.encode_bulk_data();
+                w.emit_by_name::<()>("bulk-spam", &[&data]);
+            });
+        }
+
+        popover
+    }
+
+    /// Add context menu to a message row using a manual Popover + Box + Buttons.
+    /// We avoid PopoverMenu/gio::Menu because GTK4 inherits the selected row's
+    /// white text color into the popover, making menu items invisible.
+    fn add_row_context_menu(&self, row: &gtk4::ListBoxRow, msg: &MessageInfo) {
+        let msg_uid = msg.uid;
+
+        // Build the single-message popover (always created)
+        let single_popover = self.build_single_context_menu(row, msg);
+
+        // Track when single popover closes
+        let widget_for_close = self.clone();
+        single_popover.connect_closed(move |_| {
+            widget_for_close.imp().context_menu_open.set(false);
+        });
+
+        // Store a RefCell for the dynamically created bulk popover
+        let bulk_popover: Rc<std::cell::RefCell<Option<gtk4::Popover>>> = Rc::new(std::cell::RefCell::new(None));
+
         // Right-click gesture
         let gesture = gtk4::GestureClick::new();
         gesture.set_button(3);
-        let popover_clone = popover.clone();
+        let single_popover_clone = single_popover.clone();
         let widget_for_gesture = self.clone();
+        let row_weak = row.downgrade();
+        let bulk_popover_clone = bulk_popover.clone();
         gesture.connect_pressed(move |gesture, _n, x, y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
             widget_for_gesture.imp().context_menu_open.set(true);
-            popover_clone.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-            popover_clone.popup();
+
+            let sel_count = widget_for_gesture.selection_count();
+            let is_in_selection = widget_for_gesture.imp().selected_uids.borrow().contains(&msg_uid);
+
+            if sel_count > 1 && is_in_selection {
+                // Show bulk context menu
+                // Clean up previous bulk popover if any
+                if let Some(old) = bulk_popover_clone.borrow_mut().take() {
+                    old.unparent();
+                }
+
+                if let Some(row) = row_weak.upgrade() {
+                    let popover = widget_for_gesture.build_bulk_context_menu(&row, sel_count);
+                    let w = widget_for_gesture.clone();
+                    popover.connect_closed(move |_| {
+                        w.imp().context_menu_open.set(false);
+                    });
+                    popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                    popover.popup();
+                    *bulk_popover_clone.borrow_mut() = Some(popover);
+                }
+            } else {
+                // Show single-message context menu
+                single_popover_clone.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                single_popover_clone.popup();
+            }
         });
         row.add_controller(gesture);
-
-        // Track when popover closes
-        let widget_for_close = self.clone();
-        popover.connect_closed(move |_| {
-            widget_for_close.imp().context_menu_open.set(false);
-        });
     }
 
     /// Update a message's starred status in the list
@@ -1744,8 +2050,8 @@ impl MessageList {
         let messages = imp.messages.borrow();
 
         if let (Some(list_box), Some(_scrolled)) = (list_box.as_ref(), scrolled.as_ref()) {
-            // Remember selected UID
-            let selected_uid = imp.selected_uid.get();
+            // Remember selected UIDs
+            let selected_uids = imp.selected_uids.borrow().clone();
 
             // Clear existing rows
             while let Some(child) = list_box.first_child() {
@@ -1770,23 +2076,67 @@ impl MessageList {
                 imp.load_more_row.replace(Some(load_row));
             }
 
-            // Restore user's selection or deselect
-            if let Some(uid) = selected_uid {
-                let filtered: Vec<&MessageInfo> = messages.iter()
-                    .filter(|m| self.message_matches(m))
+            // Restore user's selection or deselect (deferred to idle so GTK finishes layout first)
+            let lb = list_box.clone();
+            if !selected_uids.is_empty() {
+                let restore: Vec<i32> = visible.iter().enumerate()
+                    .filter(|(_, m)| selected_uids.contains(&m.uid))
+                    .map(|(idx, _)| idx as i32)
                     .collect();
-                if let Some(pos) = filtered.iter().position(|m| m.uid == uid) {
-                    if let Some(row) = list_box.row_at_index(pos as i32) {
-                        list_box.select_row(Some(&row));
+                glib::idle_add_local_once(move || {
+                    lb.unselect_all();
+                    for idx in &restore {
+                        if let Some(row) = lb.row_at_index(*idx) {
+                            lb.select_row(Some(&row));
+                        }
                     }
-                }
+                });
             } else {
-                let lb = list_box.clone();
                 glib::idle_add_local_once(move || {
                     lb.unselect_all();
                 });
             }
         }
+    }
+
+    /// Return cloned info for all currently selected messages
+    pub fn selected_messages(&self) -> Vec<MessageInfo> {
+        let imp = self.imp();
+        let uids = imp.selected_uids.borrow();
+        let messages = imp.messages.borrow();
+        messages.iter()
+            .filter(|m| uids.contains(&m.uid))
+            .cloned()
+            .collect()
+    }
+
+    /// Return the number of currently selected messages
+    pub fn selection_count(&self) -> usize {
+        self.imp().selected_uids.borrow().len()
+    }
+
+    /// Bulk remove messages by UIDs and rebuild
+    pub fn remove_messages(&self, uids: &[u32]) {
+        let imp = self.imp();
+        let mut messages = imp.messages.borrow_mut();
+        messages.retain(|m| !uids.contains(&m.uid));
+        imp.message_count.set(messages.len());
+        drop(messages);
+        // Clear selection for removed messages
+        {
+            let mut sel = imp.selected_uids.borrow_mut();
+            sel.retain(|uid| !uids.contains(uid));
+        }
+        self.rebuild_visible_rows();
+    }
+
+    /// Encode selected messages as pipe-delimited string "uid:msg_id:folder_id|..."
+    fn encode_bulk_data(&self) -> String {
+        let msgs = self.selected_messages();
+        msgs.iter()
+            .map(|m| format!("{}:{}:{}", m.uid, m.id, m.folder_id))
+            .collect::<Vec<_>>()
+            .join("|")
     }
 }
 
