@@ -4423,13 +4423,7 @@ impl NorthMailApplication {
                         .unwrap_or_default(),
                     from_address: h.envelope.from.first().map(|a| a.address.clone()).unwrap_or_default(),
                     to: h.envelope.to.iter()
-                        .map(|a| {
-                            if let Some(name) = &a.name {
-                                decode_mime_header(name)
-                            } else {
-                                a.address.clone()
-                            }
-                        })
+                        .map(|a| a.address.clone())
                         .collect::<Vec<_>>()
                         .join(", "),
                     cc: h.envelope.cc.iter()

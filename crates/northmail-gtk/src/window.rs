@@ -1619,7 +1619,7 @@ impl NorthMailWindow {
             let to_row = gtk4::Box::builder()
                 .orientation(gtk4::Orientation::Horizontal)
                 .spacing(4)
-                .margin_start(48) // Align with sender info (after avatar)
+                .margin_start(62) // Align with sender text (40px avatar + 12px spacing + 10px chip padding)
                 .margin_top(4)
                 .build();
             let to_label = gtk4::Label::builder()
@@ -2067,6 +2067,7 @@ impl NorthMailWindow {
             .attachment-pill button { min-width: 16px; min-height: 16px; padding: 0; margin: 0 0 0 2px; }
             .more-badge { background: alpha(@accent_color, 0.15); color: @accent_color; border-radius: 6px; padding: 1px 8px; font-size: 0.8em; font-weight: 500; }
             .more-badge:hover { background: alpha(@accent_color, 0.25); }
+            .kb-highlight { background: alpha(@accent_bg_color, 0.15); }
             .warning { color: @warning_color; }
             .compose-send { min-height: 24px; padding-top: 2px; padding-bottom: 2px; }
             .format-bar { background-color: white; }
@@ -3523,6 +3524,7 @@ impl NorthMailWindow {
             .margin_end(12)
             .margin_top(4)
             .margin_bottom(4)
+            .height_request(32) // Consistent row height (matches Cc row with Bcc button)
             .build();
 
         let label = gtk4::Label::builder()
@@ -3689,12 +3691,18 @@ impl NorthMailWindow {
             entry_suggest.grab_focus();
         });
 
+        // Track keyboard-highlighted row index (-1 = none)
+        let kb_index: Rc<Cell<i32>> = Rc::new(Cell::new(-1));
+
         // Instant autocomplete — filter preloaded contacts on every keystroke
         let window_clone = window.clone();
         let popover_change = popover.clone();
         let suggestion_list_ref = suggestion_list.clone();
         let suggestion_list_key = suggestion_list; // For key handler below
+        let kb_index_change = kb_index.clone();
         entry.connect_changed(move |entry| {
+            // Reset keyboard navigation on text change
+            kb_index_change.set(-1);
             let text = entry.text().to_string();
 
             if text.trim().is_empty() {
@@ -3768,6 +3776,43 @@ impl NorthMailWindow {
         let list_key = suggestion_list_key;
         let add_chip_key = add_chip.clone();
         let entry_key = entry.clone();
+
+        // Helper to update visual highlight
+        let highlight_row = {
+            let list = list_key.clone();
+            let kb_idx = kb_index.clone();
+            let scrolled = suggestion_scrolled.clone();
+            move |new_idx: i32| {
+                // Remove highlight from old row
+                let old = kb_idx.get();
+                if old >= 0 {
+                    if let Some(row) = list.row_at_index(old) {
+                        row.remove_css_class("kb-highlight");
+                    }
+                }
+                kb_idx.set(new_idx);
+                if new_idx >= 0 {
+                    if let Some(row) = list.row_at_index(new_idx) {
+                        row.add_css_class("kb-highlight");
+                        list.select_row(Some(&row));
+                        // Scroll the row into view
+                        let adj = scrolled.vadjustment();
+                        let row_y = row.allocation().y() as f64;
+                        let row_h = row.allocation().height() as f64;
+                        let visible_top = adj.value();
+                        let visible_h = adj.page_size();
+                        if row_y < visible_top {
+                            adj.set_value(row_y);
+                        } else if row_y + row_h > visible_top + visible_h {
+                            adj.set_value(row_y + row_h - visible_h);
+                        }
+                    }
+                } else {
+                    list.unselect_all();
+                }
+            }
+        };
+
         key_controller.connect_key_pressed(move |_, keyval, _, _| {
             use gtk4::gdk::Key;
 
@@ -3777,60 +3822,67 @@ impl NorthMailWindow {
 
             match keyval {
                 k if k == Key::Down => {
-                    // Move selection down (or select first if none selected)
-                    let selected = list_key.selected_row();
-                    if let Some(row) = selected {
-                        let idx = row.index();
-                        if let Some(next) = list_key.row_at_index(idx + 1) {
-                            list_key.select_row(Some(&next));
-                        }
-                    } else if let Some(first) = list_key.row_at_index(0) {
-                        list_key.select_row(Some(&first));
+                    let current = kb_index.get();
+                    // Count rows
+                    let mut count = 0;
+                    while list_key.row_at_index(count).is_some() {
+                        count += 1;
                     }
+                    let next = if current < count - 1 { current + 1 } else { current };
+                    highlight_row(next);
                     gtk4::glib::Propagation::Stop
                 }
                 k if k == Key::Up => {
-                    // Move selection up
-                    if let Some(row) = list_key.selected_row() {
-                        let idx = row.index();
-                        if idx > 0 {
-                            if let Some(prev) = list_key.row_at_index(idx - 1) {
-                                list_key.select_row(Some(&prev));
-                            }
-                        } else {
-                            // At top, deselect and stay in entry
-                            list_key.unselect_all();
-                        }
+                    let current = kb_index.get();
+                    if current > 0 {
+                        highlight_row(current - 1);
+                    } else {
+                        // Back to entry, deselect all
+                        highlight_row(-1);
                     }
                     gtk4::glib::Propagation::Stop
                 }
                 k if k == Key::Return || k == Key::KP_Enter => {
-                    // If a row is selected, activate it
-                    if let Some(row) = list_key.selected_row() {
-                        if let Some(tooltip) = row.tooltip_text() {
-                            let parts: Vec<&str> = tooltip.splitn(2, '\t').collect();
-                            if parts.len() == 2 {
-                                add_chip_key(parts[0], parts[1]);
-                            } else {
-                                add_chip_key("", &tooltip);
+                    let idx = kb_index.get();
+                    if idx >= 0 {
+                        if let Some(row) = list_key.row_at_index(idx) {
+                            if let Some(tooltip) = row.tooltip_text() {
+                                let parts: Vec<&str> = tooltip.splitn(2, '\t').collect();
+                                if parts.len() == 2 {
+                                    add_chip_key(parts[0], parts[1]);
+                                } else {
+                                    add_chip_key("", &tooltip);
+                                }
                             }
                         }
+                        highlight_row(-1);
                         popover_key.popdown();
                         entry_key.set_text("");
                         return gtk4::glib::Propagation::Stop;
                     }
+                    // No row highlighted — let entry's default activate handle it
                     gtk4::glib::Propagation::Proceed
                 }
                 k if k == Key::Escape => {
-                    // Close popover and deselect
-                    list_key.unselect_all();
+                    highlight_row(-1);
                     popover_key.popdown();
                     gtk4::glib::Propagation::Stop
                 }
                 _ => gtk4::glib::Propagation::Proceed,
             }
         });
-        entry.add_controller(key_controller);
+        // GTK4 Entry delegates focus to its internal GtkText widget. Key events go
+        // to GtkText, not Entry. We add the controller to Entry first, then move it
+        // to the GtkText child once the widget tree is realized.
+        entry.add_controller(key_controller.clone());
+        let entry_for_realize = entry.clone();
+        let kc = key_controller;
+        entry.connect_realize(move |_| {
+            if let Some(text_widget) = entry_for_realize.first_child() {
+                entry_for_realize.remove_controller(&kc);
+                text_widget.add_controller(kc.clone());
+            }
+        });
 
         (row, add_chip_return)
     }
