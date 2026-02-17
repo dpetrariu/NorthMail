@@ -339,7 +339,7 @@ mod imp {
     use super::*;
     use libadwaita::subclass::prelude::*;
     use std::cell::{Cell, OnceCell, RefCell};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use tracing::info;
 
@@ -377,6 +377,9 @@ mod imp {
         pub(super) idle_event_receiver: RefCell<Option<std::sync::mpsc::Receiver<IdleManagerEvent>>>,
         /// Accounts currently being synced (prevents duplicate concurrent syncs)
         pub(super) syncing_accounts: RefCell<std::collections::HashSet<String>>,
+        /// UIDs pending IMAP deletion: (folder_id, uid) pairs
+        /// Prevents re-insertion from cache/sync while IMAP move is in flight
+        pub(super) pending_deletes: RefCell<HashSet<(i64, u32)>>,
     }
 
     #[glib::object_subclass]
@@ -2582,8 +2585,15 @@ impl NorthMailApplication {
                             account_id,
                             folder_path
                         );
-                        let message_infos: Vec<MessageInfo> =
-                            messages.iter().map(MessageInfo::from).collect();
+                        let pending = self.imp().pending_deletes.borrow();
+                        let message_infos: Vec<MessageInfo> = messages
+                            .iter()
+                            .map(MessageInfo::from)
+                            .filter(|m| !pending.contains(&(folder_id, m.uid)))
+                            .collect();
+                        if message_infos.is_empty() {
+                            return None;
+                        }
                         return Some((folder_id, message_infos));
                     }
                 }
@@ -2781,6 +2791,8 @@ impl NorthMailApplication {
         let account_id = account_id.to_string();
         let folder_path = folder_path.to_string();
         let messages: Vec<MessageInfo> = messages.to_vec();
+        // Snapshot pending deletes to filter out messages being moved/deleted
+        let pending = self.imp().pending_deletes.borrow().clone();
 
         // Run in background thread - fire and forget
         std::thread::spawn(move || {
@@ -2794,6 +2806,16 @@ impl NorthMailApplication {
                         return;
                     }
                 };
+
+                // Filter out messages with pending deletes
+                let messages: Vec<&MessageInfo> = messages
+                    .iter()
+                    .filter(|m| !pending.contains(&(folder_id, m.uid)))
+                    .collect();
+
+                if messages.is_empty() {
+                    return;
+                }
 
                 // Build batch of DbMessages
                 let db_messages: Vec<northmail_core::models::DbMessage> = messages
@@ -3635,20 +3657,35 @@ impl NorthMailApplication {
                         }
                     }
                     FetchEvent::FlagsUpdated(flags) => {
-                        // Save updated flags to cache for background streaming
+                        // FlagsUpdated contains ALL server UIDs - use for stale cleanup too
                         if let Some(db) = self.database() {
                             let db = db.clone();
                             let aid = account_id_ref.to_string();
+                            let server_uids: Vec<i64> = flags.iter().map(|&(uid, _, _)| uid as i64).collect();
                             std::thread::spawn(move || {
                                 let rt = tokio::runtime::Runtime::new().unwrap();
                                 rt.block_on(async {
                                     if let Ok(folder_id) = db.get_or_create_folder_id(&aid, "INBOX").await {
+                                        // Update flags
                                         match db.batch_update_flags(folder_id, &flags).await {
                                             Ok(updated) => {
                                                 tracing::info!("Background flags sync: updated {} cached messages for {}", updated, aid);
                                             }
                                             Err(e) => {
                                                 tracing::warn!("Background flags sync failed: {}", e);
+                                            }
+                                        }
+                                        // Clean up stale messages not on server anymore
+                                        if !server_uids.is_empty() {
+                                            match db.delete_messages_not_in_uids(folder_id, &server_uids).await {
+                                                Ok(deleted) => {
+                                                    if deleted > 0 {
+                                                        tracing::info!("Background cache cleanup: removed {} stale messages from INBOX for {}", deleted, aid);
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!("Background stale cleanup failed: {}", e);
+                                                }
                                             }
                                         }
                                     }
@@ -3715,6 +3752,8 @@ impl NorthMailApplication {
         let mut lowest_seq = 0u32;
         // Track all UIDs seen during sync for cache cleanup
         let mut synced_uids: Vec<i64> = Vec::new();
+        // Track resolved folder_id to avoid redundant blocking lookups
+        let mut sync_folder_id: Option<i64> = None;
 
         loop {
             // Check if this fetch is still valid (user hasn't switched folders)
@@ -3767,8 +3806,20 @@ impl NorthMailApplication {
                                 let _ = sender.send(result);
                             });
                             if let Ok(Ok(folder_id)) = receiver.recv_timeout(std::time::Duration::from_millis(500)) {
+                                sync_folder_id = Some(folder_id);
                                 for msg in &mut messages {
                                     msg.folder_id = folder_id;
+                                }
+                                // Filter out messages with pending deletes
+                                {
+                                    let pending = app.imp().pending_deletes.borrow();
+                                    if !pending.is_empty() {
+                                        let before = messages.len();
+                                        messages.retain(|m| !pending.contains(&(folder_id, m.uid)));
+                                        if messages.len() < before {
+                                            info!("Filtered {} pending-delete messages from IMAP batch", before - messages.len());
+                                        }
+                                    }
                                 }
                                 debug!("Updated {} messages with folder_id={}", messages.len(), folder_id);
                             }
@@ -4041,6 +4092,25 @@ impl NorthMailApplication {
                     }
                     FetchEvent::FullSyncDone { total_synced } => {
                         info!("Full sync complete for {}/{}: {} messages (tracked {} UIDs)", account_id, folder_path, total_synced, synced_uids.len());
+
+                        // Only clear pending deletes whose UIDs are gone from server
+                        // (i.e., NOT in synced_uids). If a UID is still in synced_uids,
+                        // the IMAP move hasn't completed yet — keep blocking re-insertion.
+                        if let Some(folder_id) = sync_folder_id {
+                            let mut pending = app.imp().pending_deletes.borrow_mut();
+                            let before = pending.len();
+                            pending.retain(|&(fid, uid)| {
+                                if fid != folder_id {
+                                    return true; // different folder, keep
+                                }
+                                // Only clear if UID is NOT on server anymore
+                                synced_uids.contains(&(uid as i64))
+                            });
+                            let cleared = before - pending.len();
+                            if cleared > 0 {
+                                info!("Cleared {} pending deletes (server confirmed removal)", cleared);
+                            }
+                        }
 
                         // Clean up stale messages from cache that no longer exist on server
                         if !synced_uids.is_empty() {
@@ -7253,7 +7323,7 @@ impl NorthMailApplication {
     }
 
     /// Archive a message (move to Archive folder)
-    pub fn archive_message(&self, message_id: i64, uid: u32, folder_id: i64) {
+    pub fn archive_message(&self, _message_id: i64, uid: u32, folder_id: i64) {
         info!("archive_message: uid={}, folder_id={}", uid, folder_id);
 
         // Use passed folder_id if valid, otherwise fall back to current folder
@@ -7268,6 +7338,9 @@ impl NorthMailApplication {
             return;
         }
 
+        // Mark as pending delete to prevent re-insertion from sync/cache
+        self.imp().pending_deletes.borrow_mut().insert((effective_folder_id, uid));
+
         // Resolve account and folder info
         let (account_id, source_folder) = match self.resolve_folder_info(effective_folder_id) {
             Some(info) => info,
@@ -7277,13 +7350,15 @@ impl NorthMailApplication {
             }
         };
 
-        // Delete from local database
+        // Delete from local database by folder_id + uid (reliable)
         if let Some(db) = self.database() {
             let db_clone = db.clone();
+            let fid = effective_folder_id;
+            let u = uid as i64;
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
-                    if let Err(e) = db_clone.delete_message(message_id).await {
+                    if let Err(e) = db_clone.delete_message_by_uid(fid, u).await {
                         error!("archive_message: Failed to delete from database: {}", e);
                     }
                 });
@@ -7295,7 +7370,7 @@ impl NorthMailApplication {
     }
 
     /// Move a message to spam folder
-    pub fn move_to_spam(&self, message_id: i64, uid: u32, folder_id: i64) {
+    pub fn move_to_spam(&self, _message_id: i64, uid: u32, folder_id: i64) {
         info!("move_to_spam: uid={}, folder_id={}", uid, folder_id);
 
         let effective_folder_id = if folder_id > 0 {
@@ -7309,6 +7384,9 @@ impl NorthMailApplication {
             return;
         }
 
+        // Mark as pending delete to prevent re-insertion from sync/cache
+        self.imp().pending_deletes.borrow_mut().insert((effective_folder_id, uid));
+
         let (account_id, source_folder) = match self.resolve_folder_info(effective_folder_id) {
             Some(info) => info,
             None => {
@@ -7317,13 +7395,15 @@ impl NorthMailApplication {
             }
         };
 
-        // Delete from local database
+        // Delete from local database by folder_id + uid (reliable)
         if let Some(db) = self.database() {
             let db_clone = db.clone();
+            let fid = effective_folder_id;
+            let u = uid as i64;
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
-                    if let Err(e) = db_clone.delete_message(message_id).await {
+                    if let Err(e) = db_clone.delete_message_by_uid(fid, u).await {
                         error!("move_to_spam: Failed to delete from database: {}", e);
                     }
                 });
@@ -7335,7 +7415,7 @@ impl NorthMailApplication {
     }
 
     /// Delete a message (move to Trash folder)
-    pub fn delete_message(&self, message_id: i64, uid: u32, folder_id: i64) {
+    pub fn delete_message(&self, _message_id: i64, uid: u32, folder_id: i64) {
         info!("delete_message: uid={}, folder_id={}", uid, folder_id);
 
         // Use passed folder_id if valid, otherwise fall back to current folder
@@ -7349,6 +7429,9 @@ impl NorthMailApplication {
             warn!("delete_message: Invalid folder_id {}", effective_folder_id);
             return;
         }
+
+        // Mark as pending delete to prevent re-insertion from sync/cache
+        self.imp().pending_deletes.borrow_mut().insert((effective_folder_id, uid));
 
         // Resolve account and folder info
         let (account_id, source_folder) = match self.resolve_folder_info(effective_folder_id) {
@@ -7373,12 +7456,14 @@ impl NorthMailApplication {
         let source_folder_clone = source_folder.clone();
 
         // Use std::thread with Tokio for database operations
+        let fid = effective_folder_id;
+        let u = uid as i64;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                // Delete from local database
-                if let Err(e) = db.delete_message(message_id).await {
+                // Delete from local database by folder_id + uid (reliable)
+                if let Err(e) = db.delete_message_by_uid(fid, u).await {
                     error!("delete_message: Failed to delete from database: {}", e);
                 }
 
@@ -7462,14 +7547,26 @@ impl NorthMailApplication {
             return false;
         }
 
-        // Delete from local database (it will be re-synced in the new folder)
+        // Use cached folder_id (non-blocking) to mark pending delete immediately
+        let cached_fid = self.cache_folder_id();
+        if cached_fid > 0 {
+            self.imp().pending_deletes.borrow_mut().insert((cached_fid, uid));
+        } else {
+            warn!("move_message_to_folder: No cached folder_id, pending delete not set for uid={}", uid);
+        }
+
+        // Delete from DB in background
         if let Some(db) = self.database() {
             let db_clone = db.clone();
+            let aid = source_account_id.to_string();
+            let fp = source_folder_path.to_string();
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
-                    if let Err(e) = db_clone.delete_message(message_id).await {
-                        error!("move_message_to_folder: Failed to delete from database: {}", e);
+                    if let Ok(folder_id) = db_clone.get_or_create_folder_id(&aid, &fp).await {
+                        if let Err(e) = db_clone.delete_message_by_uid(folder_id, uid as i64).await {
+                            error!("move_message_to_folder: Failed to delete from database: {}", e);
+                        }
                     }
                 });
             });

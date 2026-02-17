@@ -1014,6 +1014,17 @@ impl Database {
         Ok(())
     }
 
+    /// Delete a single message by folder_id and IMAP UID
+    /// More reliable than delete_message() since the UID is always known from IMAP
+    pub async fn delete_message_by_uid(&self, folder_id: i64, uid: i64) -> CoreResult<()> {
+        sqlx::query("DELETE FROM messages WHERE folder_id = ? AND uid = ?")
+            .bind(folder_id)
+            .bind(uid)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Delete messages by UID (for sync)
     pub async fn delete_messages_not_in_uids(
         &self,
