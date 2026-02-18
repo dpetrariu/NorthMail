@@ -257,10 +257,10 @@ mod imp {
                                         <child type="start">
                                             <object class="GtkBox">
                                                 <property name="orientation">horizontal</property>
-                                                <property name="spacing">2</property>
+                                                <property name="spacing">4</property>
                                                 <property name="margin-start">4</property>
                                                 <child>
-                                                    <object class="GtkImage">
+                                                    <object class="GtkImage" id="app_icon_image">
                                                         <property name="icon-name">org.northmail.NorthMail</property>
                                                         <property name="pixel-size">28</property>
                                                     </object>
@@ -341,6 +341,8 @@ mod imp {
         #[template_child]
         pub header_bar: TemplateChild<adw::HeaderBar>,
         #[template_child]
+        pub app_icon_image: TemplateChild<gtk4::Image>,
+        #[template_child]
         pub outer_paned: TemplateChild<gtk4::Paned>,
         /// Sidebar toggle button (created in setup_widgets)
         pub sidebar_toggle: std::cell::RefCell<Option<gtk4::ToggleButton>>,
@@ -394,6 +396,12 @@ mod imp {
     impl ObjectImpl for NorthMailWindow {
         fn constructed(&self) {
             self.parent_constructed();
+
+            // Set header bar icon based on user preference
+            let icon_settings = gio::Settings::new("org.northmail.NorthMail");
+            if icon_settings.string("app-icon") == "system" {
+                self.app_icon_image.set_icon_name(Some("email"));
+            }
 
             let obj = self.obj();
             obj.setup_widgets();

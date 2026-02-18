@@ -80,5 +80,15 @@
       <description>Whether to suppress all notifications.</description>
     </key>
 
+    <key name="app-icon" type="s">
+      <choices>
+        <choice value="custom"/>
+        <choice value="system"/>
+      </choices>
+      <default>'custom'</default>
+      <summary>App icon</summary>
+      <description>Which icon to use for the application: custom NorthMail icon or system email icon.</description>
+    </key>
+
   </schema>
 </schemalist>

@@ -403,6 +403,12 @@ mod imp {
             // Create or present the window
             let window = self.window.get_or_init(|| {
                 let win = NorthMailWindow::new(&app);
+
+                // Quit the application when the main window is closed
+                win.connect_close_request(move |_| {
+                    std::process::exit(0);
+                });
+
                 win.present();
                 win
             });
@@ -476,8 +482,14 @@ mod imp {
                     }
                 }
 
-                // Set the default window icon for all windows
-                gtk4::Window::set_default_icon_name("org.northmail.NorthMail");
+                // Set the default window icon based on user preference
+                let icon_settings = gio::Settings::new(APP_ID);
+                let icon_name = if icon_settings.string("app-icon") == "system" {
+                    "email"
+                } else {
+                    "org.northmail.NorthMail"
+                };
+                gtk4::Window::set_default_icon_name(icon_name);
             }
 
             let app = self.obj();
@@ -498,16 +510,25 @@ mod imp {
             let desktop_src = project_root.join("data").join("org.northmail.NorthMail.desktop");
             let desktop_dst_dir = home.join(".local/share/applications");
             let desktop_dst = desktop_dst_dir.join("org.northmail.NorthMail.desktop");
-            if desktop_src.exists() && !desktop_dst.exists() {
+            if desktop_src.exists() {
                 let _ = std::fs::create_dir_all(&desktop_dst_dir);
                 if let Ok(contents) = std::fs::read_to_string(&desktop_src) {
-                    // Rewrite Exec= to point to the dev binary
+                    // Determine which icon name to use from GSettings
+                    let icon_setting = gio::Settings::new(APP_ID);
+                    let desktop_icon = if icon_setting.string("app-icon") == "system" {
+                        "email"
+                    } else {
+                        "org.northmail.NorthMail"
+                    };
+                    // Rewrite Exec= and Icon= for the dev binary and icon preference
                     let exe = std::env::current_exe().unwrap_or_default();
                     let patched = contents
                         .lines()
                         .map(|line| {
                             if line.starts_with("Exec=") {
                                 format!("Exec={} %U", exe.display())
+                            } else if line.starts_with("Icon=") {
+                                format!("Icon={}", desktop_icon)
                             } else {
                                 line.to_string()
                             }
@@ -6808,7 +6829,7 @@ impl NorthMailApplication {
     fn show_about_dialog(&self) {
         let about = adw::AboutDialog::builder()
             .application_name("NorthMail")
-            .application_icon("mail-send-receive")
+            .application_icon("email")
             .developer_name("NorthMail Contributors")
             .version("0.1.0")
             .copyright("© 2024 NorthMail Contributors")
@@ -7033,7 +7054,100 @@ impl NorthMailApplication {
         });
 
         appearance_group.add(&theme_row);
+
+        // App Icon picker
+        let icon_picker_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+        icon_picker_box.set_halign(gtk4::Align::Center);
+        icon_picker_box.set_margin_top(8);
+        icon_picker_box.set_margin_bottom(8);
+
+        let make_icon_button = |icon_name: &str, label_text: &str| -> gtk4::ToggleButton {
+            let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+            vbox.set_halign(gtk4::Align::Center);
+
+            let image = gtk4::Image::from_icon_name(icon_name);
+            image.set_pixel_size(48);
+            vbox.append(&image);
+
+            let label = gtk4::Label::new(Some(label_text));
+            label.add_css_class("caption");
+            vbox.append(&label);
+
+            let button = gtk4::ToggleButton::new();
+            button.set_child(Some(&vbox));
+            button.add_css_class("flat");
+            button.set_size_request(100, -1);
+            button
+        };
+
+        let custom_btn = make_icon_button("org.northmail.NorthMail", "NorthMail");
+        let system_btn = make_icon_button("email", "System");
+        system_btn.set_group(Some(&custom_btn));
+
+        // Set initial state from GSettings
+        let icon_settings = self.settings();
+        let current_icon = icon_settings.string("app-icon");
+        if current_icon == "system" {
+            system_btn.set_active(true);
+        } else {
+            custom_btn.set_active(true);
+        }
+
+        // Restart banner (hidden until icon choice changes)
+        let restart_box = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        restart_box.set_halign(gtk4::Align::Center);
+        restart_box.set_margin_top(8);
+        restart_box.set_visible(false);
+
+        let restart_label = gtk4::Label::new(Some("Please restart for the changes to take effect."));
+        restart_label.add_css_class("dim-label");
+        restart_box.append(&restart_label);
+
+        let initial_icon = current_icon.to_string();
+        let restart_box_ref = restart_box.clone();
+        let settings_for_icon = self.settings();
+        system_btn.connect_toggled(move |btn| {
+            let (value, icon) = if btn.is_active() {
+                ("system", "email")
+            } else {
+                ("custom", "org.northmail.NorthMail")
+            };
+            let _ = settings_for_icon.set_string("app-icon", value);
+            gtk4::Window::set_default_icon_name(icon);
+            restart_box_ref.set_visible(value != initial_icon.as_str());
+
+            // Update desktop file immediately so GNOME has the right icon on next launch
+            if let Ok(home) = std::env::var("HOME") {
+                let desktop_path = std::path::PathBuf::from(&home)
+                    .join(".local/share/applications/org.northmail.NorthMail.desktop");
+                if let Ok(contents) = std::fs::read_to_string(&desktop_path) {
+                    let patched = contents
+                        .lines()
+                        .map(|line| {
+                            if line.starts_with("Icon=") {
+                                format!("Icon={}", icon)
+                            } else {
+                                line.to_string()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let _ = std::fs::write(&desktop_path, patched);
+                }
+            }
+        });
+
+        icon_picker_box.append(&custom_btn);
+        icon_picker_box.append(&system_btn);
+
+        let icon_group = adw::PreferencesGroup::builder()
+            .title("App Icon")
+            .build();
+        icon_group.add(&icon_picker_box);
+        icon_group.add(&restart_box);
+
         general_page.add(&appearance_group);
+        general_page.add(&icon_group);
 
         // Sync group
         let sync_group = adw::PreferencesGroup::builder()
