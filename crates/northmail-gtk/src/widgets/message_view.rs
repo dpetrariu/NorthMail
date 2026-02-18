@@ -5,6 +5,91 @@ use libadwaita as adw;
 #[cfg(feature = "webkit")]
 use webkit6::prelude::*;
 
+#[cfg(feature = "webkit")]
+use std::cell::RefCell as StdRefCell;
+
+/// Thread-local storage for HTML content to be served by the `northmail:` URI scheme handler.
+/// We set this before calling `load_uri()` and the scheme handler reads it.
+#[cfg(feature = "webkit")]
+thread_local! {
+    static PENDING_HTML: StdRefCell<String> = StdRefCell::new(String::new());
+}
+
+/// Ensure the `northmail` and `northmail-link` URI schemes are registered exactly once.
+#[cfg(feature = "webkit")]
+pub fn ensure_uri_schemes_registered() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        if let Some(ctx) = webkit6::WebContext::default() {
+            // Scheme for serving email HTML content
+            ctx.register_uri_scheme("northmail", |request| {
+                let html = PENDING_HTML.with(|cell| cell.borrow().clone());
+                let bytes = glib::Bytes::from(html.as_bytes());
+                let stream = gio::MemoryInputStream::from_bytes(&bytes);
+                request.finish(&stream, html.len() as i64, Some("text/html; charset=utf-8"));
+            });
+
+            // Scheme for intercepting link clicks — extract the real URL and open externally
+            ctx.register_uri_scheme("northmail-link", |request| {
+                if let Some(uri) = request.uri() {
+                    let uri_str: String = uri.into();
+                    // The real URL is encoded after "northmail-link://open?"
+                    if let Some(encoded) = uri_str.strip_prefix("northmail-link://open?") {
+                        let real_url = urlencoding::decode(encoded)
+                            .unwrap_or_else(|_| encoded.into())
+                            .into_owned();
+                        tracing::info!("Opening external link: {}", real_url);
+                        if let Err(e) = gtk4::gio::AppInfo::launch_default_for_uri(&real_url, gtk4::gio::AppLaunchContext::NONE) {
+                            tracing::warn!("launch_default_for_uri failed: {}, trying xdg-open", e);
+                            let _ = std::process::Command::new("xdg-open").arg(&real_url).spawn();
+                        }
+                    }
+                }
+                // Return an empty response to prevent navigation
+                let bytes = glib::Bytes::from(&[]);
+                let stream = gio::MemoryInputStream::from_bytes(&bytes);
+                request.finish(&stream, 0, Some("text/plain"));
+            });
+        }
+    });
+}
+
+/// Rewrite all `href` attributes in HTML so links go through our `northmail-link://` scheme,
+/// which opens them in the user's default browser instead of navigating inline.
+#[cfg(feature = "webkit")]
+pub fn rewrite_links_for_external_open(html: &str) -> String {
+    // Match href="..." or href='...' attributes
+    let re = regex::Regex::new(r##"(?i)href\s*=\s*"([^"]*)""##).unwrap();
+    let pass1 = re.replace_all(html, |caps: &regex::Captures| {
+        let url = &caps[1];
+        if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
+            let encoded = urlencoding::encode(url);
+            format!(r#"href="northmail-link://open?{}""#, encoded)
+        } else if url.starts_with('#') || url.is_empty() {
+            // Keep anchor links and empty hrefs as-is (they won't navigate away)
+            format!(r#"href="{}""#, url)
+        } else {
+            // For relative URLs or other schemes, just disable the link
+            "href=\"#\"".to_string()
+        }
+    });
+
+    // Also handle single-quoted hrefs
+    let re2 = regex::Regex::new(r#"(?i)href\s*=\s*'([^']*)'"#).unwrap();
+    re2.replace_all(&pass1, |caps: &regex::Captures| {
+        let url = &caps[1];
+        if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
+            let encoded = urlencoding::encode(url);
+            format!(r#"href='northmail-link://open?{}'"#, encoded)
+        } else if url.starts_with('#') || url.is_empty() {
+            format!(r#"href='{}'"#, url)
+        } else {
+            r#"href='#'"#.to_string()
+        }
+    }).into_owned()
+}
+
 mod imp {
     use super::*;
     use std::cell::RefCell;
@@ -573,6 +658,20 @@ impl MessageView {
             #[cfg(feature = "webkit")]
             {
                 if let Some(ref html) = message.html_body {
+                    ensure_uri_schemes_registered();
+
+                    // Rewrite all links to go through our northmail-link:// scheme
+                    // which opens them in the default browser
+                    let rewritten_html = rewrite_links_for_external_open(html);
+
+                    // Log a snippet so we can verify links were rewritten
+                    if let Some(pos) = rewritten_html.find("northmail-link://") {
+                        let snippet_end = (pos + 80).min(rewritten_html.len());
+                        tracing::info!("Links rewritten OK, sample: {}", &rewritten_html[pos..snippet_end]);
+                    } else {
+                        tracing::warn!("No links were rewritten in this email HTML ({} bytes)", html.len());
+                    }
+
                     let webview = webkit6::WebView::new();
                     webview.set_vexpand(true);
                     webview.set_hexpand(true);
@@ -581,8 +680,10 @@ impl MessageView {
                     let settings: webkit6::Settings = webkit6::prelude::WebViewExt::settings(&webview).unwrap();
                     settings.set_enable_javascript(false);  // Security: no JS in emails
                     settings.set_auto_load_images(true);
+                    settings.set_enable_developer_extras(true);  // Allow Web Inspector for debugging
 
-                    webview.load_html(html, None);
+                    // Load HTML directly — no custom URI scheme needed for the content itself
+                    webview.load_html(&rewritten_html, None);
                     content_box.append(&webview);
                     return;
                 }

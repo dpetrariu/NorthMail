@@ -422,6 +422,123 @@ glib::wrapper! {
         @implements gio::ActionGroup, gio::ActionMap;
 }
 
+/// Check if a GtkTextBuffer has any formatting tags applied.
+fn buffer_has_tags(buffer: &gtk4::TextBuffer) -> bool {
+    let (start, end) = buffer.bounds();
+    let mut iter = start;
+    while iter < end {
+        if !iter.tags().is_empty() {
+            return true;
+        }
+        iter.forward_char();
+    }
+    false
+}
+
+/// Convert a GtkTextBuffer with formatting tags into HTML.
+/// Returns the HTML body string (without <html>/<body> wrappers — just inline content).
+fn buffer_to_html(buffer: &gtk4::TextBuffer) -> String {
+    let (start, end) = buffer.bounds();
+    if start == end {
+        return String::new();
+    }
+
+    let mut html = String::new();
+    let mut iter = start;
+
+    // Track which tags are currently open
+    let mut open_tags: Vec<String> = Vec::new();
+
+    while iter < end {
+        // Get tags at this position
+        let tags_here: Vec<String> = iter.tags().iter()
+            .filter_map(|t| t.name().map(|n| n.to_string()))
+            .collect();
+
+        // Close tags that are no longer active (in reverse order)
+        let mut i = open_tags.len();
+        while i > 0 {
+            i -= 1;
+            if !tags_here.contains(&open_tags[i]) {
+                let closing = tag_to_html_close(&open_tags[i]);
+                html.push_str(&closing);
+                open_tags.remove(i);
+            }
+        }
+
+        // Open new tags
+        for tag_name in &tags_here {
+            if !open_tags.contains(tag_name) {
+                let opening = tag_to_html_open(tag_name);
+                html.push_str(&opening);
+                open_tags.push(tag_name.clone());
+            }
+        }
+
+        // Append the character (HTML-escaped)
+        let ch = iter.char();
+        match ch {
+            '<' => html.push_str("&lt;"),
+            '>' => html.push_str("&gt;"),
+            '&' => html.push_str("&amp;"),
+            '\n' => html.push_str("<br>"),
+            _ => html.push(ch),
+        }
+
+        iter.forward_char();
+    }
+
+    // Close remaining open tags
+    for tag_name in open_tags.iter().rev() {
+        html.push_str(&tag_to_html_close(tag_name));
+    }
+
+    html
+}
+
+fn tag_to_html_open(tag_name: &str) -> String {
+    match tag_name {
+        "bold" => "<b>".to_string(),
+        "italic" => "<i>".to_string(),
+        "underline" => "<u>".to_string(),
+        "strikethrough" => "<s>".to_string(),
+        "align-center" => "<div style=\"text-align:center\">".to_string(),
+        "align-right" => "<div style=\"text-align:right\">".to_string(),
+        "align-left" => "<div style=\"text-align:left\">".to_string(),
+        name if name.starts_with("font-") => {
+            let family = match &name[5..] {
+                "sans" => "sans-serif",
+                "serif" => "serif",
+                "monospace" => "monospace",
+                "cantarell" => "Cantarell, sans-serif",
+                "dejavu-sans" => "DejaVu Sans, sans-serif",
+                other => other,
+            };
+            format!("<span style=\"font-family:{}\">", family)
+        }
+        name if name.starts_with("size-") => {
+            if let Ok(pts) = name[5..].parse::<u32>() {
+                format!("<span style=\"font-size:{}pt\">", pts)
+            } else {
+                String::new()
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+fn tag_to_html_close(tag_name: &str) -> String {
+    match tag_name {
+        "bold" => "</b>".to_string(),
+        "italic" => "</i>".to_string(),
+        "underline" => "</u>".to_string(),
+        "strikethrough" => "</s>".to_string(),
+        "align-center" | "align-right" | "align-left" => "</div>".to_string(),
+        name if name.starts_with("font-") || name.starts_with("size-") => "</span>".to_string(),
+        _ => String::new(),
+    }
+}
+
 impl NorthMailWindow {
     pub fn new(app: &NorthMailApplication) -> Self {
         glib::Object::builder()
@@ -2169,11 +2286,72 @@ impl NorthMailWindow {
             #[cfg(feature = "webkit")]
             {
                 use webkit6::prelude::WebViewExt;
-                let web_view = webkit6::WebView::new();
+
+                /// Strip `<script>` tags and inline JS event handlers from email HTML
+                /// to prevent malicious JS execution while keeping our UserScript active.
+                fn sanitize_email_html(html: &str) -> String {
+                    // Remove <script>...</script> blocks (including multiline)
+                    let re_script = regex::Regex::new(r"(?is)<script[\s>].*?</script>").unwrap();
+                    let pass1 = re_script.replace_all(html, "");
+                    // Remove inline event handlers: on*="..." or on*='...'
+                    let re_on = regex::Regex::new(r#"(?i)\s+on\w+\s*=\s*(?:"[^"]*"|'[^']*')"#).unwrap();
+                    let pass2 = re_on.replace_all(&pass1, "");
+                    // Remove javascript: hrefs
+                    let re_js_href = regex::Regex::new(r##"(?i)href\s*=\s*(?:"javascript:[^"]*"|'javascript:[^']*')"##).unwrap();
+                    re_js_href.replace_all(&pass2, "href=\"#\"").into_owned()
+                }
+
+                // Set up a UserContentManager to intercept link clicks via JS message handler
+                let ucm = webkit6::UserContentManager::new();
+
+                // Register a message handler named "linkClicked"
+                ucm.register_script_message_handler("linkClicked", None);
+
+                // When JS sends a message, open the URL in the default browser
+                ucm.connect_script_message_received(Some("linkClicked"), |_ucm, js_value| {
+                    let uri = js_value.to_string();
+                    eprintln!("[LINK] JS message received, raw value: {}", uri);
+                    let uri = uri.trim();
+                    if uri.starts_with("http://") || uri.starts_with("https://") || uri.starts_with("mailto:") {
+                        eprintln!("[LINK] Opening in browser: {}", uri);
+                        if let Err(e) = gtk4::gio::AppInfo::launch_default_for_uri(uri, gtk4::gio::AppLaunchContext::NONE) {
+                            eprintln!("[LINK] launch_default_for_uri failed: {}, trying xdg-open", e);
+                            let _ = std::process::Command::new("xdg-open").arg(uri).spawn();
+                        }
+                    } else {
+                        eprintln!("[LINK] Ignoring non-http URI: {}", uri);
+                    }
+                });
+
+                // Inject a script that intercepts all link clicks
+                let click_interceptor = webkit6::UserScript::new(
+                    r#"
+                    document.addEventListener('click', function(e) {
+                        var el = e.target;
+                        while (el && el.tagName !== 'A') {
+                            el = el.parentElement;
+                        }
+                        if (el && el.href) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            window.webkit.messageHandlers.linkClicked.postMessage(el.href);
+                        }
+                    }, true);
+                    "#,
+                    webkit6::UserContentInjectedFrames::AllFrames,
+                    webkit6::UserScriptInjectionTime::End,
+                    &[],
+                    &[],
+                );
+                ucm.add_script(&click_interceptor);
+
+                let web_view = webkit6::WebView::builder()
+                    .user_content_manager(&ucm)
+                    .build();
                 web_view.set_vexpand(true);
                 web_view.set_hexpand(true);
                 if let Some(settings) = WebViewExt::settings(&web_view) {
-                    settings.set_enable_javascript(false);
+                    settings.set_enable_javascript(true);  // Needed for our click interceptor
                     settings.set_auto_load_images(true);
                     settings.set_allow_modal_dialogs(false);
                     settings.set_enable_html5_database(false);
@@ -2196,7 +2374,11 @@ impl NorthMailWindow {
                     text_view.buffer().set_text(&text);
                     body_box_crash.append(&text_view);
                 });
-                web_view.load_html(&html, None);
+                // Sanitize: strip <script> tags and inline JS event handlers from email HTML
+                // Our UserScript (click interceptor) still runs via UserContentManager
+                let sanitized_html = sanitize_email_html(&html);
+                eprintln!("[LINK] Loading HTML with JS click interceptor ({} bytes)", sanitized_html.len());
+                web_view.load_html(&sanitized_html, None);
                 body_box.append(&web_view);
             }
             #[cfg(not(feature = "webkit"))]
@@ -3590,6 +3772,14 @@ impl NorthMailWindow {
                         let (start, end) = buf.bounds();
                         buf.text(&start, &end, false).to_string()
                     };
+                    let html_body = {
+                        let buf = text_view_timer.buffer();
+                        if buffer_has_tags(&buf) {
+                            Some(buffer_to_html(&buf))
+                        } else {
+                            None
+                        }
+                    };
 
                     // Only save if there's content in subject or body
                     if subject.trim().is_empty() && body.trim().is_empty() {
@@ -3638,6 +3828,9 @@ impl NorthMailWindow {
                         }
                     }
                     msg = msg.text(&body);
+                    if let Some(ref html) = html_body {
+                        msg = msg.html(html);
+                    }
 
                     // Include attachments
                     for (filename, mime_type, data, _path) in attachments_timer.borrow().iter() {
@@ -3823,10 +4016,14 @@ impl NorthMailWindow {
             let cc_list = cc_chips.borrow().clone();
             let bcc_list = bcc_chips_send.borrow().clone();
             let subject = subject_entry.text().to_string();
-            let body = {
+            let (body, html_body) = {
                 let buf = text_view.buffer();
                 let (start, end) = buf.bounds();
-                buf.text(&start, &end, false).to_string()
+                let plain = buf.text(&start, &end, false).to_string();
+                let html = buffer_to_html(&buf);
+                // Only include HTML if formatting tags were actually used
+                let has_formatting = buffer_has_tags(&buf);
+                (plain, if has_formatting { Some(html) } else { None })
             };
 
             // Collect attachments: (filename, mime_type, data)
@@ -3866,6 +4063,7 @@ impl NorthMailWindow {
                         bcc_list,
                         subject,
                         body,
+                        html_body,
                         att_list,
                         (*reply_in_reply_to).clone(),
                         (*reply_references).clone(),

@@ -776,6 +776,14 @@ impl MessageList {
         }
     }
 
+    /// Focus the search entry
+    pub fn focus_search(&self) {
+        let imp = self.imp();
+        if let Some(entry) = imp.search_entry.borrow().as_ref() {
+            entry.grab_focus();
+        }
+    }
+
     /// Show or hide load more capability (with infinite scroll)
     pub fn set_can_load_more(&self, can_load: bool) {
         tracing::info!("set_can_load_more({})", can_load);

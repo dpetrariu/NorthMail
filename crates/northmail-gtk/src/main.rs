@@ -21,19 +21,19 @@ fn main() {
 
     tracing::info!("Starting NorthMail");
 
-    // Set GSettings schema directory for development builds
-    // This must happen before any GSettings are accessed
+    // Set GSettings schema directory for development builds.
+    // This must happen before any GSettings are accessed.
+    // For installed/Flatpak builds, the schema is in the system path and this is skipped.
     if std::env::var("GSETTINGS_SCHEMA_DIR").is_err() {
-        if let Ok(exe) = std::env::current_exe() {
-            // Check if running from target/debug or target/release
-            if let Some(target_dir) = exe.parent() {
-                if let Some(project_root) = target_dir.parent().and_then(|p| p.parent()) {
-                    let schema_dir = project_root.join("data");
-                    if schema_dir.join("gschemas.compiled").exists() {
-                        std::env::set_var("GSETTINGS_SCHEMA_DIR", &schema_dir);
-                        tracing::debug!("Set GSETTINGS_SCHEMA_DIR to {:?}", schema_dir);
-                    }
-                }
+        // CARGO_MANIFEST_DIR is embedded at compile time — always points to the crate source dir
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // crates/northmail-gtk -> project root
+        let project_root = manifest_dir.parent().and_then(|p| p.parent());
+        if let Some(root) = project_root {
+            let schema_dir = root.join("data");
+            if schema_dir.join("gschemas.compiled").exists() {
+                std::env::set_var("GSETTINGS_SCHEMA_DIR", &schema_dir);
+                tracing::debug!("Set GSETTINGS_SCHEMA_DIR to {:?}", schema_dir);
             }
         }
     }

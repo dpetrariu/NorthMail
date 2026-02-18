@@ -7467,6 +7467,7 @@ impl NorthMailApplication {
         bcc: Vec<String>,
         subject: String,
         body: String,
+        html_body: Option<String>,
         attachments: Vec<(String, String, Vec<u8>)>, // (filename, mime_type, data)
         in_reply_to: Option<String>,
         references: Vec<String>,
@@ -7525,6 +7526,9 @@ impl NorthMailApplication {
             msg = msg.bcc(addr);
         }
         msg = msg.text(&body);
+        if let Some(ref html) = html_body {
+            msg = msg.html(html);
+        }
         if let Some(ref reply_id) = in_reply_to {
             msg = msg.reply_to_message(reply_id);
         }
@@ -7748,6 +7752,7 @@ impl NorthMailApplication {
                                         &graph_id,
                                         &msg.subject,
                                         msg.text_body.as_deref().unwrap_or(""),
+                                        msg.html_body.as_deref(),
                                         &to_filtered,
                                         &cc_filtered,
                                     )
@@ -7770,6 +7775,7 @@ impl NorthMailApplication {
                             client.create_draft_from_message(
                                 &msg.subject,
                                 msg.text_body.as_deref().unwrap_or(""),
+                                msg.html_body.as_deref(),
                                 &to_filtered,
                                 &cc_filtered,
                                 &attachments,

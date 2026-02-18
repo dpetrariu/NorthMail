@@ -5,6 +5,7 @@ members = [
     "crates/northmail-imap",
     "crates/northmail-smtp",
     "crates/northmail-auth",
+    "crates/northmail-graph",
     "crates/northmail-gtk",
 ]
 
@@ -61,7 +62,7 @@ url = "2"
 rand = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 async-std = { version = "1.12", features = ["attributes"] }
 
 # Desktop notifications
@@ -72,3 +73,4 @@ northmail-core = { path = "crates/northmail-core" }
 northmail-imap = { path = "crates/northmail-imap" }
 northmail-smtp = { path = "crates/northmail-smtp" }
 northmail-auth = { path = "crates/northmail-auth" }
+northmail-graph = { path = "crates/northmail-graph" }

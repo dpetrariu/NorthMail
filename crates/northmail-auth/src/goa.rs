@@ -7,6 +7,7 @@
 //! - Provides a consistent user experience
 
 use crate::{AuthError, AuthResult};
+use futures::stream::StreamExt;
 use tracing::{debug, info, warn};
 use zbus::{proxy, Connection};
 use zbus::zvariant::ObjectPath;
@@ -84,6 +85,15 @@ pub enum GoaAuthType {
     Password,
     /// Unknown/unsupported
     Unknown,
+}
+
+/// Events emitted when GOA accounts change at runtime
+#[derive(Debug, Clone)]
+pub enum GoaAccountEvent {
+    /// An account with Mail interface was added
+    AccountAdded,
+    /// An account with Mail interface was removed
+    AccountRemoved,
 }
 
 /// Represents a mail-enabled GOA account
@@ -344,5 +354,71 @@ impl GoaManager {
 
         debug!("Got password for account {}", account_id);
         Ok(password)
+    }
+
+    /// Watch for GOA account additions and removals via D-Bus signals.
+    ///
+    /// This opens its own session bus connection (suitable for a background thread)
+    /// and listens for ObjectManager InterfacesAdded/InterfacesRemoved signals.
+    /// Events are sent through `tx` when a mail-enabled account changes.
+    pub async fn watch_account_changes(
+        tx: std::sync::mpsc::Sender<GoaAccountEvent>,
+    ) -> AuthResult<()> {
+        let conn = Connection::session()
+            .await
+            .map_err(|e| AuthError::DbusError(e.to_string()))?;
+
+        let object_manager = zbus::fdo::ObjectManagerProxy::builder(&conn)
+            .destination("org.gnome.OnlineAccounts")
+            .map_err(|e| AuthError::DbusError(e.to_string()))?
+            .path("/org/gnome/OnlineAccounts")
+            .map_err(|e| AuthError::DbusError(e.to_string()))?
+            .build()
+            .await
+            .map_err(|e| AuthError::DbusError(e.to_string()))?;
+
+        let added_stream = object_manager
+            .receive_interfaces_added()
+            .await
+            .map_err(|e| AuthError::DbusError(e.to_string()))?;
+
+        let removed_stream = object_manager
+            .receive_interfaces_removed()
+            .await
+            .map_err(|e| AuthError::DbusError(e.to_string()))?;
+
+        // Map both streams to a common type
+        let added = added_stream.map(|signal| {
+            let has_mail = signal
+                .args()
+                .map(|a| a.interfaces_and_properties().contains_key("org.gnome.OnlineAccounts.Mail"))
+                .unwrap_or(false);
+            (GoaAccountEvent::AccountAdded, has_mail)
+        });
+        let removed = removed_stream.map(|signal| {
+            let has_mail = signal
+                .args()
+                .map(|a| {
+                    let mail_iface = zbus::names::InterfaceName::try_from("org.gnome.OnlineAccounts.Mail").unwrap();
+                    a.interfaces().contains(&mail_iface)
+                })
+                .unwrap_or(false);
+            (GoaAccountEvent::AccountRemoved, has_mail)
+        });
+        let mut merged = futures::stream::select(added, removed);
+
+        info!("GOA account watcher started, listening for changes...");
+
+        while let Some((event, has_mail)) = merged.next().await {
+            if has_mail {
+                info!("GOA account change detected: {:?}", event);
+                if tx.send(event).is_err() {
+                    info!("GOA watcher channel closed, stopping");
+                    break;
+                }
+            }
+        }
+
+        Ok(())
     }
 }

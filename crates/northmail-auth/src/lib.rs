@@ -11,7 +11,7 @@ mod secrets;
 mod xoauth2;
 
 pub use error::{AuthError, AuthResult};
-pub use goa::{GoaAccount, GoaAuthType, GoaManager};
+pub use goa::{GoaAccount, GoaAccountEvent, GoaAuthType, GoaManager};
 pub use oauth2::{OAuth2Config, OAuth2Flow, OAuth2Provider, TokenPair};
 pub use secrets::SecretStore;
 pub use xoauth2::XOAuth2Token;

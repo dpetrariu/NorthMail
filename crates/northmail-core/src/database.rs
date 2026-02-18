@@ -3,7 +3,7 @@
 use crate::{CoreError, CoreResult};
 use sqlx::{sqlite::SqlitePoolOptions, Pool, Row, Sqlite};
 use std::path::Path;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Prepare a user query for FTS5 search with prefix matching
 /// Transforms "jenni smith" → "jenni* smith*" for partial word matching
@@ -51,6 +51,7 @@ pub struct AttachmentMetadata {
     pub size: i64,
     pub content_id: Option<String>,
     pub is_inline: bool,
+    pub data: Option<Vec<u8>>,
 }
 
 /// Attachment info for saving (without id)
@@ -61,6 +62,7 @@ pub struct AttachmentInfo {
     pub size: usize,
     pub content_id: Option<String>,
     pub is_inline: bool,
+    pub data: Vec<u8>,
 }
 
 /// Database message record
@@ -304,6 +306,9 @@ impl Database {
         // Migration: Add cc_addresses column if it doesn't exist
         self.migrate_add_cc_addresses().await?;
 
+        // Migration: Add graph_folder_id and graph_message_id columns
+        self.migrate_add_graph_ids().await?;
+
         // Migration: Rebuild FTS index to ensure all messages are indexed
         self.migrate_rebuild_fts().await?;
 
@@ -321,14 +326,22 @@ impl Database {
         if result.is_err() {
             // Columns don't exist, add them
             debug!("Migrating database: adding body_text and body_html columns");
-            sqlx::query("ALTER TABLE messages ADD COLUMN body_text TEXT")
+            if let Err(e) = sqlx::query("ALTER TABLE messages ADD COLUMN body_text TEXT")
                 .execute(&self.pool)
                 .await
-                .ok(); // Ignore error if column already exists
-            sqlx::query("ALTER TABLE messages ADD COLUMN body_html TEXT")
+            {
+                if !e.to_string().contains("duplicate column") {
+                    warn!("Migration error adding body_text column: {}", e);
+                }
+            }
+            if let Err(e) = sqlx::query("ALTER TABLE messages ADD COLUMN body_html TEXT")
                 .execute(&self.pool)
                 .await
-                .ok();
+            {
+                if !e.to_string().contains("duplicate column") {
+                    warn!("Migration error adding body_html column: {}", e);
+                }
+            }
         }
 
         Ok(())
@@ -342,15 +355,21 @@ impl Database {
 
         if result.is_err() {
             debug!("Migrating database: adding date_epoch column");
-            sqlx::query("ALTER TABLE messages ADD COLUMN date_epoch INTEGER")
+            if let Err(e) = sqlx::query("ALTER TABLE messages ADD COLUMN date_epoch INTEGER")
                 .execute(&self.pool)
                 .await
-                .ok();
+            {
+                if !e.to_string().contains("duplicate column") {
+                    warn!("Migration error adding date_epoch column: {}", e);
+                }
+            }
             // Create index for sorting
-            sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_date_epoch ON messages(date_epoch DESC)")
+            if let Err(e) = sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_date_epoch ON messages(date_epoch DESC)")
                 .execute(&self.pool)
                 .await
-                .ok();
+            {
+                warn!("Migration error creating date_epoch index: {}", e);
+            }
         }
 
         Ok(())
@@ -364,10 +383,70 @@ impl Database {
 
         if result.is_err() {
             debug!("Migrating database: adding cc_addresses column");
-            sqlx::query("ALTER TABLE messages ADD COLUMN cc_addresses TEXT")
+            if let Err(e) = sqlx::query("ALTER TABLE messages ADD COLUMN cc_addresses TEXT")
                 .execute(&self.pool)
                 .await
-                .ok();
+            {
+                if !e.to_string().contains("duplicate column") {
+                    warn!("Migration error adding cc_addresses column: {}", e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Add graph_folder_id and graph_message_id columns for Microsoft Graph API support
+    async fn migrate_add_graph_ids(&self) -> CoreResult<()> {
+        // Check if graph_folder_id column exists on folders
+        let result = sqlx::query("SELECT graph_folder_id FROM folders LIMIT 1")
+            .fetch_optional(&self.pool)
+            .await;
+
+        if result.is_err() {
+            debug!("Migrating database: adding graph_folder_id column to folders");
+            if let Err(e) = sqlx::query("ALTER TABLE folders ADD COLUMN graph_folder_id TEXT")
+                .execute(&self.pool)
+                .await
+            {
+                if !e.to_string().contains("duplicate column") {
+                    warn!("Migration error adding graph_folder_id column: {}", e);
+                }
+            }
+        }
+
+        // Check if graph_message_id column exists on messages
+        let result = sqlx::query("SELECT graph_message_id FROM messages LIMIT 1")
+            .fetch_optional(&self.pool)
+            .await;
+
+        if result.is_err() {
+            debug!("Migrating database: adding graph_message_id column to messages");
+            if let Err(e) = sqlx::query("ALTER TABLE messages ADD COLUMN graph_message_id TEXT")
+                .execute(&self.pool)
+                .await
+            {
+                if !e.to_string().contains("duplicate column") {
+                    warn!("Migration error adding graph_message_id column: {}", e);
+                }
+            }
+            // Create index for graph_message_id lookups
+            if let Err(e) = sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_graph_id ON messages(graph_message_id)")
+                .execute(&self.pool)
+                .await
+            {
+                warn!("Migration error creating graph_message_id index: {}", e);
+            }
+        }
+
+        // Migration: add data BLOB column to attachments table
+        if let Err(e) = sqlx::query("ALTER TABLE attachments ADD COLUMN data BLOB")
+            .execute(&self.pool)
+            .await
+        {
+            if !e.to_string().contains("duplicate column") {
+                warn!("Migration error adding data column to attachments: {}", e);
+            }
         }
 
         Ok(())
@@ -395,10 +474,12 @@ impl Database {
 
             // Rebuild FTS index by re-inserting all messages
             // First delete all FTS entries
-            sqlx::query("DELETE FROM messages_fts")
+            if let Err(e) = sqlx::query("DELETE FROM messages_fts")
                 .execute(&self.pool)
                 .await
-                .ok();
+            {
+                warn!("Failed to clear FTS index: {}", e);
+            }
 
             // Then repopulate from messages table
             sqlx::query(
@@ -582,6 +663,185 @@ impl Database {
         .await?;
 
         Ok(())
+    }
+
+    /// Upsert a folder with Graph API folder ID
+    pub async fn upsert_folder_graph(
+        &self,
+        account_id: &str,
+        name: &str,
+        full_path: &str,
+        folder_type: &str,
+        message_count: Option<i64>,
+        unread_count: Option<i64>,
+        graph_folder_id: &str,
+    ) -> CoreResult<i64> {
+        let id = self
+            .upsert_folder_with_counts(
+                account_id,
+                name,
+                full_path,
+                folder_type,
+                message_count,
+                unread_count,
+            )
+            .await?;
+
+        // Update the graph_folder_id
+        sqlx::query("UPDATE folders SET graph_folder_id = ? WHERE id = ?")
+            .bind(graph_folder_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(id)
+    }
+
+    /// Get graph_message_id for a message by folder_id and uid
+    pub async fn get_graph_message_id(&self, folder_id: i64, uid: i64) -> CoreResult<Option<String>> {
+        let result = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT graph_message_id FROM messages WHERE folder_id = ? AND uid = ?",
+        )
+        .bind(folder_id)
+        .bind(uid)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(result.flatten())
+    }
+
+    /// Get graph_folder_id for a folder by its DB id
+    pub async fn get_graph_folder_id(&self, folder_id: i64) -> CoreResult<Option<String>> {
+        let result = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT graph_folder_id FROM folders WHERE id = ?",
+        )
+        .bind(folder_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(result.flatten())
+    }
+
+    /// Upsert a message with a Graph message ID
+    pub async fn upsert_message_graph(
+        &self,
+        folder_id: i64,
+        msg: &DbMessage,
+        graph_message_id: &str,
+    ) -> CoreResult<i64> {
+        let id = self.upsert_message(folder_id, msg).await?;
+
+        sqlx::query("UPDATE messages SET graph_message_id = ? WHERE id = ?")
+            .bind(graph_message_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(id)
+    }
+
+    /// Batch upsert messages with Graph message IDs
+    pub async fn upsert_messages_batch_graph(
+        &self,
+        folder_id: i64,
+        messages: &[(DbMessage, String)], // (message, graph_message_id)
+    ) -> CoreResult<usize> {
+        let mut tx = self.pool.begin().await?;
+        let mut count = 0;
+
+        for (msg, graph_id) in messages {
+            let result = sqlx::query(
+                r#"
+                INSERT INTO messages (
+                    folder_id, uid, message_id, subject, from_address, from_name,
+                    to_addresses, cc_addresses, date_sent, date_epoch, snippet, is_read, is_starred,
+                    has_attachments, size, maildir_path, graph_message_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(folder_id, uid) DO UPDATE SET
+                    message_id = excluded.message_id,
+                    subject = excluded.subject,
+                    from_address = excluded.from_address,
+                    from_name = excluded.from_name,
+                    to_addresses = excluded.to_addresses,
+                    cc_addresses = excluded.cc_addresses,
+                    date_sent = excluded.date_sent,
+                    date_epoch = excluded.date_epoch,
+                    snippet = excluded.snippet,
+                    is_read = excluded.is_read,
+                    is_starred = excluded.is_starred,
+                    has_attachments = excluded.has_attachments,
+                    size = excluded.size,
+                    maildir_path = excluded.maildir_path,
+                    graph_message_id = excluded.graph_message_id,
+                    updated_at = datetime('now')
+                "#,
+            )
+            .bind(folder_id)
+            .bind(msg.uid)
+            .bind(&msg.message_id)
+            .bind(&msg.subject)
+            .bind(&msg.from_address)
+            .bind(&msg.from_name)
+            .bind(&msg.to_addresses)
+            .bind(&msg.cc_addresses)
+            .bind(&msg.date_sent)
+            .bind(msg.date_epoch)
+            .bind(&msg.snippet)
+            .bind(msg.is_read)
+            .bind(msg.is_starred)
+            .bind(msg.has_attachments)
+            .bind(msg.size)
+            .bind(&msg.maildir_path)
+            .bind(graph_id)
+            .execute(&mut *tx)
+            .await;
+
+            match result {
+                Ok(_) => count += 1,
+                Err(e) => {
+                    tracing::warn!("Failed to upsert graph message uid={}: {}", msg.uid, e);
+                }
+            }
+        }
+
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// Look up the Graph message ID for a message by its UID hash
+    pub async fn get_graph_message_id_by_uid(&self, uid: i64) -> CoreResult<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT graph_message_id FROM messages WHERE uid = ? AND graph_message_id IS NOT NULL LIMIT 1",
+        )
+        .bind(uid)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    /// Look up the Graph message ID for a message by account, folder, and UID
+    pub async fn get_graph_message_id_for_folder_uid(
+        &self,
+        account_id: &str,
+        folder_path: &str,
+        uid: i64,
+    ) -> CoreResult<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            r#"
+            SELECT m.graph_message_id FROM messages m
+            JOIN folders f ON m.folder_id = f.id
+            WHERE f.account_id = ? AND f.full_path = ? AND m.uid = ?
+            AND m.graph_message_id IS NOT NULL
+            LIMIT 1
+            "#,
+        )
+        .bind(account_id)
+        .bind(folder_path)
+        .bind(uid)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.0))
     }
 
     /// Insert or update messages in a batch (wrapped in a transaction for performance)
@@ -796,7 +1056,7 @@ impl Database {
         };
 
         let attachments = sqlx::query_as::<_, AttachmentMetadata>(
-            "SELECT id, message_id, filename, mime_type, size, content_id, is_inline FROM attachments WHERE message_id = ?",
+            "SELECT id, message_id, filename, mime_type, size, content_id, is_inline, data FROM attachments WHERE message_id = ?",
         )
         .bind(message_id)
         .fetch_all(&self.pool)
@@ -835,8 +1095,8 @@ impl Database {
         for att in attachments {
             sqlx::query(
                 r#"
-                INSERT INTO attachments (message_id, filename, mime_type, size, content_id, is_inline)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO attachments (message_id, filename, mime_type, size, content_id, is_inline, data)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(message_id)
@@ -845,6 +1105,7 @@ impl Database {
             .bind(att.size as i64)
             .bind(&att.content_id)
             .bind(att.is_inline)
+            .bind(if att.data.is_empty() { None } else { Some(&att.data) })
             .execute(&self.pool)
             .await?;
         }

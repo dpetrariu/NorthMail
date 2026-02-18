@@ -288,6 +288,17 @@ fn idle_worker_loop(
                         break; // Reconnect
                     }
                     Err(e) => {
+                        let err_msg = e.to_string();
+                        // Detect IDLE not supported: server responds with BAD/NO
+                        // instead of '+' continuation
+                        if err_msg.contains("Expected '+' continuation") {
+                            warn!("IDLE not supported by server for {}: {}", account_id, err_msg);
+                            let _ = event_tx.send(IdleManagerEvent::NotSupported {
+                                account_id: account_id.clone(),
+                            });
+                            let _ = client.logout().await;
+                            return; // Stop entirely - don't reconnect
+                        }
                         error!("IDLE error for {}: {}", account_id, e);
                         let _ = event_tx.send(IdleManagerEvent::ConnectionLost {
                             account_id: account_id.clone(),
