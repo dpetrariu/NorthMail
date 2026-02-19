@@ -150,9 +150,20 @@ impl ImapClient {
             let attributes: Vec<String> = mailbox
                 .attributes()
                 .iter()
-                .map(|a| format!("{:?}", a))
+                .map(|a| {
+                    use async_imap::types::NameAttribute;
+                    match a {
+                        NameAttribute::NoInferiors => "\\Noinferiors".to_string(),
+                        NameAttribute::NoSelect => "\\Noselect".to_string(),
+                        NameAttribute::Marked => "\\Marked".to_string(),
+                        NameAttribute::Unmarked => "\\Unmarked".to_string(),
+                        NameAttribute::Extension(ext) => ext.to_string(),
+                        other => format!("{:?}", other),
+                    }
+                })
                 .collect();
 
+            debug!("LIST folder: {} attrs={:?}", mailbox.name(), &attributes);
             folders.push(Folder::new(
                 name,
                 mailbox.name().to_string(),
@@ -161,6 +172,7 @@ impl ImapClient {
             ));
         }
 
+        FolderType::deduplicate_folder_types(&mut folders);
         debug!("Found {} folders", folders.len());
         Ok(folders)
     }

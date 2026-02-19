@@ -382,6 +382,8 @@ mod imp {
         pub(super) goa_event_receiver: RefCell<Option<std::sync::mpsc::Receiver<northmail_auth::GoaAccountEvent>>>,
         /// Accounts currently being synced (prevents duplicate concurrent syncs)
         pub(super) syncing_accounts: RefCell<std::collections::HashSet<String>>,
+        /// Accounts that have done a full folder LIST this session (skip cache on first sync)
+        pub(super) folders_listed: RefCell<std::collections::HashSet<String>>,
         /// UIDs pending IMAP deletion: (folder_id, uid) pairs
         /// Prevents re-insertion from cache/sync while IMAP move is in flight
         pub(super) pending_deletes: RefCell<HashSet<(i64, u32)>>,
@@ -2076,7 +2078,12 @@ impl NorthMailApplication {
         info!("Syncing inbox for {}", account.email);
 
         // Load cached folders from DB to skip list_folders() when possible
-        let cached_folders: Option<Vec<(String, String, String)>> = if let Some(db) = self.database() {
+        // Skip folder cache on first sync per session to pick up folder type changes
+        let first_sync = !self.imp().folders_listed.borrow().contains(&account_id.to_string());
+        let cached_folders: Option<Vec<(String, String, String)>> = if first_sync {
+            info!("First sync for {}, will do full folder LIST", account.email);
+            None
+        } else if let Some(db) = self.database() {
             let db = db.clone();
             let acct_id = account_id.to_string();
             let email_for_log = account.email.clone();
@@ -2213,6 +2220,8 @@ impl NorthMailApplication {
 
         // Save synced folders to database
         if let Some(sr) = sync_result {
+            // Mark as having done a full LIST this session
+            self.imp().folders_listed.borrow_mut().insert(account_id.to_string());
             if !sr.folders.is_empty() {
                 if let Some(db) = self.database() {
                     let db = db.clone();
@@ -2310,13 +2319,7 @@ impl NorthMailApplication {
                         // Get folder list: use cache or fetch from IMAP
                         let folder_entries: Vec<(String, String, String)> = if let Some(cached) = cached_folders {
                             debug!("Using {} cached folders, skipping LIST", cached.len());
-                            // Re-detect folder types in case detection logic improved
-                            cached.into_iter().map(|(path, name, _ft)| {
-                                let detected = folder_type_to_db_string(
-                                    &northmail_imap::FolderType::from_attributes_and_name(&[], &name)
-                                );
-                                (path, name, detected)
-                            }).collect()
+                            cached
                         } else {
                             match client.list_folders().await {
                                 Ok(folder_list) => {
@@ -2392,13 +2395,7 @@ impl NorthMailApplication {
                         // Get folder list: use cache or fetch from IMAP
                         let folder_entries: Vec<(String, String, String)> = if let Some(cached) = cached_folders {
                             debug!("Using {} cached folders, skipping LIST", cached.len());
-                            // Re-detect folder types in case detection logic improved
-                            cached.into_iter().map(|(path, name, _ft)| {
-                                let detected = folder_type_to_db_string(
-                                    &northmail_imap::FolderType::from_attributes_and_name(&[], &name)
-                                );
-                                (path, name, detected)
-                            }).collect()
+                            cached
                         } else {
                             match client.list_folders().await {
                                 Ok(folder_list) => {
@@ -2934,13 +2931,7 @@ impl NorthMailApplication {
                         // Get folder list: use cache or fetch from IMAP
                         let folder_entries: Vec<(String, String, String)> = if let Some(cached) = cached_folders {
                             debug!("Using {} cached folders, skipping LIST", cached.len());
-                            // Re-detect folder types in case detection logic improved
-                            cached.into_iter().map(|(path, name, _ft)| {
-                                let detected = folder_type_to_db_string(
-                                    &northmail_imap::FolderType::from_attributes_and_name(&[], &name)
-                                );
-                                (path, name, detected)
-                            }).collect()
+                            cached
                         } else {
                             match client.list_folders().await {
                                 Ok(folder_list) => {

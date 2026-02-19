@@ -934,6 +934,7 @@ impl SimpleImapClient {
             }
         }
 
+        FolderType::deduplicate_folder_types(&mut folders);
         Ok(folders)
     }
 
