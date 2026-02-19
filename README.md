@@ -8,6 +8,8 @@ A modern email client for GNOME, built with GTK4/libadwaita and Rust.
 - Gmail support with GNOME Online Accounts integration
 - Adaptive layout for different screen sizes
 - Fast full-text search with SQLite FTS5
+- Starred messages with per-account virtual folders
+- Keyboard navigation for browsing messages
 - Offline message access
 - Real-time email notifications via IMAP IDLE
 
