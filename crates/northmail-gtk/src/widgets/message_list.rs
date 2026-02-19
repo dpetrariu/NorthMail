@@ -5,6 +5,8 @@ use libadwaita as adw;
 use std::cell::Cell;
 use std::rc::Rc;
 
+use crate::i18n::{tr, ntr};
+
 /// Escape XML/Pango markup special characters
 fn escape_markup(text: &str) -> String {
     text.replace('&', "&amp;")
@@ -78,11 +80,11 @@ fn try_parse_email_date(date_str: &str) -> Option<String> {
         if year == today_year && month == today_month && day as i32 == today_day {
             // Today - show time
             let hour_12 = if hour == 0 { 12 } else if hour > 12 { hour - 12 } else { hour };
-            let am_pm = if hour < 12 { "AM" } else { "PM" };
+            let am_pm = if hour < 12 { tr("AM") } else { tr("PM") };
             Some(format!("{}:{:02} {}", hour_12, minute, am_pm))
         } else if year == today_year && month == today_month && day as i32 == today_day - 1 {
             // Yesterday
-            Some("Yesterday".to_string())
+            Some(tr("Yesterday"))
         } else if year == today_year {
             // This year - show month and day
             Some(format!("{} {}", month_str, day))
@@ -267,7 +269,7 @@ impl MessageList {
             .build();
 
         let search_entry = gtk4::SearchEntry::builder()
-            .placeholder_text("Search messages...")
+            .placeholder_text(&tr("Search messages..."))
             .hexpand(true)
             .build();
 
@@ -397,8 +399,8 @@ impl MessageList {
         // Placeholder content - initially empty, will be populated when folder is selected
         let placeholder = adw::StatusPage::builder()
             .icon_name("mail-inbox-symbolic")
-            .title("Select a folder")
-            .description("Choose a folder from the sidebar to view messages")
+            .title(&tr("Select a folder"))
+            .description(&tr("Choose a folder from the sidebar to view messages"))
             .build();
 
         scrolled.set_child(Some(&placeholder));
@@ -474,7 +476,7 @@ impl MessageList {
             .spacing(12)
             .build();
         let unread_label = gtk4::Label::builder()
-            .label("Unread only")
+            .label(&tr("Unread only"))
             .hexpand(true)
             .xalign(0.0)
             .build();
@@ -487,7 +489,7 @@ impl MessageList {
             .spacing(12)
             .build();
         let starred_label = gtk4::Label::builder()
-            .label("Starred")
+            .label(&tr("Starred"))
             .hexpand(true)
             .xalign(0.0)
             .build();
@@ -500,7 +502,7 @@ impl MessageList {
             .spacing(12)
             .build();
         let attachment_label = gtk4::Label::builder()
-            .label("Has attachments")
+            .label(&tr("Has attachments"))
             .hexpand(true)
             .xalign(0.0)
             .build();
@@ -516,13 +518,13 @@ impl MessageList {
 
         // --- From filter ---
         let from_entry = gtk4::Entry::builder()
-            .placeholder_text("From...")
+            .placeholder_text(&tr("From..."))
             .build();
         popover_content.append(&from_entry);
 
         // --- To/Cc filter ---
         let to_cc_entry = gtk4::Entry::builder()
-            .placeholder_text("To/Cc...")
+            .placeholder_text(&tr("To/Cc..."))
             .build();
         popover_content.append(&to_cc_entry);
 
@@ -533,7 +535,7 @@ impl MessageList {
             .orientation(gtk4::Orientation::Horizontal)
             .spacing(8)
             .build();
-        let after_label = gtk4::Label::new(Some("After:"));
+        let after_label = gtk4::Label::new(Some(&tr("After:")));
         after_label.set_width_request(50);
         after_label.set_xalign(0.0);
         let after_entry = gtk4::Entry::builder()
@@ -547,7 +549,7 @@ impl MessageList {
             .orientation(gtk4::Orientation::Horizontal)
             .spacing(8)
             .build();
-        let before_label = gtk4::Label::new(Some("Before:"));
+        let before_label = gtk4::Label::new(Some(&tr("Before:")));
         before_label.set_width_request(50);
         before_label.set_xalign(0.0);
         let before_entry = gtk4::Entry::builder()
@@ -561,7 +563,7 @@ impl MessageList {
 
         // --- Clear Filters button ---
         let clear_button = gtk4::Button::builder()
-            .label("Clear Filters")
+            .label(&tr("Clear Filters"))
             .build();
         popover_content.append(&clear_button);
 
@@ -571,7 +573,7 @@ impl MessageList {
 
         let filter_button = gtk4::MenuButton::builder()
             .icon_name("funnel-symbolic")
-            .tooltip_text("Filter messages")
+            .tooltip_text(&tr("Filter messages"))
             .popover(&popover)
             .build();
         filter_button.add_css_class("flat");
@@ -884,7 +886,7 @@ impl MessageList {
             .build();
 
         let label = gtk4::Label::builder()
-            .label("Loading more...")
+            .label(&tr("Loading more..."))
             .css_classes(["dim-label"])
             .build();
 
@@ -1157,16 +1159,16 @@ impl MessageList {
                 let filter_state = imp.filter_state.borrow();
                 let search_query = imp.search_query.borrow();
                 let (title, desc) = if !search_query.is_empty() && !messages.is_empty() {
-                    ("No Results", "No messages match your search")
+                    (tr("No Results"), tr("No messages match your search"))
                 } else if filter_state.is_active() && !messages.is_empty() {
-                    ("No Matching Messages", "Try adjusting your filters")
+                    (tr("No Matching Messages"), tr("Try adjusting your filters"))
                 } else {
-                    ("Empty Folder", "There are no messages in this folder")
+                    (tr("Empty Folder"), tr("There are no messages in this folder"))
                 };
                 let placeholder = adw::StatusPage::builder()
                     .icon_name("mail-inbox-symbolic")
-                    .title(title)
-                    .description(desc)
+                    .title(&title)
+                    .description(&desc)
                     .build();
                 scrolled.set_child(Some(&placeholder));
             } else {
@@ -1463,7 +1465,7 @@ impl MessageList {
             .build();
 
         let subject_text = if msg.subject.is_empty() {
-            "(No Subject)".to_string()
+            tr("(No Subject)")
         } else {
             msg.subject.clone()
         };
@@ -1566,7 +1568,7 @@ impl MessageList {
 
         // Show message info as drag icon (handle UTF-8 properly)
         let subject_for_drag = if msg.subject.is_empty() {
-            "(No Subject)".to_string()
+            tr("(No Subject)")
         } else {
             let chars: Vec<char> = msg.subject.chars().collect();
             if chars.len() > 40 {
@@ -1610,7 +1612,7 @@ impl MessageList {
                 // Multi-drag: show badge with count
                 let count = selected_uids.len();
                 let label = gtk4::Label::builder()
-                    .label(&format!("{} Messages", count))
+                    .label(&ntr("{} Message", "{} Messages", count as u32).replace("{}", &count.to_string()))
                     .xalign(0.0)
                     .css_classes(["heading"])
                     .build();
@@ -1736,7 +1738,7 @@ impl MessageList {
         // Read/Unread toggle
         let widget = self.clone();
         if is_read {
-            let btn = Self::make_context_menu_item(&vbox, "Mark as Unread");
+            let btn = Self::make_context_menu_item(&vbox, &tr("Mark as Unread"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1745,7 +1747,7 @@ impl MessageList {
                 w.emit_by_name::<()>("mark-read", &[&msg_uid, &msg_id, &msg_folder_id, &false]);
             });
         } else {
-            let btn = Self::make_context_menu_item(&vbox, "Mark as Read");
+            let btn = Self::make_context_menu_item(&vbox, &tr("Mark as Read"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1757,7 +1759,7 @@ impl MessageList {
 
         // Star toggle
         if is_starred {
-            let btn = Self::make_context_menu_item(&vbox, "Unstar");
+            let btn = Self::make_context_menu_item(&vbox, &tr("Unstar"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1766,7 +1768,7 @@ impl MessageList {
                 w.emit_by_name::<()>("star-toggled", &[&msg_uid, &msg_id, &msg_folder_id, &false]);
             });
         } else {
-            let btn = Self::make_context_menu_item(&vbox, "Star");
+            let btn = Self::make_context_menu_item(&vbox, &tr("Star"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1780,7 +1782,7 @@ impl MessageList {
 
         // Reply / Reply All / Forward
         {
-            let btn = Self::make_context_menu_item(&vbox, "Reply");
+            let btn = Self::make_context_menu_item(&vbox, &tr("Reply"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1790,7 +1792,7 @@ impl MessageList {
             });
         }
         {
-            let btn = Self::make_context_menu_item(&vbox, "Reply All");
+            let btn = Self::make_context_menu_item(&vbox, &tr("Reply All"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1800,7 +1802,7 @@ impl MessageList {
             });
         }
         {
-            let btn = Self::make_context_menu_item(&vbox, "Forward");
+            let btn = Self::make_context_menu_item(&vbox, &tr("Forward"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1814,7 +1816,7 @@ impl MessageList {
 
         // Archive / Trash / Spam
         {
-            let btn = Self::make_context_menu_item(&vbox, "Archive");
+            let btn = Self::make_context_menu_item(&vbox, &tr("Archive"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1824,7 +1826,7 @@ impl MessageList {
             });
         }
         {
-            let btn = Self::make_context_menu_item(&vbox, "Move to Trash");
+            let btn = Self::make_context_menu_item(&vbox, &tr("Move to Trash"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1834,7 +1836,7 @@ impl MessageList {
             });
         }
         {
-            let btn = Self::make_context_menu_item(&vbox, "Mark as Spam");
+            let btn = Self::make_context_menu_item(&vbox, &tr("Mark as Spam"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1862,7 +1864,7 @@ impl MessageList {
 
         // Mark as Read / Mark as Unread
         {
-            let btn = Self::make_context_menu_item(&vbox, &format!("Mark {} as Read", count));
+            let btn = Self::make_context_menu_item(&vbox, &ntr("Mark {} as Read", "Mark {} as Read", count as u32).replace("{}", &count.to_string()));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1873,7 +1875,7 @@ impl MessageList {
             });
         }
         {
-            let btn = Self::make_context_menu_item(&vbox, &format!("Mark {} as Unread", count));
+            let btn = Self::make_context_menu_item(&vbox, &ntr("Mark {} as Unread", "Mark {} as Unread", count as u32).replace("{}", &count.to_string()));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1886,7 +1888,7 @@ impl MessageList {
 
         // Star / Unstar
         {
-            let btn = Self::make_context_menu_item(&vbox, &format!("Star {}", count));
+            let btn = Self::make_context_menu_item(&vbox, &ntr("Star {}", "Star {}", count as u32).replace("{}", &count.to_string()));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1897,7 +1899,7 @@ impl MessageList {
             });
         }
         {
-            let btn = Self::make_context_menu_item(&vbox, &format!("Unstar {}", count));
+            let btn = Self::make_context_menu_item(&vbox, &ntr("Unstar {}", "Unstar {}", count as u32).replace("{}", &count.to_string()));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1912,7 +1914,7 @@ impl MessageList {
 
         // Archive / Trash / Spam
         {
-            let btn = Self::make_context_menu_item(&vbox, &format!("Archive {} Messages", count));
+            let btn = Self::make_context_menu_item(&vbox, &ntr("Archive {} Message", "Archive {} Messages", count as u32).replace("{}", &count.to_string()));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1923,7 +1925,7 @@ impl MessageList {
             });
         }
         {
-            let btn = Self::make_context_menu_item(&vbox, &format!("Move {} to Trash", count));
+            let btn = Self::make_context_menu_item(&vbox, &ntr("Move {} to Trash", "Move {} to Trash", count as u32).replace("{}", &count.to_string()));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1934,7 +1936,7 @@ impl MessageList {
             });
         }
         {
-            let btn = Self::make_context_menu_item(&vbox, &format!("Mark {} as Spam", count));
+            let btn = Self::make_context_menu_item(&vbox, &ntr("Mark {} as Spam", "Mark {} as Spam", count as u32).replace("{}", &count.to_string()));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -2212,7 +2214,7 @@ impl From<&northmail_core::models::DbMessage> for MessageInfo {
                 .from_name
                 .clone()
                 .or_else(|| db_msg.from_address.clone())
-                .unwrap_or_else(|| "Unknown".to_string()),
+                .unwrap_or_else(|| tr("Unknown")),
             from_address: db_msg.from_address.clone().unwrap_or_default(),
             to: db_msg.to_addresses.clone().unwrap_or_default(),
             cc: db_msg.cc_addresses.clone().unwrap_or_default(),

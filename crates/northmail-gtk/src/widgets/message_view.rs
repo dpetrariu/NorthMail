@@ -2,6 +2,7 @@
 
 use gtk4::{gio, glib, prelude::*, subclass::prelude::*};
 use libadwaita as adw;
+use crate::i18n::tr;
 #[cfg(feature = "webkit")]
 use webkit6::prelude::*;
 
@@ -238,7 +239,7 @@ impl MessageView {
         // Star button on left
         let star_button = gtk4::ToggleButton::builder()
             .icon_name("non-starred-symbolic")
-            .tooltip_text("Star")
+            .tooltip_text(&tr("Star"))
             .css_classes(["flat"])
             .build();
 
@@ -258,31 +259,31 @@ impl MessageView {
         // Action buttons on right
         let reply_button = gtk4::Button::builder()
             .icon_name("mail-reply-sender-symbolic")
-            .tooltip_text("Reply")
+            .tooltip_text(&tr("Reply"))
             .css_classes(["flat"])
             .build();
 
         let reply_all_button = gtk4::Button::builder()
             .icon_name("mail-reply-all-symbolic")
-            .tooltip_text("Reply All")
+            .tooltip_text(&tr("Reply All"))
             .css_classes(["flat"])
             .build();
 
         let forward_button = gtk4::Button::builder()
             .icon_name("mail-forward-symbolic")
-            .tooltip_text("Forward")
+            .tooltip_text(&tr("Forward"))
             .css_classes(["flat"])
             .build();
 
         let archive_button = gtk4::Button::builder()
             .icon_name("folder-symbolic")
-            .tooltip_text("Archive")
+            .tooltip_text(&tr("Archive"))
             .css_classes(["flat"])
             .build();
 
         let delete_button = gtk4::Button::builder()
             .icon_name("user-trash-symbolic")
-            .tooltip_text("Delete")
+            .tooltip_text(&tr("Delete"))
             .css_classes(["flat"])
             .build();
 
@@ -319,8 +320,8 @@ impl MessageView {
         // Placeholder
         let placeholder = adw::StatusPage::builder()
             .icon_name("mail-read-symbolic")
-            .title("No Message Selected")
-            .description("Select a message to view its contents")
+            .title(&tr("No Message Selected"))
+            .description(&tr("Select a message to view its contents"))
             .vexpand(true)
             .build();
 
@@ -499,7 +500,7 @@ impl MessageView {
 
             // New Email button
             let new_email_btn = gtk4::Button::builder()
-                .label("New Email")
+                .label(&tr("New Email"))
                 .css_classes(["flat"])
                 .build();
             let email_for_compose = from_email.clone();
@@ -515,7 +516,7 @@ impl MessageView {
 
             // Copy Address button
             let copy_btn = gtk4::Button::builder()
-                .label("Copy Address")
+                .label(&tr("Copy Address"))
                 .css_classes(["flat"])
                 .build();
             let email_for_copy = from_email.clone();
@@ -530,7 +531,7 @@ impl MessageView {
 
             // Add to Contacts button
             let add_contact_btn = gtk4::Button::builder()
-                .label("Add to Contacts")
+                .label(&tr("Add to Contacts"))
                 .css_classes(["flat"])
                 .build();
             let email_for_contact = from_email.clone();
@@ -600,7 +601,7 @@ impl MessageView {
                     .build();
 
                 let to_label = gtk4::Label::builder()
-                    .label("To:")
+                    .label(&tr("To:"))
                     .css_classes(["message-recipients-label"])
                     .xalign(0.0)
                     .build();
@@ -626,7 +627,7 @@ impl MessageView {
                     .build();
 
                 let cc_label = gtk4::Label::builder()
-                    .label("Cc:")
+                    .label(&tr("Cc:"))
                     .css_classes(["message-recipients-label"])
                     .xalign(0.0)
                     .build();
@@ -710,7 +711,7 @@ impl MessageView {
                 content_box.append(&text_view);
             } else {
                 let label = gtk4::Label::builder()
-                    .label("[No content]")
+                    .label(&tr("[No content]"))
                     .css_classes(["dim-label"])
                     .build();
                 content_box.append(&label);
@@ -742,8 +743,8 @@ impl MessageView {
 
             let placeholder = adw::StatusPage::builder()
                 .icon_name("mail-read-symbolic")
-                .title("No Message Selected")
-                .description("Select a message to view its contents")
+                .title(&tr("No Message Selected"))
+                .description(&tr("Select a message to view its contents"))
                 .vexpand(true)
                 .build();
 

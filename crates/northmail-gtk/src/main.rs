@@ -3,6 +3,7 @@
 //! Built with GTK4/libadwaita for a native GNOME experience.
 
 mod application;
+pub mod i18n;
 mod idle_manager;
 mod imap_pool;
 mod window;
@@ -20,6 +21,9 @@ fn main() {
         .init();
 
     tracing::info!("Starting NorthMail");
+
+    // Initialize i18n/gettext
+    i18n::init();
 
     // Set GSettings schema directory for development builds.
     // This must happen before any GSettings are accessed.

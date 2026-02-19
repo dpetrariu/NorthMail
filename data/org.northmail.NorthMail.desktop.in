@@ -1,0 +1,13 @@
+[Desktop Entry]
+Name=NorthMail
+Comment=A modern email client for GNOME
+Exec=northmail %U
+Icon=org.northmail.NorthMail
+Terminal=false
+Type=Application
+Categories=GNOME;GTK;Network;Email;
+Keywords=email;mail;gmail;imap;
+StartupNotify=true
+StartupWMClass=org.northmail.NorthMail
+MimeType=x-scheme-handler/mailto;
+X-GNOME-UsesNotifications=true

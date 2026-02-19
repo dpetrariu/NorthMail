@@ -1,0 +1,782 @@
+# NorthMail Translation Template
+# Copyright (C) 2024 NorthMail Contributors
+# This file is distributed under the same license as the NorthMail package.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: northmail 0.1.0\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2024-01-01 00:00+0000\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: LANGUAGE <LL@li.org>\n"
+"Language: \n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "&gt;"
+msgstr ""
+
+msgid "&lt;"
+msgstr ""
+
+msgid "(Message body is still loading...)"
+msgstr ""
+
+msgid "(No Subject)"
+msgstr ""
+
+msgid "(No subject)"
+msgstr ""
+
+msgid "(sync to update)"
+msgstr ""
+
+msgid "A draft of this message has been saved. Do you want to keep it or delete it?"
+msgstr ""
+
+msgid "A modern email client for GNOME"
+msgstr ""
+
+msgid "AM"
+msgstr ""
+
+msgid "Account added"
+msgstr ""
+
+msgid "Account not found"
+msgstr ""
+
+msgid "Account removed"
+msgstr ""
+
+msgid "Accounts"
+msgstr ""
+
+msgid "Add Account"
+msgstr ""
+
+msgid "Add Bcc recipients"
+msgstr ""
+
+msgid "Add Email Account"
+msgstr ""
+
+msgid "Add Gmail Account"
+msgstr ""
+
+msgid "Add an email account to get started"
+msgstr ""
+
+msgid "Add recipient"
+msgstr ""
+
+msgid "Add to Contacts"
+msgstr ""
+
+msgid "Added"
+msgstr ""
+
+msgid "Added account:"
+msgstr ""
+
+msgid "After:"
+msgstr ""
+
+msgid "Align Left"
+msgstr ""
+
+msgid "Align Right"
+msgstr ""
+
+msgid "All Inboxes"
+msgstr ""
+
+msgid "App Icon"
+msgstr ""
+
+msgid "Appearance"
+msgstr ""
+
+msgid "Archive"
+msgstr ""
+
+msgid "Attach File"
+msgstr ""
+
+msgid "Attach file"
+msgstr ""
+
+msgid "Auth failed"
+msgstr ""
+
+msgid "Auth manager error"
+msgstr ""
+
+msgid "Auth manager failed"
+msgstr ""
+
+msgid "Authenticate"
+msgstr ""
+
+msgid "Authentication failed"
+msgstr ""
+
+msgid "Bcc"
+msgstr ""
+
+msgid "Before:"
+msgstr ""
+
+msgid "Bold (Ctrl+B)"
+msgstr ""
+
+msgid "Built With"
+msgstr ""
+
+msgid "Bullet List"
+msgstr ""
+
+msgid "Cache Management"
+msgstr ""
+
+msgid "Cached Messages"
+msgstr ""
+
+msgid "Cancel"
+msgstr ""
+
+msgid "Cannot Send from This Account"
+msgstr ""
+
+msgid "Cannot move between different accounts"
+msgstr ""
+
+msgid "Cannot send from this account"
+msgstr ""
+
+msgid "Cc"
+msgstr ""
+
+msgid "Cc:"
+msgstr ""
+
+msgid "Center"
+msgstr ""
+
+msgid "Channel disconnected"
+msgstr ""
+
+msgid "Check for New Mail"
+msgstr ""
+
+msgid "Checking for updates..."
+msgstr ""
+
+msgid "Choose a folder from the sidebar to view messages"
+msgstr ""
+
+msgid "Choose a message from the list to read it"
+msgstr ""
+
+msgid "Choose the application color scheme"
+msgstr ""
+
+msgid "Clear All Cache"
+msgstr ""
+
+msgid "Clear Filters"
+msgstr ""
+
+msgid "Color Scheme"
+msgstr ""
+
+msgid "Compose"
+msgstr ""
+
+msgid "Connecting..."
+msgstr ""
+
+msgid "Connection lost"
+msgstr ""
+
+msgid "Copy Address"
+msgstr ""
+
+msgid "Could not find Sent folder"
+msgstr ""
+
+msgid "Could not resolve folder"
+msgstr ""
+
+msgid "Dark"
+msgstr ""
+
+msgid "Database not available"
+msgstr ""
+
+msgid "Database not initialized"
+msgstr ""
+
+msgid "Date"
+msgstr ""
+
+msgid "Delete"
+msgstr ""
+
+msgid "Delete Draft"
+msgstr ""
+
+msgid "Delete Message?"
+msgstr ""
+
+msgid "Delete all cached messages and bodies"
+msgstr ""
+
+msgid "Delete draft?"
+msgstr ""
+
+msgid "Desktop Notifications"
+msgstr ""
+
+msgid "Display sender and subject in notifications"
+msgstr ""
+
+msgid "Do Not Disturb"
+msgstr ""
+
+msgid "Draft delete thread crashed"
+msgstr ""
+
+msgid "Draft save thread crashed"
+msgstr ""
+
+msgid "Draft saved"
+msgstr ""
+
+msgid "Drafts"
+msgstr ""
+
+msgid "Empty Folder"
+msgstr ""
+
+msgid "Every 10 minutes"
+msgstr ""
+
+msgid "Every 15 minutes"
+msgstr ""
+
+msgid "Every 2 minutes"
+msgstr ""
+
+msgid "Every 30 minutes"
+msgstr ""
+
+msgid "Every 5 minutes"
+msgstr ""
+
+msgid "Every minute"
+msgstr ""
+
+msgid "Failed to add account:"
+msgstr ""
+
+msgid "Failed to add contact"
+msgstr ""
+
+msgid "Failed to authenticate"
+msgstr ""
+
+msgid "Failed to fetch body for message after retries:"
+msgstr ""
+
+msgid "Failed to fetch messages"
+msgstr ""
+
+msgid "Failed to get credentials"
+msgstr ""
+
+msgid "Failed to list folders"
+msgstr ""
+
+msgid "Failed to load inbox"
+msgstr ""
+
+msgid "Failed to load message body"
+msgstr ""
+
+msgid "Failed to load messages"
+msgstr ""
+
+msgid "Failed to save draft"
+msgstr ""
+
+msgid "Failed to select folder"
+msgstr ""
+
+msgid "Failed to send command"
+msgstr ""
+
+msgid "Fetch failed"
+msgstr ""
+
+msgid "Filter messages"
+msgstr ""
+
+msgid "Folder not found"
+msgstr ""
+
+msgid "Font Family"
+msgstr ""
+
+msgid "Font Size"
+msgstr ""
+
+msgid "Forward"
+msgstr ""
+
+msgid "Forwarded message"
+msgstr ""
+
+msgid "From"
+msgstr ""
+
+msgid "From..."
+msgstr ""
+
+msgid "General"
+msgstr ""
+
+msgid "Graph fetch body failed"
+msgstr ""
+
+msgid "Graph list_attachments failed"
+msgstr ""
+
+msgid "Graph message ID not found in cache"
+msgstr ""
+
+msgid "Has attachments"
+msgstr ""
+
+msgid "How often to automatically check for new emails"
+msgstr ""
+
+msgid "Important"
+msgstr ""
+
+msgid "Inbox"
+msgstr ""
+
+msgid "Inbox folder not found via Graph API"
+msgstr ""
+
+msgid "Include Attachments?"
+msgstr ""
+
+msgid "Invalid account selection"
+msgstr ""
+
+msgid "Italic (Ctrl+I)"
+msgstr ""
+
+msgid "Junk"
+msgstr ""
+
+msgid "Keep Draft"
+msgstr ""
+
+msgid "Light"
+msgstr ""
+
+msgid "Loading"
+msgstr ""
+
+msgid "Loading message..."
+msgstr ""
+
+msgid "Loading messages..."
+msgstr ""
+
+msgid "Loading more..."
+msgstr ""
+
+msgid "Loading..."
+msgstr ""
+
+msgid "Mail Checking"
+msgstr ""
+
+msgid "Manage accounts in GNOME Settings"
+msgstr ""
+
+msgid "Mark as Read"
+msgstr ""
+
+msgid "Mark as Spam"
+msgstr ""
+
+msgid "Mark as Unread"
+msgstr ""
+
+msgid "Message archived"
+msgstr ""
+
+msgid "Message deleted"
+msgstr ""
+
+msgid "Message sent"
+msgstr ""
+
+msgid "Messages stored locally for offline access and fast loading"
+msgstr ""
+
+msgid "Move to Trash"
+msgstr ""
+
+msgid "Moved to"
+msgstr ""
+
+msgid "New Email"
+msgstr ""
+
+msgid "New Message"
+msgstr ""
+
+msgid "No"
+msgstr ""
+
+msgid "No Matching Messages"
+msgstr ""
+
+msgid "No Message Selected"
+msgstr ""
+
+msgid "No Results"
+msgstr ""
+
+msgid "No content available"
+msgstr ""
+
+msgid "No folder selected"
+msgstr ""
+
+msgid "No messages match your search"
+msgstr ""
+
+msgid "NorthMail uses GNOME Online Accounts to manage your email accounts. Add or remove accounts in System Settings."
+msgstr ""
+
+msgid "NorthMail will open your browser to authenticate with Google."
+msgstr ""
+
+msgid "Not Implemented"
+msgstr ""
+
+msgid "Notification Sound"
+msgstr ""
+
+msgid "Notifications"
+msgstr ""
+
+msgid "Numbered List"
+msgstr ""
+
+msgid "OK"
+msgstr ""
+
+msgid "On"
+msgstr ""
+
+msgid "Online Accounts"
+msgstr ""
+
+msgid "Open"
+msgstr ""
+
+msgid "Open Settings"
+msgstr ""
+
+msgid "Open Settings..."
+msgstr ""
+
+msgid "PM"
+msgstr ""
+
+msgid "Play a sound when new emails arrive"
+msgstr ""
+
+msgid "Please add at least one recipient"
+msgstr ""
+
+msgid "Please restart for the changes to take effect."
+msgstr ""
+
+msgid "Please wait for the message to load"
+msgstr ""
+
+msgid "Pool error"
+msgstr ""
+
+msgid "Pool worker disconnected"
+msgstr ""
+
+msgid "Preview"
+msgstr ""
+
+msgid "Re-sync all messages from all accounts"
+msgstr ""
+
+msgid "Refresh Accounts"
+msgstr ""
+
+msgid "Reload All Messages"
+msgstr ""
+
+msgid "Remove attachment"
+msgstr ""
+
+msgid "Reply"
+msgstr ""
+
+msgid "Reply All"
+msgstr ""
+
+msgid "Retry"
+msgstr ""
+
+msgid "Retrying..."
+msgstr ""
+
+msgid "Save"
+msgstr ""
+
+msgid "Search messages..."
+msgstr ""
+
+msgid "Select a Message"
+msgstr ""
+
+msgid "Select a folder"
+msgstr ""
+
+msgid "Select a message to view its contents"
+msgstr ""
+
+msgid "Select an account from GNOME Online Accounts or add a new one."
+msgstr ""
+
+msgid "Select failed"
+msgstr ""
+
+msgid "Send"
+msgstr ""
+
+msgid "Send failed"
+msgstr ""
+
+msgid "Send thread crashed"
+msgstr ""
+
+msgid "Sending…"
+msgstr ""
+
+msgid "Sent"
+msgstr ""
+
+msgid "Settings"
+msgstr ""
+
+msgid "Show Message Preview"
+msgstr ""
+
+msgid "Show notifications for new emails"
+msgstr ""
+
+msgid "Standalone OAuth2 is not yet implemented. Please add your Gmail account in GNOME Settings → Online Accounts first."
+msgstr ""
+
+msgid "Star"
+msgstr ""
+
+msgid "Starred"
+msgstr ""
+
+msgid "Strikethrough"
+msgstr ""
+
+msgid "Subject"
+msgstr ""
+
+msgid "Suppress all notifications"
+msgstr ""
+
+msgid "Syncing"
+msgstr ""
+
+msgid "Syncing older messages..."
+msgstr ""
+
+msgid "Syncing..."
+msgstr ""
+
+msgid "System"
+msgstr ""
+
+msgid "There are no messages in this folder"
+msgstr ""
+
+msgid "This account cannot send emails"
+msgstr ""
+
+msgid "This message will be moved to Trash."
+msgstr ""
+
+msgid "Timeout waiting for body of message"
+msgstr ""
+
+msgid "To"
+msgstr ""
+
+msgid "To/Cc..."
+msgstr ""
+
+msgid "To:"
+msgstr ""
+
+msgid "Toggle Sidebar"
+msgstr ""
+
+msgid "Trash"
+msgstr ""
+
+msgid "Try adjusting your filters"
+msgstr ""
+
+msgid "Underline (Ctrl+U)"
+msgstr ""
+
+msgid "Unknown"
+msgstr ""
+
+msgid "Unread only"
+msgstr ""
+
+msgid "Unstar"
+msgstr ""
+
+msgid "Unsupported auth type"
+msgstr ""
+
+msgid "Up to date"
+msgstr ""
+
+msgid "Welcome to NorthMail"
+msgstr ""
+
+msgid "Yes"
+msgstr ""
+
+msgid "Yesterday"
+msgstr ""
+
+msgid "You have a new message"
+msgstr ""
+
+msgid "You have new messages"
+msgstr ""
+
+msgid "[No content]"
+msgstr ""
+
+msgid "accounts"
+msgstr ""
+
+msgid "bodies cached"
+msgstr ""
+
+msgid "loading"
+msgstr ""
+
+msgid "messages"
+msgstr ""
+
+msgid "new"
+msgstr ""
+
+msgid "read"
+msgstr ""
+
+msgid "to contacts"
+msgstr ""
+
+msgid "unread"
+msgstr ""
+
+msgid "unsupported"
+msgstr ""
+
+msgid "wrote"
+msgstr ""
+
+msgid "{} accounts are not yet supported"
+msgstr ""
+
+msgid "Archive {} Message"
+msgid_plural "Archive {} Messages"
+msgstr[0] ""
+msgstr[1] ""
+
+msgid "Mark {} as Read"
+msgid_plural "Mark {} as Read"
+msgstr[0] ""
+msgstr[1] ""
+
+msgid "Mark {} as Spam"
+msgid_plural "Mark {} as Spam"
+msgstr[0] ""
+msgstr[1] ""
+
+msgid "Mark {} as Unread"
+msgid_plural "Mark {} as Unread"
+msgstr[0] ""
+msgstr[1] ""
+
+msgid "Move {} to Trash"
+msgid_plural "Move {} to Trash"
+msgstr[0] ""
+msgstr[1] ""
+
+msgid "Star {}"
+msgid_plural "Star {}"
+msgstr[0] ""
+msgstr[1] ""
+
+msgid "Unstar {}"
+msgid_plural "Unstar {}"
+msgstr[0] ""
+msgstr[1] ""
+
+msgid "{} Message"
+msgid_plural "{} Messages"
+msgstr[0] ""
+msgstr[1] ""
+
+msgid "{} New Email"
+msgid_plural "{} New Emails"
+msgstr[0] ""
+msgstr[1] ""
+
+msgid "{} account"
+msgid_plural "{} accounts"
+msgstr[0] ""
+msgstr[1] ""
+
+msgid "{} attachment"
+msgid_plural "{} attachments"
+msgstr[0] ""
+msgstr[1] ""
+

@@ -5,6 +5,8 @@ use gtk4::{glib, prelude::*, subclass::prelude::*};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use crate::i18n::tr;
+
 /// Row widget name encoding: "section:kind:account_id:folder_path"
 /// Parsed with splitn(4, ':') so folder_path can contain ':'.
 ///
@@ -515,7 +517,7 @@ impl FolderSidebar {
             .build();
 
         let sync_label = gtk4::Label::builder()
-            .label("Syncing...")
+            .label(&tr("Syncing..."))
             .css_classes(["caption"])
             .xalign(0.0)
             .hexpand(true)
@@ -595,7 +597,7 @@ impl FolderSidebar {
         // ── Section 0: Unified Inbox (in inboxes list) ──
         // No drop target for unified inbox (can't drop to all accounts at once)
         let total_unread: u32 = accounts.iter().filter_map(|a| a.inbox_unread).sum();
-        let row = self.create_inbox_row("mail-inbox-symbolic", "All Inboxes", Some(total_unread), None);
+        let row = self.create_inbox_row("mail-inbox-symbolic", &tr("All Inboxes"), Some(total_unread), None);
         row.set_widget_name(&encode_row_name(0, "unified", "", ""));
         inboxes_list.append(&row);
 

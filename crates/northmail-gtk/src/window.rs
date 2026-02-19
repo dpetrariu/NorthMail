@@ -9,6 +9,8 @@ use std::cell::Cell;
 use std::rc::Rc;
 use tracing::debug;
 
+use crate::i18n::{tr, ntr};
+
 /// Mode for compose dialog
 #[derive(Clone)]
 pub enum ComposeMode {
@@ -59,7 +61,7 @@ fn extract_email_address(from: &str) -> String {
 
 /// Format the quoted body for reply
 fn format_quoted_body(from: &str, date: &str, body: &str) -> String {
-    let mut quoted = format!("\n\nOn {}, {} wrote:\n", date, from);
+    let mut quoted = format!("\n\n{} {}, {} {}:\n", tr("On"), date, from, tr("wrote"));
     for line in body.lines() {
         quoted.push_str(&format!("> {}\n", line));
     }
@@ -68,12 +70,12 @@ fn format_quoted_body(from: &str, date: &str, body: &str) -> String {
 
 /// Format the body for forward
 fn format_forward_body(from: &str, to: &[String], date: &str, subject: &str, body: &str) -> String {
-    let mut fwd = String::from("\n\n---------- Forwarded message ----------\n");
-    fwd.push_str(&format!("From: {}\n", from));
-    fwd.push_str(&format!("Date: {}\n", date));
-    fwd.push_str(&format!("Subject: {}\n", subject));
+    let mut fwd = format!("\n\n---------- {} ----------\n", tr("Forwarded message"));
+    fwd.push_str(&format!("{}: {}\n", tr("From"), from));
+    fwd.push_str(&format!("{}: {}\n", tr("Date"), date));
+    fwd.push_str(&format!("{}: {}\n", tr("Subject"), subject));
     if !to.is_empty() {
-        fwd.push_str(&format!("To: {}\n", to.join(", ")));
+        fwd.push_str(&format!("{}: {}\n", tr("To"), to.join(", ")));
     }
     fwd.push('\n');
     fwd.push_str(body);
@@ -637,7 +639,6 @@ impl NorthMailWindow {
              .message-recipients-label {
                  font-size: 12px;
                  color: alpha(@view_fg_color, 0.5);
-                 min-width: 28px;
              }
              .message-recipients-value {
                  font-size: 12px;
@@ -744,7 +745,7 @@ impl NorthMailWindow {
         // Position: after the title, with margin to align with sidebar's right edge
         let sidebar_toggle = gtk4::ToggleButton::builder()
             .icon_name("dock-left-symbolic")
-            .tooltip_text("Toggle Sidebar")
+            .tooltip_text(&tr("Toggle Sidebar"))
             .active(true)
             .margin_start(92)  // Initial position, updated dynamically based on paned
             .build();
@@ -757,7 +758,7 @@ impl NorthMailWindow {
         // Position: after sidebar toggle, aligned with message list left edge
         let compose_button = gtk4::Button::builder()
             .icon_name("mail-message-new-symbolic")
-            .tooltip_text("Compose")
+            .tooltip_text(&tr("Compose"))
             .margin_start(0)
             .build();
         compose_button.add_css_class("flat");
@@ -890,9 +891,9 @@ impl NorthMailWindow {
 
                         // Extract just the folder name for a friendlier message
                         let folder_name = target_folder_path.rsplit('/').next().unwrap_or(target_folder_path);
-                        window.add_toast(adw::Toast::new(&format!("Moved to {}", folder_name)));
+                        window.add_toast(adw::Toast::new(&format!("{} {}", tr("Moved to"), folder_name)));
                     } else {
-                        window.add_toast(adw::Toast::new("Cannot move between different accounts"));
+                        window.add_toast(adw::Toast::new(&tr("Cannot move between different accounts")));
                     }
                 }
             }
@@ -1173,7 +1174,7 @@ impl NorthMailWindow {
                         }
                     }
                 }
-                window.add_toast(adw::Toast::new(&format!("Archived {} messages", count)));
+                window.add_toast(adw::Toast::new(&ntr("Archived 1 message", &format!("Archived {} messages", count), count as u32)));
             }),
         );
 
@@ -1195,7 +1196,7 @@ impl NorthMailWindow {
                         }
                     }
                 }
-                window.add_toast(adw::Toast::new(&format!("Moved {} messages to Trash", count)));
+                window.add_toast(adw::Toast::new(&ntr("Moved 1 message to Trash", &format!("Moved {} messages to Trash", count), count as u32)));
             }),
         );
 
@@ -1217,7 +1218,7 @@ impl NorthMailWindow {
                         }
                     }
                 }
-                window.add_toast(adw::Toast::new(&format!("Marked {} messages as Spam", count)));
+                window.add_toast(adw::Toast::new(&ntr("Marked 1 message as Spam", &format!("Marked {} messages as Spam", count), count as u32)));
             }),
         );
 
@@ -1238,8 +1239,12 @@ impl NorthMailWindow {
                         }
                     }
                 }
-                let label = if is_read { "read" } else { "unread" };
-                window.add_toast(adw::Toast::new(&format!("Marked {} messages as {}", count, label)));
+                let label = if is_read { tr("read") } else { tr("unread") };
+                window.add_toast(adw::Toast::new(&ntr(
+                    &format!("Marked 1 message as {}", label),
+                    &format!("Marked {} messages as {}", count, label),
+                    count as u32,
+                )));
             }),
         );
 
@@ -1260,8 +1265,11 @@ impl NorthMailWindow {
                         }
                     }
                 }
-                let label = if is_starred { "starred" } else { "unstarred" };
-                window.add_toast(adw::Toast::new(&format!("{} {} messages", label.chars().next().unwrap().to_uppercase().collect::<String>() + &label[1..], count)));
+                if is_starred {
+                    window.add_toast(adw::Toast::new(&ntr("Starred 1 message", &format!("Starred {} messages", count), count as u32)));
+                } else {
+                    window.add_toast(adw::Toast::new(&ntr("Unstarred 1 message", &format!("Unstarred {} messages", count), count as u32)));
+                }
             }),
         );
 
@@ -1355,19 +1363,19 @@ impl NorthMailWindow {
 
             let reply_button = gtk4::Button::builder()
                 .icon_name("mail-reply-sender-symbolic")
-                .tooltip_text("Reply")
+                .tooltip_text(&tr("Reply"))
                 .css_classes(["flat"])
                 .build();
 
             let reply_all_button = gtk4::Button::builder()
                 .icon_name("mail-reply-all-symbolic")
-                .tooltip_text("Reply All")
+                .tooltip_text(&tr("Reply All"))
                 .css_classes(["flat"])
                 .build();
 
             let forward_button = gtk4::Button::builder()
                 .icon_name("mail-forward-symbolic")
-                .tooltip_text("Forward")
+                .tooltip_text(&tr("Forward"))
                 .css_classes(["flat"])
                 .build();
 
@@ -1383,7 +1391,7 @@ impl NorthMailWindow {
                 let body_text = body_text.clone();
                 reply_button.connect_clicked(move |_| {
                     let body = body_text.borrow().clone().unwrap_or_else(|| {
-                        "(Message body is still loading...)".to_string()
+                        tr("(Message body is still loading...)")
                     });
                     // Use from_address if it looks like an email, otherwise extract from 'from'
                     let reply_to_email = if !msg_clone.from_address.is_empty() && msg_clone.from_address.contains('@') {
@@ -1418,7 +1426,7 @@ impl NorthMailWindow {
                 let body_text = body_text.clone();
                 reply_all_button.connect_clicked(move |_| {
                     let body = body_text.borrow().clone().unwrap_or_else(|| {
-                        "(Message body is still loading...)".to_string()
+                        tr("(Message body is still loading...)")
                     });
                     // Use from_address if it looks like an email, otherwise extract from 'from'
                     let reply_to_email = if !msg_clone.from_address.is_empty() && msg_clone.from_address.contains('@') {
@@ -1466,7 +1474,7 @@ impl NorthMailWindow {
                 let attachments_data = attachments_data.clone();
                 forward_button.connect_clicked(move |_| {
                     let body = body_text.borrow().clone().unwrap_or_else(|| {
-                        "(Message body is still loading...)".to_string()
+                        tr("(Message body is still loading...)")
                     });
                     let subject = if msg_clone.subject.to_lowercase().starts_with("fwd:") {
                         msg_clone.subject.clone()
@@ -1482,15 +1490,17 @@ impl NorthMailWindow {
                     let stored_attachments = attachments_data.borrow().clone();
                     if !stored_attachments.is_empty() {
                         // Ask user if they want to include attachments
+                        let n = stored_attachments.len() as u32;
                         let dialog = adw::AlertDialog::builder()
-                            .heading("Include Attachments?")
-                            .body(&format!("This message has {} attachment{}. Do you want to include {} in the forwarded message?",
-                                stored_attachments.len(),
-                                if stored_attachments.len() == 1 { "" } else { "s" },
-                                if stored_attachments.len() == 1 { "it" } else { "them" }))
+                            .heading(&tr("Include Attachments?"))
+                            .body(&ntr(
+                                "This message has 1 attachment. Do you want to include it in the forwarded message?",
+                                &format!("This message has {} attachments. Do you want to include them in the forwarded message?", n),
+                                n,
+                            ))
                             .build();
-                        dialog.add_response("no", "No");
-                        dialog.add_response("yes", "Yes");
+                        dialog.add_response("no", &tr("No"));
+                        dialog.add_response("yes", &tr("Yes"));
                         dialog.set_response_appearance("yes", adw::ResponseAppearance::Suggested);
                         dialog.set_default_response(Some("yes"));
 
@@ -1525,19 +1535,19 @@ impl NorthMailWindow {
 
             let archive_button = gtk4::Button::builder()
                 .icon_name("folder-symbolic")
-                .tooltip_text("Archive")
+                .tooltip_text(&tr("Archive"))
                 .css_classes(["flat"])
                 .build();
 
             let delete_button = gtk4::Button::builder()
                 .icon_name("user-trash-symbolic")
-                .tooltip_text("Delete")
+                .tooltip_text(&tr("Delete"))
                 .css_classes(["flat"])
                 .build();
 
             // Open button (only visible for drafts) - styled as compact prominent action
             let edit_button = gtk4::Button::builder()
-                .label("Open")
+                .label(&tr("Open"))
                 .build();
             edit_button.add_css_class("suggested-action");
             edit_button.add_css_class("draft-open-btn");
@@ -1565,7 +1575,7 @@ impl NorthMailWindow {
                     let body = match body_text.borrow().clone() {
                         Some(b) => b,
                         None => {
-                            window.add_toast(adw::Toast::new("Please wait for the message to load"));
+                            window.add_toast(adw::Toast::new(&tr("Please wait for the message to load")));
                             return;
                         }
                     };
@@ -1644,7 +1654,7 @@ impl NorthMailWindow {
                                 imp.message_view_box.remove(&child);
                             }
                             *imp.current_message_uid.borrow_mut() = None;
-                            window.add_toast(adw::Toast::new("Message archived"));
+                            window.add_toast(adw::Toast::new(&tr("Message archived")));
                         }
                     }
                 });
@@ -1662,12 +1672,12 @@ impl NorthMailWindow {
 
                     // Show confirmation dialog
                     let dialog = adw::AlertDialog::builder()
-                        .heading("Delete Message?")
-                        .body("This message will be moved to Trash.")
+                        .heading(&tr("Delete Message?"))
+                        .body(&tr("This message will be moved to Trash."))
                         .build();
 
-                    dialog.add_response("cancel", "Cancel");
-                    dialog.add_response("delete", "Delete");
+                    dialog.add_response("cancel", &tr("Cancel"));
+                    dialog.add_response("delete", &tr("Delete"));
                     dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
                     dialog.set_default_response(Some("cancel"));
                     dialog.set_close_response("cancel");
@@ -1690,7 +1700,7 @@ impl NorthMailWindow {
                                         imp.message_view_box.remove(&child);
                                     }
                                     *imp.current_message_uid.borrow_mut() = None;
-                                    window.add_toast(adw::Toast::new("Message deleted"));
+                                    window.add_toast(adw::Toast::new(&tr("Message deleted")));
                                 }
                             }
                         }
@@ -1704,9 +1714,10 @@ impl NorthMailWindow {
                 .hexpand(true)
                 .build();
 
+            let star_tooltip = if msg.is_starred { tr("Unstar") } else { tr("Star") };
             let star_button = gtk4::ToggleButton::builder()
                 .icon_name(if msg.is_starred { "starred-symbolic" } else { "non-starred-symbolic" })
-                .tooltip_text(if msg.is_starred { "Unstar" } else { "Star" })
+                .tooltip_text(&star_tooltip)
                 .active(msg.is_starred)
                 .css_classes(["flat", "star-button"])
                 .build();
@@ -1721,7 +1732,8 @@ impl NorthMailWindow {
                     let is_starred = button.is_active();
                     // Update icon and tooltip
                     button.set_icon_name(if is_starred { "starred-symbolic" } else { "non-starred-symbolic" });
-                    button.set_tooltip_text(Some(if is_starred { "Unstar" } else { "Star" }));
+                    let tip = if is_starred { tr("Unstar") } else { tr("Star") };
+                    button.set_tooltip_text(Some(&tip));
                     // Update database and IMAP via application
                     if let Some(app) = window.application() {
                         if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
@@ -1737,9 +1749,10 @@ impl NorthMailWindow {
             }
 
             // Read/Unread button (icon shows the action, not current state)
+            let read_tooltip = if msg.is_read { tr("Mark as Unread") } else { tr("Mark as Read") };
             let read_button = gtk4::Button::builder()
                 .icon_name(if msg.is_read { "mail-unread-symbolic" } else { "mail-read-symbolic" })
-                .tooltip_text(if msg.is_read { "Mark as Unread" } else { "Mark as Read" })
+                .tooltip_text(&read_tooltip)
                 .css_classes(["flat", "dim-label"])
                 .build();
             // Track current read state in a Cell so clicked handler can toggle it
@@ -1757,7 +1770,8 @@ impl NorthMailWindow {
                     state.set(new_read);
                     // Update icon and tooltip (icon shows action)
                     button.set_icon_name(if new_read { "mail-unread-symbolic" } else { "mail-read-symbolic" });
-                    button.set_tooltip_text(Some(if new_read { "Mark as Unread" } else { "Mark as Read" }));
+                    let tip = if new_read { tr("Mark as Unread") } else { tr("Mark as Read") };
+                    button.set_tooltip_text(Some(&tip));
                     // Update database and IMAP via application
                     if let Some(app) = window.application() {
                         if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
@@ -1888,7 +1902,7 @@ impl NorthMailWindow {
 
             // New Email button
             let new_email_btn = gtk4::Button::builder()
-                .label("New Email")
+                .label(&tr("New Email"))
                 .css_classes(["flat", "context-menu-item"])
                 .build();
             new_email_btn.set_halign(gtk4::Align::Fill);
@@ -1914,7 +1928,7 @@ impl NorthMailWindow {
 
             // Copy Address button
             let copy_btn = gtk4::Button::builder()
-                .label("Copy Address")
+                .label(&tr("Copy Address"))
                 .css_classes(["flat", "context-menu-item"])
                 .build();
             copy_btn.set_halign(gtk4::Align::Fill);
@@ -1937,7 +1951,7 @@ impl NorthMailWindow {
 
             // Add to Contacts button
             let add_contact_btn = gtk4::Button::builder()
-                .label("Add to Contacts")
+                .label(&tr("Add to Contacts"))
                 .css_classes(["flat", "context-menu-item"])
                 .build();
             add_contact_btn.set_halign(gtk4::Align::Fill);
@@ -1962,12 +1976,12 @@ impl NorthMailWindow {
                     glib::spawn_future_local(async move {
                         match add_contact_to_eds(&name, &email).await {
                             Ok(()) => {
-                                let toast = adw::Toast::new(&format!("Added {} to contacts", name));
+                                let toast = adw::Toast::new(&format!("{} {} {}", tr("Added"), name, tr("to contacts")));
                                 win.imp().toast_overlay.add_toast(toast);
                             }
                             Err(e) => {
                                 tracing::error!("Failed to add contact: {}", e);
-                                let toast = adw::Toast::new("Failed to add contact");
+                                let toast = adw::Toast::new(&tr("Failed to add contact"));
                                 win.imp().toast_overlay.add_toast(toast);
                             }
                         }
@@ -2008,7 +2022,7 @@ impl NorthMailWindow {
 
             // To: row (separate from clickable sender)
             let to_display = if msg.to.is_empty() && !is_drafts {
-                "(sync to update)".to_string()
+                tr("(sync to update)")
             } else if msg.to.is_empty() {
                 String::new()
             } else if is_drafts {
@@ -2035,12 +2049,12 @@ impl NorthMailWindow {
             };
             let to_row = gtk4::Box::builder()
                 .orientation(gtk4::Orientation::Horizontal)
-                .spacing(4)
+                .spacing(0)
                 .margin_start(62) // Align with sender text (40px avatar + 12px spacing + 10px chip padding)
                 .margin_top(0)
                 .build();
             let to_label = gtk4::Label::builder()
-                .label("To:")
+                .label(&format!("{} ", tr("To:")))
                 .css_classes(["message-recipients-label"])
                 .xalign(0.0)
                 .build();
@@ -2077,12 +2091,12 @@ impl NorthMailWindow {
             if !msg.cc.is_empty() {
                 let cc_row = gtk4::Box::builder()
                     .orientation(gtk4::Orientation::Horizontal)
-                    .spacing(6)
+                    .spacing(0)
                     .margin_top(4)
                     .build();
 
                 let cc_label = gtk4::Label::builder()
-                    .label("Cc:")
+                    .label(&format!("{} ", tr("Cc:")))
                     .css_classes(["message-recipients-label"])
                     .xalign(0.0)
                     .build();
@@ -2163,7 +2177,7 @@ impl NorthMailWindow {
                 .build();
 
             let loading_label = gtk4::Label::builder()
-                .label("Loading message...")
+                .label(&tr("Loading message..."))
                 .css_classes(["dim-label"])
                 .build();
 
@@ -2204,7 +2218,7 @@ impl NorthMailWindow {
                                     .height_request(32)
                                     .build();
                                 let retry_label = gtk4::Label::builder()
-                                    .label("Retrying...")
+                                    .label(&tr("Retrying..."))
                                     .css_classes(["dim-label"])
                                     .build();
                                 let retry_box = gtk4::Box::builder()
@@ -2404,7 +2418,7 @@ impl NorthMailWindow {
             body_box.append(&text_view);
         } else {
             let label = gtk4::Label::builder()
-                .label("No content available")
+                .label(&tr("No content available"))
                 .css_classes(["dim-label"])
                 .build();
             body_box.append(&label);
@@ -2425,7 +2439,7 @@ impl NorthMailWindow {
 
             let menu_btn = gtk4::MenuButton::builder()
                 .child(&btn_content)
-                .tooltip_text(&format!("{} attachment{}", count, if count == 1 { "" } else { "s" }))
+                .tooltip_text(&ntr("{} attachment", "{} attachments", count as u32).replace("{}", &count.to_string()))
                 .css_classes(["flat"])
                 .direction(gtk4::ArrowType::Down)
                 .build();
@@ -2490,12 +2504,12 @@ impl NorthMailWindow {
             .build();
 
         let label = gtk4::Label::builder()
-            .label("Failed to load message body")
+            .label(&tr("Failed to load message body"))
             .css_classes(["dim-label"])
             .build();
 
         let retry_btn = gtk4::Button::builder()
-            .label("Retry")
+            .label(&tr("Retry"))
             .css_classes(["suggested-action", "pill"])
             .halign(gtk4::Align::Center)
             .build();
@@ -2516,7 +2530,7 @@ impl NorthMailWindow {
                 .height_request(32)
                 .build();
             let loading_label = gtk4::Label::builder()
-                .label("Loading message...")
+                .label(&tr("Loading message..."))
                 .css_classes(["dim-label"])
                 .build();
             let loading_box = gtk4::Box::builder()
@@ -2608,12 +2622,12 @@ impl NorthMailWindow {
         // Create welcome status page
         let welcome = adw::StatusPage::builder()
             .icon_name("mail-send-receive-symbolic")
-            .title("Welcome to NorthMail")
-            .description("Add an email account to get started")
+            .title(&tr("Welcome to NorthMail"))
+            .description(&tr("Add an email account to get started"))
             .build();
 
         let add_button = gtk4::Button::builder()
-            .label("Add Account")
+            .label(&tr("Add Account"))
             .halign(gtk4::Align::Center)
             .css_classes(["pill", "suggested-action"])
             .action_name("app.add-account")
@@ -2657,7 +2671,7 @@ impl NorthMailWindow {
             .compose-field-label { font-size: 0.9em; min-width: 52px; color: alpha(@view_fg_color, 0.55); }
             .compose-separator { background: alpha(@view_fg_color, 0.15); min-height: 1px; }
             .compose-body { background: @view_bg_color; }
-            .attachment-pill { background: alpha(currentColor, 0.1); border-radius: 14px; padding: 1px 4px 1px 8px; }
+            .attachment-pill { background: alpha(currentColor, 0.1); border-radius: 14px; padding: 6px 4px 6px 8px; }
             .attachment-pill:hover { background: alpha(currentColor, 0.15); }
             .attachment-pill label { font-size: 0.8em; }
             .attachment-pill button { min-width: 16px; min-height: 16px; padding: 0; margin: 0 0 0 2px; }
@@ -2681,7 +2695,7 @@ impl NorthMailWindow {
         );
 
         let compose_window = adw::Window::builder()
-            .title("New Message")
+            .title(&tr("New Message"))
             .default_width(640)
             .default_height(560)
             .build();
@@ -2695,7 +2709,7 @@ impl NorthMailWindow {
         let header = adw::HeaderBar::new();
 
         let send_button = gtk4::Button::builder()
-            .label("Send")
+            .label(&tr("Send"))
             .css_classes(["suggested-action", "pill", "compose-send"])
             .build();
 
@@ -2738,7 +2752,7 @@ impl NorthMailWindow {
         let warning_button = gtk4::Button::builder()
             .icon_name("dialog-warning-symbolic")
             .css_classes(["flat", "circular", "warning"])
-            .tooltip_text("This account cannot send emails")
+            .tooltip_text(&tr("This account cannot send emails"))
             .visible(false)
             .build();
 
@@ -2765,9 +2779,9 @@ impl NorthMailWindow {
             std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
 
         let all_chips = vec![to_chips.clone(), cc_chips.clone(), bcc_chips.clone()];
-        let (to_row, to_add_chip) = Self::build_chip_row("To", to_chips.clone(), all_chips.clone(), self, label_width);
-        let (cc_row, cc_add_chip) = Self::build_chip_row("Cc", cc_chips.clone(), all_chips.clone(), self, label_width);
-        let (bcc_row, _bcc_add_chip) = Self::build_chip_row("Bcc", bcc_chips.clone(), all_chips.clone(), self, label_width);
+        let (to_row, to_add_chip) = Self::build_chip_row(&tr("To"), to_chips.clone(), all_chips.clone(), self, label_width);
+        let (cc_row, cc_add_chip) = Self::build_chip_row(&tr("Cc"), cc_chips.clone(), all_chips.clone(), self, label_width);
+        let (bcc_row, _bcc_add_chip) = Self::build_chip_row(&tr("Bcc"), bcc_chips.clone(), all_chips.clone(), self, label_width);
 
         // Bcc row starts hidden
         bcc_row.set_visible(false);
@@ -2776,9 +2790,9 @@ impl NorthMailWindow {
 
         // Bcc button (shown on Cc row, like attach button on Subject)
         let bcc_button = gtk4::Button::builder()
-            .label("Bcc")
+            .label(&tr("Bcc"))
             .css_classes(["flat"])
-            .tooltip_text("Add Bcc recipients")
+            .tooltip_text(&tr("Add Bcc recipients"))
             .valign(gtk4::Align::Center)
             .build();
 
@@ -2832,7 +2846,7 @@ impl NorthMailWindow {
             .build();
 
         let subject_label = gtk4::Label::builder()
-            .label("Subject")
+            .label(&tr("Subject"))
             .xalign(1.0)
             .width_request(label_width)
             .css_classes(["dim-label", "compose-field-label"])
@@ -2841,14 +2855,14 @@ impl NorthMailWindow {
         let subject_entry = gtk4::Entry::builder()
             .hexpand(true)
             .has_frame(false)
-            .placeholder_text("Subject")
+            .placeholder_text(&tr("Subject"))
             .css_classes(["compose-entry"])
             .build();
 
         // Attachment button (next to subject)
         let attach_button = gtk4::Button::builder()
             .icon_name("mail-attachment-symbolic")
-            .tooltip_text("Attach file")
+            .tooltip_text(&tr("Attach file"))
             .css_classes(["flat", "circular"])
             .build();
 
@@ -2941,7 +2955,7 @@ impl NorthMailWindow {
         let font_families = gtk4::StringList::new(&font_names);
         let font_dropdown = gtk4::DropDown::builder()
             .model(&font_families)
-            .tooltip_text("Font Family")
+            .tooltip_text(&tr("Font Family"))
             .build();
 
         // Font size dropdown
@@ -2951,7 +2965,7 @@ impl NorthMailWindow {
         let size_dropdown = gtk4::DropDown::builder()
             .model(&font_sizes)
             .selected(2) // Default to 12
-            .tooltip_text("Font Size")
+            .tooltip_text(&tr("Font Size"))
             .build();
 
         // Text style group (Bold, Italic, Underline, Strikethrough)
@@ -2959,22 +2973,22 @@ impl NorthMailWindow {
 
         let bold_btn = gtk4::ToggleButton::builder()
             .icon_name("format-text-bold-symbolic")
-            .tooltip_text("Bold (Ctrl+B)")
+            .tooltip_text(&tr("Bold (Ctrl+B)"))
             .build();
 
         let italic_btn = gtk4::ToggleButton::builder()
             .icon_name("format-text-italic-symbolic")
-            .tooltip_text("Italic (Ctrl+I)")
+            .tooltip_text(&tr("Italic (Ctrl+I)"))
             .build();
 
         let underline_btn = gtk4::ToggleButton::builder()
             .icon_name("format-text-underline-symbolic")
-            .tooltip_text("Underline (Ctrl+U)")
+            .tooltip_text(&tr("Underline (Ctrl+U)"))
             .build();
 
         let strikethrough_btn = gtk4::ToggleButton::builder()
             .icon_name("format-text-strikethrough-symbolic")
-            .tooltip_text("Strikethrough")
+            .tooltip_text(&tr("Strikethrough"))
             .build();
 
         style_group.append(&bold_btn);
@@ -2987,18 +3001,18 @@ impl NorthMailWindow {
 
         let align_left_btn = gtk4::ToggleButton::builder()
             .icon_name("format-justify-left-symbolic")
-            .tooltip_text("Align Left")
+            .tooltip_text(&tr("Align Left"))
             .active(true)
             .build();
 
         let align_center_btn = gtk4::ToggleButton::builder()
             .icon_name("format-justify-center-symbolic")
-            .tooltip_text("Center")
+            .tooltip_text(&tr("Center"))
             .build();
 
         let align_right_btn = gtk4::ToggleButton::builder()
             .icon_name("format-justify-right-symbolic")
-            .tooltip_text("Align Right")
+            .tooltip_text(&tr("Align Right"))
             .build();
 
         align_center_btn.set_group(Some(&align_left_btn));
@@ -3013,12 +3027,12 @@ impl NorthMailWindow {
 
         let bullet_btn = gtk4::ToggleButton::builder()
             .icon_name("view-list-bullet-symbolic")
-            .tooltip_text("Bullet List")
+            .tooltip_text(&tr("Bullet List"))
             .build();
 
         let numbered_btn = gtk4::ToggleButton::builder()
             .icon_name("view-list-ordered-symbolic")
-            .tooltip_text("Numbered List")
+            .tooltip_text(&tr("Numbered List"))
             .build();
 
         list_group.append(&bullet_btn);
@@ -3543,7 +3557,7 @@ impl NorthMailWindow {
                     let remove_btn = gtk4::Button::builder()
                         .icon_name("window-close-symbolic")
                         .css_classes(["flat", "circular"])
-                        .tooltip_text("Remove attachment")
+                        .tooltip_text(&tr("Remove attachment"))
                         .build();
 
                     pill.append(&icon);
@@ -3623,7 +3637,7 @@ impl NorthMailWindow {
             let add_attachment = add_attachment_to_ui.clone();
             attach_button.connect_clicked(move |_| {
                 let dialog = gtk4::FileDialog::builder()
-                    .title("Attach File")
+                    .title(&tr("Attach File"))
                     .modal(true)
                     .build();
 
@@ -3866,18 +3880,18 @@ impl NorthMailWindow {
                                     Ok(Some(uid)) => {
                                         eprintln!("[draft] Updated! uid={}", uid);
                                         *draft_state_cb.borrow_mut() = Some((account_index, uid));
-                                        toast_cb.add_toast(adw::Toast::new("Draft saved"));
+                                        toast_cb.add_toast(adw::Toast::new(&tr("Draft saved")));
                                         app_refresh.refresh_if_viewing_drafts();
                                     }
                                     Ok(None) => {
                                         eprintln!("[draft] Updated (no uid returned)");
                                         *draft_state_cb.borrow_mut() = None;
-                                        toast_cb.add_toast(adw::Toast::new("Draft saved"));
+                                        toast_cb.add_toast(adw::Toast::new(&tr("Draft saved")));
                                         app_refresh.refresh_if_viewing_drafts();
                                     }
                                     Err(e) => {
                                         eprintln!("[draft] Update FAILED: {}", e);
-                                        toast_cb.add_toast(adw::Toast::new("Failed to save draft"));
+                                        toast_cb.add_toast(adw::Toast::new(&tr("Failed to save draft")));
                                     }
                                 }
                             });
@@ -3896,18 +3910,18 @@ impl NorthMailWindow {
                                         Ok(Some(uid)) => {
                                             eprintln!("[draft] Saved! uid={}", uid);
                                             *draft_state_cb.borrow_mut() = Some((account_index, uid));
-                                            toast_inner.add_toast(adw::Toast::new("Draft saved"));
+                                            toast_inner.add_toast(adw::Toast::new(&tr("Draft saved")));
                                             app_refresh_inner.refresh_if_viewing_drafts();
                                         }
                                         Ok(None) => {
                                             eprintln!("[draft] Saved (no uid returned)");
                                             *draft_state_cb.borrow_mut() = None;
-                                            toast_inner.add_toast(adw::Toast::new("Draft saved"));
+                                            toast_inner.add_toast(adw::Toast::new(&tr("Draft saved")));
                                             app_refresh_inner.refresh_if_viewing_drafts();
                                         }
                                         Err(e) => {
                                             eprintln!("[draft] Save FAILED: {}", e);
-                                            toast_inner.add_toast(adw::Toast::new("Failed to save draft"));
+                                            toast_inner.add_toast(adw::Toast::new(&tr("Failed to save draft")));
                                         }
                                     }
                                 });
@@ -3924,18 +3938,18 @@ impl NorthMailWindow {
                                 Ok(Some(uid)) => {
                                     eprintln!("[draft] Saved! uid={}", uid);
                                     *draft_state_cb.borrow_mut() = Some((account_index, uid));
-                                    toast_cb.add_toast(adw::Toast::new("Draft saved"));
+                                    toast_cb.add_toast(adw::Toast::new(&tr("Draft saved")));
                                     app_refresh.refresh_if_viewing_drafts();
                                 }
                                 Ok(None) => {
                                     eprintln!("[draft] Saved (no uid returned)");
                                     *draft_state_cb.borrow_mut() = None;
-                                    toast_cb.add_toast(adw::Toast::new("Draft saved"));
+                                    toast_cb.add_toast(adw::Toast::new(&tr("Draft saved")));
                                     app_refresh.refresh_if_viewing_drafts();
                                 }
                                 Err(e) => {
                                     eprintln!("[draft] Save FAILED: {}", e);
-                                    toast_cb.add_toast(adw::Toast::new("Failed to save draft"));
+                                    toast_cb.add_toast(adw::Toast::new(&tr("Failed to save draft")));
                                 }
                             }
                         });
@@ -3969,7 +3983,7 @@ impl NorthMailWindow {
             if initial_idx < sendable.len() && !sendable[initial_idx] {
                 warning_btn.set_visible(true);
                 send_btn.set_sensitive(false);
-                send_btn.set_tooltip_text(Some("Cannot send from this account"));
+                send_btn.set_tooltip_text(Some(&tr("Cannot send from this account")));
             }
 
             from_dropdown.connect_selected_notify(move |dropdown| {
@@ -3982,7 +3996,7 @@ impl NorthMailWindow {
                     } else {
                         warning_btn.set_visible(true);
                         send_btn.set_sensitive(false);
-                        send_btn.set_tooltip_text(Some("Cannot send from this account"));
+                        send_btn.set_tooltip_text(Some(&tr("Cannot send from this account")));
                     }
                 }
             });
@@ -3993,10 +4007,10 @@ impl NorthMailWindow {
             let compose_win = compose_window.clone();
             warning_button.connect_clicked(move |_| {
                 let dialog = adw::AlertDialog::builder()
-                    .heading("Cannot Send from This Account")
-                    .body("This Microsoft account uses a legacy authentication method (Windows Live) that doesn't support sending emails.\n\nTo fix this, remove the account in GNOME Settings → Online Accounts, then re-add it as \"Microsoft 365\".")
+                    .heading(&tr("Cannot Send from This Account"))
+                    .body(&tr("This Microsoft account uses a legacy authentication method (Windows Live) that doesn't support sending emails.\n\nTo fix this, remove the account in GNOME Settings \u{2192} Online Accounts, then re-add it as \"Microsoft 365\"."))
                     .build();
-                dialog.add_response("ok", "OK");
+                dialog.add_response("ok", &tr("OK"));
                 dialog.set_default_response(Some("ok"));
                 dialog.present(Some(&compose_win));
             });
@@ -4035,7 +4049,7 @@ impl NorthMailWindow {
 
             if to_list.is_empty() {
                 if let Some(win) = window_ref.downcast_ref::<NorthMailWindow>() {
-                    win.add_toast(adw::Toast::new("Please add at least one recipient"));
+                    win.add_toast(adw::Toast::new(&tr("Please add at least one recipient")));
                 }
                 return;
             }
@@ -4046,7 +4060,7 @@ impl NorthMailWindow {
             timer_generation_send.set(timer_generation_send.get().wrapping_add(1));
 
             send_btn_ref.set_sensitive(false);
-            send_btn_ref.set_label("Sending…");
+            send_btn_ref.set_label(&tr("Sending…"));
 
             if let Some(app) = window_ref.application() {
                 if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
@@ -4071,7 +4085,7 @@ impl NorthMailWindow {
                             match result {
                                 Ok(()) => {
                                     if let Some(win) = window_for_toast.downcast_ref::<NorthMailWindow>() {
-                                        win.add_toast(adw::Toast::new("Message sent"));
+                                        win.add_toast(adw::Toast::new(&tr("Message sent")));
                                     }
                                     was_sent_cb.set(true);
 
@@ -4084,10 +4098,10 @@ impl NorthMailWindow {
                                 }
                                 Err(e) => {
                                     if let Some(win) = window_for_toast.downcast_ref::<NorthMailWindow>() {
-                                        win.add_toast(adw::Toast::new(&format!("Send failed: {}", e)));
+                                        win.add_toast(adw::Toast::new(&format!("{}: {}", tr("Send failed"), e)));
                                     }
                                     send_btn_restore.set_sensitive(true);
-                                    send_btn_restore.set_label("Send");
+                                    send_btn_restore.set_label(&tr("Send"));
                                 }
                             }
                         },
@@ -4114,11 +4128,11 @@ impl NorthMailWindow {
             let saved_state = *draft_state_close.borrow();
             if let Some((acct_idx, uid)) = saved_state {
                 let dialog = adw::AlertDialog::builder()
-                    .heading("Delete draft?")
-                    .body("A draft of this message has been saved. Do you want to keep it or delete it?")
+                    .heading(&tr("Delete draft?"))
+                    .body(&tr("A draft of this message has been saved. Do you want to keep it or delete it?"))
                     .build();
-                dialog.add_response("keep", "Keep Draft");
-                dialog.add_response("delete", "Delete Draft");
+                dialog.add_response("keep", &tr("Keep Draft"));
+                dialog.add_response("delete", &tr("Delete Draft"));
                 dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
                 dialog.set_default_response(Some("keep"));
                 dialog.set_close_response("keep");
@@ -4236,7 +4250,7 @@ impl NorthMailWindow {
         let entry = gtk4::Entry::builder()
             .hexpand(true)
             .has_frame(false)
-            .placeholder_text("Add recipient")
+            .placeholder_text(&tr("Add recipient"))
             .css_classes(["compose-entry"])
             .build();
 
@@ -4712,8 +4726,8 @@ impl NorthMailWindow {
         // Show a "select a message" placeholder in the message view
         let placeholder = adw::StatusPage::builder()
             .icon_name("mail-read-symbolic")
-            .title("Select a Message")
-            .description("Choose a message from the list to read it")
+            .title(&tr("Select a Message"))
+            .description(&tr("Choose a message from the list to read it"))
             .vexpand(true)
             .build();
 
@@ -4749,7 +4763,8 @@ impl NorthMailWindow {
         if *self.imp().current_message_uid.borrow() == Some(uid) {
             if let Some(btn) = self.imp().current_read_button.borrow().as_ref() {
                 btn.set_icon_name(if is_read { "mail-unread-symbolic" } else { "mail-read-symbolic" });
-                btn.set_tooltip_text(Some(if is_read { "Mark as Unread" } else { "Mark as Read" }));
+                let tip = if is_read { tr("Mark as Unread") } else { tr("Mark as Read") };
+                btn.set_tooltip_text(Some(&tip));
             }
             if let Some(state) = self.imp().current_read_state.borrow().as_ref() {
                 state.set(is_read);
@@ -4766,7 +4781,7 @@ impl NorthMailWindow {
 
     /// Show loading spinner in the message list area
     pub fn show_loading(&self) {
-        self.show_loading_with_status("Connecting...", None);
+        self.show_loading_with_status(&tr("Connecting..."), None);
     }
 
     /// Show loading with a specific status message
@@ -4904,7 +4919,7 @@ fn build_attachment_row(attachment: ParsedAttachment) -> adw::ActionRow {
     let open_btn = gtk4::Button::builder()
         .icon_name("eye-open-negative-filled-symbolic")
         .css_classes(["flat", "circular"])
-        .tooltip_text("Preview")
+        .tooltip_text(&tr("Preview"))
         .valign(gtk4::Align::Center)
         .build();
 
@@ -4920,7 +4935,7 @@ fn build_attachment_row(attachment: ParsedAttachment) -> adw::ActionRow {
     let save_btn = gtk4::Button::builder()
         .icon_name("document-save-symbolic")
         .css_classes(["flat", "circular"])
-        .tooltip_text("Save")
+        .tooltip_text(&tr("Save"))
         .valign(gtk4::Align::Center)
         .build();
 

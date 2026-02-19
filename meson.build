@@ -20,9 +20,16 @@ localedir = prefix / get_option('localedir')
 dependency('gtk4', version: '>= 4.14')
 dependency('libadwaita-1', version: '>= 1.4')
 
-# Install desktop file
-install_data(
-  'data/org.northmail.NorthMail.desktop',
+# Translations
+subdir('po')
+
+# Install desktop file (with translations merged in)
+i18n.merge_file(
+  input: 'data/org.northmail.NorthMail.desktop.in',
+  output: 'org.northmail.NorthMail.desktop',
+  type: 'desktop',
+  po_dir: 'po',
+  install: true,
   install_dir: datadir / 'applications',
 )
 

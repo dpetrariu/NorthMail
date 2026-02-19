@@ -1,0 +1,780 @@
+# German translation for NorthMail
+# Copyright (C) 2024 NorthMail Contributors
+# This file is distributed under the same license as the NorthMail package.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: northmail 0.1.0\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2024-01-01 00:00+0000\n"
+"PO-Revision-Date: 2026-02-19 00:00+0000\n"
+"Last-Translator: \n"
+"Language-Team: German\n"
+"Language: de\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "&gt;"
+msgstr "&gt;"
+
+msgid "&lt;"
+msgstr "&lt;"
+
+msgid "(Message body is still loading...)"
+msgstr "(Nachricht wird geladen...)"
+
+msgid "(No Subject)"
+msgstr "(Kein Betreff)"
+
+msgid "(No subject)"
+msgstr "(Kein Betreff)"
+
+msgid "(sync to update)"
+msgstr "(synchronisiere zum Aktualisieren)"
+
+msgid "A draft of this message has been saved. Do you want to keep it or delete it?"
+msgstr "Ein Entwurf dieser Nachricht wurde gespeichert. Möchten Sie ihn behalten oder löschen?"
+
+msgid "A modern email client for GNOME"
+msgstr "Ein moderner E-Mail-Client für GNOME"
+
+msgid "AM"
+msgstr "AM"
+
+msgid "Account added"
+msgstr "Konto hinzugefügt"
+
+msgid "Account not found"
+msgstr "Konto nicht gefunden"
+
+msgid "Account removed"
+msgstr "Konto entfernt"
+
+msgid "Accounts"
+msgstr "Konten"
+
+msgid "Add Account"
+msgstr "Konto hinzufügen"
+
+msgid "Add Bcc recipients"
+msgstr "Bcc-Empfänger hinzufügen"
+
+msgid "Add Email Account"
+msgstr "E-Mail-Konto hinzufügen"
+
+msgid "Add Gmail Account"
+msgstr "Gmail-Konto hinzufügen"
+
+msgid "Add an email account to get started"
+msgstr "Fügen Sie ein E-Mail-Konto hinzu, um loszulegen"
+
+msgid "Add recipient"
+msgstr "Empfänger hinzufügen"
+
+msgid "Add to Contacts"
+msgstr "Zu Kontakten hinzufügen"
+
+msgid "Added"
+msgstr "Hinzugefügt"
+
+msgid "Added account:"
+msgstr "Konto hinzugefügt:"
+
+msgid "After:"
+msgstr "Nach:"
+
+msgid "Align Left"
+msgstr "Linksbündig"
+
+msgid "Align Right"
+msgstr "Rechtsbündig"
+
+msgid "All Inboxes"
+msgstr "Alle Posteingänge"
+
+msgid "App Icon"
+msgstr "App Symbol"
+
+msgid "Appearance"
+msgstr "Erscheinungsbild"
+
+msgid "Archive"
+msgstr "Archivieren"
+
+msgid "Attach File"
+msgstr "Datei anhängen"
+
+msgid "Attach file"
+msgstr "Datei anhängen"
+
+msgid "Auth failed"
+msgstr "Authentifizierung fehlgeschlagen"
+
+msgid "Auth manager error"
+msgstr "Fehler im Authentifizierungsmanager"
+
+msgid "Auth manager failed"
+msgstr "Authentifizierungsmanager fehlgeschlagen"
+
+msgid "Authenticate"
+msgstr "Authentifizieren"
+
+msgid "Authentication failed"
+msgstr "Authentifizierung fehlgeschlagen"
+
+msgid "Bcc"
+msgstr "Bcc"
+
+msgid "Before:"
+msgstr "Vor:"
+
+msgid "Bold (Ctrl+B)"
+msgstr "Fett (Ctrl+B)"
+
+msgid "Built With"
+msgstr "Erstellt mit"
+
+msgid "Bullet List"
+msgstr "Aufzählungsliste"
+
+msgid "Cache Management"
+msgstr "Cache-Verwaltung"
+
+msgid "Cached Messages"
+msgstr "Zwischengespeicherte Nachrichten"
+
+msgid "Cancel"
+msgstr "Abbrechen"
+
+msgid "Cannot Send from This Account"
+msgstr "Senden von diesem Konto nicht möglich"
+
+msgid "Cannot move between different accounts"
+msgstr "Verschieben zwischen verschiedenen Konten nicht möglich"
+
+msgid "Cannot send from this account"
+msgstr "Senden von diesem Konto nicht möglich"
+
+msgid "Cc"
+msgstr "Cc"
+
+msgid "Cc:"
+msgstr "Cc:"
+
+msgid "Center"
+msgstr "Zentriert"
+
+msgid "Channel disconnected"
+msgstr "Verbindung getrennt"
+
+msgid "Check for New Mail"
+msgstr "Auf neue E-Mails prüfen"
+
+msgid "Checking for updates..."
+msgstr "Aktualisiere..."
+
+msgid "Choose a folder from the sidebar to view messages"
+msgstr "Wählen Sie einen Ordner in der Seitenleiste, um Nachrichten anzuzeigen"
+
+msgid "Choose a message from the list to read it"
+msgstr "Wählen Sie eine Nachricht aus der Liste, um sie zu lesen"
+
+msgid "Choose the application color scheme"
+msgstr "Farbschema der Anwendung wählen"
+
+msgid "Clear All Cache"
+msgstr "Gesamten Cache leeren"
+
+msgid "Clear Filters"
+msgstr "Filter zurücksetzen"
+
+msgid "Color Scheme"
+msgstr "Farbschema"
+
+msgid "Compose"
+msgstr "Verfassen"
+
+msgid "Connecting..."
+msgstr "Verbinden..."
+
+msgid "Connection lost"
+msgstr "Verbindung verloren"
+
+msgid "Copy Address"
+msgstr "Adresse kopieren"
+
+msgid "Could not find Sent folder"
+msgstr "Ordner 'Gesendet' nicht gefunden"
+
+msgid "Could not resolve folder"
+msgstr "Ordner konnte nicht aufgelöst werden"
+
+msgid "Dark"
+msgstr "Dunkel"
+
+msgid "Database not available"
+msgstr "Datenbank nicht verfügbar"
+
+msgid "Database not initialized"
+msgstr "Datenbank nicht initialisiert"
+
+msgid "Date"
+msgstr "Datum"
+
+msgid "Delete"
+msgstr "Löschen"
+
+msgid "Delete Draft"
+msgstr "Entwurf löschen"
+
+msgid "Delete Message?"
+msgstr "Nachricht löschen?"
+
+msgid "Delete all cached messages and bodies"
+msgstr "Alle zwischengespeicherten Nachrichten und Inhalte löschen"
+
+msgid "Delete draft?"
+msgstr "Entwurf löschen?"
+
+msgid "Desktop Notifications"
+msgstr "Desktop-Benachrichtigungen"
+
+msgid "Display sender and subject in notifications"
+msgstr "Absender und Betreff in Benachrichtigungen anzeigen"
+
+msgid "Do Not Disturb"
+msgstr "Nicht stören"
+
+msgid "Draft delete thread crashed"
+msgstr "Thread zum Löschen des Entwurfs abgestürzt"
+
+msgid "Draft save thread crashed"
+msgstr "Thread zum Speichern des Entwurfs abgestürzt"
+
+msgid "Draft saved"
+msgstr "Entwurf gespeichert"
+
+msgid "Drafts"
+msgstr "Entwürfe"
+
+msgid "Empty Folder"
+msgstr "Leerer Ordner"
+
+msgid "Every 10 minutes"
+msgstr "Alle 10 Minuten"
+
+msgid "Every 15 minutes"
+msgstr "Alle 15 Minuten"
+
+msgid "Every 2 minutes"
+msgstr "Alle 2 Minuten"
+
+msgid "Every 30 minutes"
+msgstr "Alle 30 Minuten"
+
+msgid "Every 5 minutes"
+msgstr "Alle 5 Minuten"
+
+msgid "Every minute"
+msgstr "Jede Minute"
+
+msgid "Failed to add account:"
+msgstr "Konto konnte nicht hinzugefügt werden:"
+
+msgid "Failed to add contact"
+msgstr "Kontakt konnte nicht hinzugefügt werden"
+
+msgid "Failed to authenticate"
+msgstr "Authentifizierung fehlgeschlagen"
+
+msgid "Failed to fetch body for message after retries:"
+msgstr "Nachrichteninhalt konnte nach Wiederholungsversuchen nicht abgerufen werden:"
+
+msgid "Failed to fetch messages"
+msgstr "Nachrichten konnten nicht abgerufen werden"
+
+msgid "Failed to get credentials"
+msgstr "Anmeldedaten konnten nicht abgerufen werden"
+
+msgid "Failed to list folders"
+msgstr "Ordner konnten nicht aufgelistet werden"
+
+msgid "Failed to load inbox"
+msgstr "Posteingang konnte nicht geladen werden"
+
+msgid "Failed to load message body"
+msgstr "Nachrichteninhalt konnte nicht geladen werden"
+
+msgid "Failed to load messages"
+msgstr "Nachrichten konnten nicht geladen werden"
+
+msgid "Failed to save draft"
+msgstr "Entwurf konnte nicht gespeichert werden"
+
+msgid "Failed to select folder"
+msgstr "Ordner konnte nicht ausgewählt werden"
+
+msgid "Failed to send command"
+msgstr "Befehl konnte nicht gesendet werden"
+
+msgid "Fetch failed"
+msgstr "Abruf fehlgeschlagen"
+
+msgid "Filter messages"
+msgstr "Nachrichten filtern"
+
+msgid "Folder not found"
+msgstr "Ordner nicht gefunden"
+
+msgid "Font Family"
+msgstr "Schriftfamilie"
+
+msgid "Font Size"
+msgstr "Schriftgröße"
+
+msgid "Forward"
+msgstr "Weiterleiten"
+
+msgid "Forwarded message"
+msgstr "Weitergeleitete Nachricht"
+
+msgid "From"
+msgstr "Von"
+
+msgid "From..."
+msgstr "Von..."
+
+msgid "General"
+msgstr "Allgemein"
+
+msgid "Graph fetch body failed"
+msgstr "Graph-Abruf des Nachrichteninhalts fehlgeschlagen"
+
+msgid "Graph list_attachments failed"
+msgstr "Graph-Abruf der Anhänge fehlgeschlagen"
+
+msgid "Graph message ID not found in cache"
+msgstr "Graph-Nachrichten-ID nicht im Cache gefunden"
+
+msgid "Has attachments"
+msgstr "Hat Anhänge"
+
+msgid "How often to automatically check for new emails"
+msgstr "Wie oft automatisch nach neuen E-Mails gesucht wird"
+
+msgid "Important"
+msgstr "Wichtig"
+
+msgid "Inbox"
+msgstr "Posteingang"
+
+msgid "Inbox folder not found via Graph API"
+msgstr "Posteingangsordner über Graph-API nicht gefunden"
+
+msgid "Include Attachments?"
+msgstr "Anhänge einschließen?"
+
+msgid "Invalid account selection"
+msgstr "Ungültige Kontoauswahl"
+
+msgid "Italic (Ctrl+I)"
+msgstr "Kursiv (Ctrl+I)"
+
+msgid "Junk"
+msgstr "Spam"
+
+msgid "Keep Draft"
+msgstr "Entwurf behalten"
+
+msgid "Light"
+msgstr "Hell"
+
+msgid "Loading"
+msgstr "Laden"
+
+msgid "Loading message..."
+msgstr "Nachricht wird geladen..."
+
+msgid "Loading messages..."
+msgstr "Nachrichten werden geladen..."
+
+msgid "Loading more..."
+msgstr "Weitere werden geladen..."
+
+msgid "Loading..."
+msgstr "Laden..."
+
+msgid "Mail Checking"
+msgstr "E-Mail-Abruf"
+
+msgid "Manage accounts in GNOME Settings"
+msgstr "Konten in den GNOME-Einstellungen verwalten"
+
+msgid "Mark as Read"
+msgstr "Als gelesen markieren"
+
+msgid "Mark as Spam"
+msgstr "Als Spam markieren"
+
+msgid "Mark as Unread"
+msgstr "Als ungelesen markieren"
+
+msgid "Message archived"
+msgstr "Nachricht archiviert"
+
+msgid "Message deleted"
+msgstr "Nachricht gelöscht"
+
+msgid "Message sent"
+msgstr "Nachricht gesendet"
+
+msgid "Messages stored locally for offline access and fast loading"
+msgstr "Lokal gespeicherte Nachrichten für Offlinezugriff und schnelles Laden"
+
+msgid "Move to Trash"
+msgstr "In den Papierkorb verschieben"
+
+msgid "Moved to"
+msgstr "Verschoben nach"
+
+msgid "New Email"
+msgstr "Neue E-Mail"
+
+msgid "New Message"
+msgstr "Neue Nachricht"
+
+msgid "No"
+msgstr "Nein"
+
+msgid "No Matching Messages"
+msgstr "Keine passenden Nachrichten"
+
+msgid "No Message Selected"
+msgstr "Keine Nachricht ausgewählt"
+
+msgid "No Results"
+msgstr "Keine Ergebnisse"
+
+msgid "No content available"
+msgstr "Kein Inhalt verfügbar"
+
+msgid "No folder selected"
+msgstr "Kein Ordner ausgewählt"
+
+msgid "No messages match your search"
+msgstr "Keine Nachrichten entsprechen Ihrer Suche"
+
+msgid "NorthMail uses GNOME Online Accounts to manage your email accounts. Add or remove accounts in System Settings."
+msgstr "NorthMail verwendet GNOME-Onlinekonten zur Verwaltung Ihrer E-Mail-Konten. Fügen Sie Konten in den Systemeinstellungen hinzu oder entfernen Sie sie."
+
+msgid "NorthMail will open your browser to authenticate with Google."
+msgstr "NorthMail öffnet Ihren Browser zur Authentifizierung bei Google."
+
+msgid "Not Implemented"
+msgstr "Nicht implementiert"
+
+msgid "Notification Sound"
+msgstr "Benachrichtigungston"
+
+msgid "Notifications"
+msgstr "Benachrichtigungen"
+
+msgid "Numbered List"
+msgstr "Nummerierte Liste"
+
+msgid "OK"
+msgstr "OK"
+
+msgid "On"
+msgstr "Ein"
+
+msgid "Online Accounts"
+msgstr "Onlinekonten"
+
+msgid "Open"
+msgstr "Öffnen"
+
+msgid "Open Settings"
+msgstr "Einstellungen öffnen"
+
+msgid "Open Settings..."
+msgstr "Einstellungen öffnen..."
+
+msgid "PM"
+msgstr "PM"
+
+msgid "Play a sound when new emails arrive"
+msgstr "Ton abspielen, wenn neue E-Mails eintreffen"
+
+msgid "Please add at least one recipient"
+msgstr "Bitte fügen Sie mindestens einen Empfänger hinzu"
+
+msgid "Please restart for the changes to take effect."
+msgstr "Bitte starten Sie die Anwendung neu, damit die Änderungen wirksam werden."
+
+msgid "Please wait for the message to load"
+msgstr "Bitte warten Sie, bis die Nachricht geladen ist"
+
+msgid "Pool error"
+msgstr "Pool-Fehler"
+
+msgid "Pool worker disconnected"
+msgstr "Pool-Worker getrennt"
+
+msgid "Preview"
+msgstr "Vorschau"
+
+msgid "Re-sync all messages from all accounts"
+msgstr "Alle Nachrichten aller Konten erneut synchronisieren"
+
+msgid "Refresh Accounts"
+msgstr "Konten aktualisieren"
+
+msgid "Reload All Messages"
+msgstr "Alle Nachrichten neu laden"
+
+msgid "Remove attachment"
+msgstr "Anhang entfernen"
+
+msgid "Reply"
+msgstr "Antworten"
+
+msgid "Reply All"
+msgstr "Allen antworten"
+
+msgid "Retry"
+msgstr "Erneut versuchen"
+
+msgid "Retrying..."
+msgstr "Erneuter Versuch..."
+
+msgid "Save"
+msgstr "Speichern"
+
+msgid "Search messages..."
+msgstr "Nachrichten durchsuchen..."
+
+msgid "Select a Message"
+msgstr "Nachricht auswählen"
+
+msgid "Select a folder"
+msgstr "Ordner auswählen"
+
+msgid "Select a message to view its contents"
+msgstr "Wählen Sie eine Nachricht aus, um ihren Inhalt anzuzeigen"
+
+msgid "Select an account from GNOME Online Accounts or add a new one."
+msgstr "Wählen Sie ein Konto aus den GNOME-Onlinekonten oder fügen Sie ein neues hinzu."
+
+msgid "Select failed"
+msgstr "Auswahl fehlgeschlagen"
+
+msgid "Send"
+msgstr "Senden"
+
+msgid "Send failed"
+msgstr "Senden fehlgeschlagen"
+
+msgid "Send thread crashed"
+msgstr "Sende-Thread abgestürzt"
+
+msgid "Sending…"
+msgstr "Wird gesendet…"
+
+msgid "Sent"
+msgstr "Gesendet"
+
+msgid "Settings"
+msgstr "Einstellungen"
+
+msgid "Show Message Preview"
+msgstr "Nachrichtenvorschau anzeigen"
+
+msgid "Show notifications for new emails"
+msgstr "Benachrichtigungen für neue E-Mails anzeigen"
+
+msgid "Standalone OAuth2 is not yet implemented. Please add your Gmail account in GNOME Settings → Online Accounts first."
+msgstr "Eigenständiges OAuth2 ist noch nicht implementiert. Bitte fügen Sie Ihr Gmail-Konto zuerst unter GNOME-Einstellungen → Onlinekonten hinzu."
+
+msgid "Star"
+msgstr "Markieren"
+
+msgid "Starred"
+msgstr "Markiert"
+
+msgid "Strikethrough"
+msgstr "Durchgestrichen"
+
+msgid "Subject"
+msgstr "Betreff"
+
+msgid "Suppress all notifications"
+msgstr "Alle Benachrichtigungen unterdrücken"
+
+msgid "Syncing"
+msgstr "Synchronisiere"
+
+msgid "Syncing older messages..."
+msgstr "Synchronisiere ältere Nachrichten..."
+
+msgid "Syncing..."
+msgstr "Synchronisiere..."
+
+msgid "System"
+msgstr "System"
+
+msgid "There are no messages in this folder"
+msgstr "In diesem Ordner befinden sich keine Nachrichten"
+
+msgid "This account cannot send emails"
+msgstr "Dieses Konto kann keine E-Mails senden"
+
+msgid "This message will be moved to Trash."
+msgstr "Diese Nachricht wird in den Papierkorb verschoben."
+
+msgid "Timeout waiting for body of message"
+msgstr "Zeitüberschreitung beim Warten auf den Nachrichteninhalt"
+
+msgid "To"
+msgstr "An"
+
+msgid "To/Cc..."
+msgstr "An/Cc..."
+
+msgid "To:"
+msgstr "An:"
+
+msgid "Toggle Sidebar"
+msgstr "Seitenleiste ein-/ausblenden"
+
+msgid "Trash"
+msgstr "Papierkorb"
+
+msgid "Try adjusting your filters"
+msgstr "Versuchen Sie, Ihre Filter anzupassen"
+
+msgid "Underline (Ctrl+U)"
+msgstr "Unterstrichen (Ctrl+U)"
+
+msgid "Unknown"
+msgstr "Unbekannt"
+
+msgid "Unread only"
+msgstr "Nur ungelesene"
+
+msgid "Unstar"
+msgstr "Markierung aufheben"
+
+msgid "Unsupported auth type"
+msgstr "Nicht unterstützter Authentifizierungstyp"
+
+msgid "Up to date"
+msgstr "Aktuell"
+
+msgid "Welcome to NorthMail"
+msgstr "Willkommen bei NorthMail"
+
+msgid "Yes"
+msgstr "Ja"
+
+msgid "Yesterday"
+msgstr "Gestern"
+
+msgid "You have a new message"
+msgstr "Sie haben eine neue Nachricht"
+
+msgid "You have new messages"
+msgstr "Sie haben neue Nachrichten"
+
+msgid "[No content]"
+msgstr "[Kein Inhalt]"
+
+msgid "accounts"
+msgstr "Konten"
+
+msgid "bodies cached"
+msgstr "Inhalte zwischengespeichert"
+
+msgid "loading"
+msgstr "Lade"
+
+msgid "messages"
+msgstr "Nachrichten"
+
+msgid "new"
+msgstr "neu"
+
+msgid "read"
+msgstr "gelesen"
+
+msgid "to contacts"
+msgstr "zu Kontakten"
+
+msgid "unread"
+msgstr "ungelesen"
+
+msgid "unsupported"
+msgstr "nicht unterstützt"
+
+msgid "wrote"
+msgstr "schrieb"
+
+msgid "{} accounts are not yet supported"
+msgstr "{}-Konten werden noch nicht unterstützt"
+
+msgid "Archive {} Message"
+msgid_plural "Archive {} Messages"
+msgstr[0] "{} Nachricht archivieren"
+msgstr[1] "{} Nachrichten archivieren"
+
+msgid "Mark {} as Read"
+msgid_plural "Mark {} as Read"
+msgstr[0] "{} als gelesen markieren"
+msgstr[1] "{} als gelesen markieren"
+
+msgid "Mark {} as Spam"
+msgid_plural "Mark {} as Spam"
+msgstr[0] "{} als Spam markieren"
+msgstr[1] "{} als Spam markieren"
+
+msgid "Mark {} as Unread"
+msgid_plural "Mark {} as Unread"
+msgstr[0] "{} als ungelesen markieren"
+msgstr[1] "{} als ungelesen markieren"
+
+msgid "Move {} to Trash"
+msgid_plural "Move {} to Trash"
+msgstr[0] "{} in den Papierkorb verschieben"
+msgstr[1] "{} in den Papierkorb verschieben"
+
+msgid "Star {}"
+msgid_plural "Star {}"
+msgstr[0] "{} markieren"
+msgstr[1] "{} markieren"
+
+msgid "Unstar {}"
+msgid_plural "Unstar {}"
+msgstr[0] "Markierung von {} aufheben"
+msgstr[1] "Markierung von {} aufheben"
+
+msgid "{} Message"
+msgid_plural "{} Messages"
+msgstr[0] "{} Nachricht"
+msgstr[1] "{} Nachrichten"
+
+msgid "{} New Email"
+msgid_plural "{} New Emails"
+msgstr[0] "{} neue E-Mail"
+msgstr[1] "{} neue E-Mails"
+
+msgid "{} account"
+msgid_plural "{} accounts"
+msgstr[0] "{} Konto"
+msgstr[1] "{} Konten"
+
+msgid "{} attachment"
+msgid_plural "{} attachments"
+msgstr[0] "{} Anhang"
+msgstr[1] "{} Anhänge"

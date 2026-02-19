@@ -1,0 +1,8 @@
+crates/northmail-gtk/src/main.rs
+crates/northmail-gtk/src/i18n.rs
+crates/northmail-gtk/src/application.rs
+crates/northmail-gtk/src/window.rs
+crates/northmail-gtk/src/widgets/message_list.rs
+crates/northmail-gtk/src/widgets/message_view.rs
+crates/northmail-gtk/src/widgets/folder_sidebar.rs
+data/org.northmail.NorthMail.desktop.in

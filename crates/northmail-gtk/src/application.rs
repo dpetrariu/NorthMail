@@ -1,5 +1,6 @@
 //! Main application setup
 
+use crate::i18n::{tr, ntr};
 use crate::idle_manager::{IdleAuthType, IdleCredentials, IdleManager, IdleManagerEvent};
 use crate::imap_pool::{ImapCommand, ImapCredentials, ImapPool, ImapResponse};
 use crate::widgets::MessageInfo;
@@ -948,34 +949,35 @@ impl NorthMailApplication {
                 if let Some(msg_info) = self.get_latest_message_info(account_id).await {
                     (msg_info.0, msg_info.1) // (from, subject)
                 } else {
-                    ("New Email".to_string(), "You have a new message".to_string())
+                    (tr("New Email"), tr("You have a new message"))
                 }
             } else {
-                ("New Email".to_string(), "You have a new message".to_string())
+                (tr("New Email"), tr("You have a new message"))
             }
         } else if total_new > 1 {
             // Multiple messages
-            let summary = format!("{} New Emails", total_new);
+            let summary = ntr("{} New Email", "{} New Emails", total_new as u32).replace("{}", &total_new.to_string());
             let body = if show_preview {
                 new_messages
                     .iter()
                     .map(|(account_id, count)| {
                         let accounts = self.imp().accounts.borrow();
+                        let unknown = tr("Unknown");
                         let email = accounts
                             .iter()
                             .find(|a| a.id == *account_id)
                             .map(|a| a.email.as_str())
-                            .unwrap_or("Unknown");
-                        format!("{}: {} new", email, count)
+                            .unwrap_or(&unknown);
+                        format!("{}: {} {}", email, count, tr("new"))
                     })
                     .collect::<Vec<_>>()
                     .join("\n")
             } else {
-                "You have new messages".to_string()
+                tr("You have new messages")
             };
             (summary, body)
         } else {
-            ("New Email".to_string(), "You have a new message".to_string())
+            (tr("New Email"), tr("You have a new message"))
         };
 
         // Send notification using libnotify (works on both X11 and Wayland)
@@ -1075,8 +1077,8 @@ impl NorthMailApplication {
         loop {
             match receiver.try_recv() {
                 Ok(Ok(Some(msg))) => {
-                    let from = msg.from_name.or(msg.from_address).unwrap_or_else(|| "Unknown".to_string());
-                    let subject = msg.subject.unwrap_or_else(|| "(No subject)".to_string());
+                    let from = msg.from_name.or(msg.from_address).unwrap_or_else(|| tr("Unknown"));
+                    let subject = msg.subject.unwrap_or_else(|| tr("(No subject)"));
                     return Some((from, subject));
                 }
                 Ok(Ok(None)) => return None,
@@ -1223,7 +1225,7 @@ impl NorthMailApplication {
             // Show toasts for changes
             for acct in &added {
                 info!("GOA account added: {}", acct.email);
-                app.show_toast(&format!("Account added: {}", acct.email));
+                app.show_toast(&format!("{}: {}", tr("Account added"), acct.email));
             }
             for acct in &removed {
                 info!("GOA account removed: {}", acct.email);
@@ -1231,7 +1233,7 @@ impl NorthMailApplication {
                 if let Some(idle_mgr) = app.imp().idle_manager.get() {
                     idle_mgr.stop_idle(&acct.id);
                 }
-                app.show_toast(&format!("Account removed: {}", acct.email));
+                app.show_toast(&format!("{}: {}", tr("Account removed"), acct.email));
             }
 
             // Save new accounts to DB
@@ -1385,16 +1387,13 @@ impl NorthMailApplication {
             }
         };
 
-        // Get old count for comparison
-        let old_count = self.imp().last_inbox_counts.borrow()
-            .get(account_id)
-            .copied()
-            .unwrap_or(0);
-
         let app = self.clone();
         let account_id = account_id.to_string();
 
         glib::spawn_future_local(async move {
+            // Get DB count BEFORE sync so we compare apples to apples
+            let old_count = app.get_inbox_count_for_account(&account_id).await;
+
             // Actually fetch new messages from IMAP (not just STATUS)
             info!("IDLE quick sync: fetching new messages for {}", account.email);
             app.stream_inbox_to_cache(&account).await;
@@ -1402,17 +1401,13 @@ impl NorthMailApplication {
             // Refresh sidebar folder counts
             app.refresh_sidebar_folders();
 
-            // Check for new messages
+            // Get DB count AFTER sync
             let new_count = app.get_inbox_count_for_account(&account_id).await;
 
             info!("IDLE sync: old_count={}, new_count={} for {}", old_count, new_count, account_id);
             if new_count > old_count {
                 let diff = new_count - old_count;
                 info!("IDLE sync found {} new messages, triggering notification", diff);
-
-                // Update stored count
-                app.imp().last_inbox_counts.borrow_mut()
-                    .insert(account_id.clone(), new_count);
 
                 // Show notification
                 let new_messages = vec![(account_id.clone(), diff)];
@@ -1703,7 +1698,7 @@ impl NorthMailApplication {
                                         app.imp().state.borrow().save();
                                         if let Some(window) = app.active_window() {
                                             if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
-                                                win.show_loading_with_status("Loading messages...", None);
+                                                win.show_loading_with_status(&tr("Loading messages..."), None);
                                                 if let Some(sidebar) = win.folder_sidebar() {
                                                     sidebar.select_unified_inbox();
                                                 }
@@ -1788,14 +1783,14 @@ impl NorthMailApplication {
 
         // Title case common folder names
         match name.to_uppercase().as_str() {
-            "INBOX" => "Inbox".to_string(),
-            "SENT" | "SENT MAIL" | "SENT MESSAGES" | "SENT ITEMS" => "Sent".to_string(),
-            "DRAFTS" | "DRAFT" => "Drafts".to_string(),
-            "TRASH" | "DELETED" | "DELETED ITEMS" | "DELETED MESSAGES" => "Trash".to_string(),
-            "SPAM" | "JUNK" | "JUNK E-MAIL" | "JUNK MAIL" => "Junk".to_string(),
-            "ARCHIVE" | "ALL MAIL" => "Archive".to_string(),
-            "STARRED" | "FLAGGED" => "Starred".to_string(),
-            "IMPORTANT" => "Important".to_string(),
+            "INBOX" => tr("Inbox"),
+            "SENT" | "SENT MAIL" | "SENT MESSAGES" | "SENT ITEMS" => tr("Sent"),
+            "DRAFTS" | "DRAFT" => tr("Drafts"),
+            "TRASH" | "DELETED" | "DELETED ITEMS" | "DELETED MESSAGES" => tr("Trash"),
+            "SPAM" | "JUNK" | "JUNK E-MAIL" | "JUNK MAIL" => tr("Junk"),
+            "ARCHIVE" | "ALL MAIL" => tr("Archive"),
+            "STARRED" | "FLAGGED" => tr("Starred"),
+            "IMPORTANT" => tr("Important"),
             _ => name.to_string(),
         }
     }
@@ -1934,7 +1929,7 @@ impl NorthMailApplication {
                 // Update status
                 if done == total_accounts {
                     // All accounts done
-                    app.update_simple_sync_status("Up to date");
+                    app.update_simple_sync_status(&tr("Up to date"));
 
                     // Final refresh of unified inbox
                     if app.imp().state.borrow().unified_inbox {
@@ -1956,9 +1951,9 @@ impl NorthMailApplication {
     fn update_sync_status_multi(&self, emails: &[String], completed: usize) {
         let total = emails.len();
         let status = if completed == 0 {
-            format!("Syncing {} accounts...", total)
+            format!("{} {}...", tr("Syncing"), ntr("{} account", "{} accounts", total as u32).replace("{}", &total.to_string()))
         } else {
-            format!("Syncing... {}/{} accounts", completed, total)
+            format!("{}... {}/{} {}", tr("Syncing"), completed, total, tr("accounts"))
         };
         self.update_simple_sync_status(&status);
     }
@@ -1970,7 +1965,7 @@ impl NorthMailApplication {
             .map(|(email, status)| {
                 let short_email = email.split('@').next().unwrap_or(email);
                 match *status {
-                    "loading" => format!("{} (loading)", short_email),
+                    "loading" => format!("{} ({})", short_email, tr("loading")),
                     "syncing" => short_email.to_string(),
                     _ => short_email.to_string(),
                 }
@@ -1981,11 +1976,11 @@ impl NorthMailApplication {
         let total = statuses.len();
 
         if syncing.is_empty() {
-            self.update_simple_sync_status("Up to date");
+            self.update_simple_sync_status(&tr("Up to date"));
         } else if syncing.len() <= 2 {
-            self.update_simple_sync_status(&format!("Syncing {}... ({}/{})", syncing.join(", "), done_count, total));
+            self.update_simple_sync_status(&format!("{} {}... ({}/{})", tr("Syncing"), syncing.join(", "), done_count, total));
         } else {
-            self.update_simple_sync_status(&format!("Syncing {} accounts... ({}/{})", syncing.len(), done_count, total));
+            self.update_simple_sync_status(&format!("{} {} {}... ({}/{})", tr("Syncing"), syncing.len(), tr("accounts"), done_count, total));
         }
     }
 
@@ -2721,7 +2716,7 @@ impl NorthMailApplication {
         let folders = match client.list_folders().await {
             Ok(f) => f,
             Err(e) => {
-                let _ = sender.send(FetchEvent::Error(format!("Graph list_folders failed: {}", e)));
+                let _ = sender.send(FetchEvent::Error(format!("{}: {}", tr("Failed to list folders"), e)));
                 return;
             }
         };
@@ -2729,7 +2724,7 @@ impl NorthMailApplication {
         let inbox_folder = match folders.iter().find(|f| f.display_name == "Inbox") {
             Some(f) => f,
             None => {
-                let _ = sender.send(FetchEvent::Error("Inbox folder not found via Graph API".to_string()));
+                let _ = sender.send(FetchEvent::Error(tr("Inbox folder not found via Graph API")));
                 return;
             }
         };
@@ -2760,7 +2755,7 @@ impl NorthMailApplication {
                 Ok(result) => result,
                 Err(e) => {
                     warn!("Graph list_messages failed at skip={}: {}", skip, e);
-                    let _ = sender.send(FetchEvent::Error(format!("Graph list_messages failed: {}", e)));
+                    let _ = sender.send(FetchEvent::Error(format!("{}: {}", tr("Failed to load messages"), e)));
                     return;
                 }
             };
@@ -2963,7 +2958,7 @@ impl NorthMailApplication {
         if db_folders.is_empty() {
             // Fallback: show just INBOX until real folders are synced
             return vec![crate::widgets::FolderInfo {
-                name: "Inbox".to_string(),
+                name: tr("Inbox"),
                 full_path: "INBOX".to_string(),
                 icon_name: "mail-inbox-symbolic".to_string(),
                 unread_count: Some(0),
@@ -3089,7 +3084,7 @@ impl NorthMailApplication {
                             let email_display = if is_supported {
                                 account.email.clone()
                             } else {
-                                format!("{} (unsupported)", account.email)
+                                format!("{} ({})", account.email, tr("unsupported"))
                             };
 
                             let db_folders = cached_folders_map
@@ -3171,7 +3166,7 @@ impl NorthMailApplication {
                                 let email_display = if is_supported {
                                     account.email.clone()
                                 } else {
-                                    format!("{} (unsupported)", account.email)
+                                    format!("{} ({})", account.email, tr("unsupported"))
                                 };
 
                                 let db_folders = cached_folders_map
@@ -3565,17 +3560,14 @@ impl NorthMailApplication {
             Some(a) => a.clone(),
             None => {
                 error!("Account not found: {}", account_id);
-                self.show_error("Account not found");
+                self.show_error(&tr("Account not found"));
                 return;
             }
         };
 
         // Check if it's a supported account
         if !Self::is_supported_account(&account) {
-            self.show_error(&format!(
-                "{} accounts are not yet supported",
-                account.provider_name
-            ));
+            self.show_error(&tr("{} accounts are not yet supported").replace("{}", &account.provider_name));
             return;
         }
 
@@ -3679,7 +3671,7 @@ impl NorthMailApplication {
                 }
 
                 // Show simple sync status for background update
-                app.update_simple_sync_status("Checking for updates...");
+                app.update_simple_sync_status(&tr("Checking for updates..."));
                 true
             } else {
                 // No cache - show skeleton loading for immediate feedback
@@ -3691,7 +3683,7 @@ impl NorthMailApplication {
                         }
                     }
                 }
-                app.update_simple_sync_status("Loading messages...");
+                app.update_simple_sync_status(&tr("Loading messages..."));
                 false
             };
 
@@ -3765,12 +3757,12 @@ impl NorthMailApplication {
 
                                 if let Err(e) = result {
                                     error!("Failed to fetch messages via Graph: {}", e);
-                                    app.show_error(&format!("Failed to fetch messages: {}", e));
+                                    app.show_error(&format!("{}: {}", tr("Failed to fetch messages"), e));
                                 }
                             }
                             Err(e) => {
                                 error!("Failed to get Graph API token: {}", e);
-                                app.show_error(&format!("Authentication failed: {}", e));
+                                app.show_error(&format!("{}: {}", tr("Authentication failed"), e));
                             }
                         }
                     } else if is_google {
@@ -3789,12 +3781,12 @@ impl NorthMailApplication {
 
                                 if let Err(e) = result {
                                     error!("Failed to fetch messages: {}", e);
-                                    app.show_error(&format!("Failed to fetch messages: {}", e));
+                                    app.show_error(&format!("{}: {}", tr("Failed to fetch messages"), e));
                                 }
                             }
                             Err(e) => {
                                 error!("Failed to get OAuth2 token: {}", e);
-                                app.show_error(&format!("Authentication failed: {}", e));
+                                app.show_error(&format!("{}: {}", tr("Authentication failed"), e));
                             }
                         }
                     } else if is_microsoft {
@@ -3813,12 +3805,12 @@ impl NorthMailApplication {
 
                                 if let Err(e) = result {
                                     error!("Failed to fetch messages: {}", e);
-                                    app.show_error(&format!("Failed to fetch messages: {}", e));
+                                    app.show_error(&format!("{}: {}", tr("Failed to fetch messages"), e));
                                 }
                             }
                             Err(e) => {
                                 error!("Failed to get OAuth2 token: {}", e);
-                                app.show_error(&format!("Authentication failed: {}", e));
+                                app.show_error(&format!("{}: {}", tr("Authentication failed"), e));
                             }
                         }
                     } else {
@@ -3837,19 +3829,19 @@ impl NorthMailApplication {
 
                                 if let Err(e) = result {
                                     error!("Failed to fetch messages: {}", e);
-                                    app.show_error(&format!("Failed to fetch messages: {}", e));
+                                    app.show_error(&format!("{}: {}", tr("Failed to fetch messages"), e));
                                 }
                             }
                             Err(e) => {
                                 error!("Failed to get password: {}", e);
-                                app.show_error(&format!("Authentication failed: {}", e));
+                                app.show_error(&format!("{}: {}", tr("Authentication failed"), e));
                             }
                         }
                     }
                 }
                 Err(e) => {
                     error!("Failed to create auth manager: {}", e);
-                    app.show_error(&format!("Failed to authenticate: {}", e));
+                    app.show_error(&format!("{}: {}", tr("Failed to authenticate"), e));
                 }
             }
         });
@@ -3957,7 +3949,7 @@ impl NorthMailApplication {
                         Self::fetch_streaming(&mut client, &folder_path_clone, &sender, true, min_cached_uid).await;
                     }
                     Err(e) => {
-                        let _ = sender.send(FetchEvent::Error(format!("Authentication failed: {}", e)));
+                        let _ = sender.send(FetchEvent::Error(format!("{}: {}", tr("Authentication failed"), e)));
                     }
                 }
             });
@@ -3989,7 +3981,7 @@ impl NorthMailApplication {
                         Self::fetch_streaming(&mut client, &folder_path_clone, &sender, true, min_cached_uid).await;
                     }
                     Err(e) => {
-                        let _ = sender.send(FetchEvent::Error(format!("Authentication failed: {}", e)));
+                        let _ = sender.send(FetchEvent::Error(format!("{}: {}", tr("Authentication failed"), e)));
                     }
                 }
             });
@@ -4105,12 +4097,12 @@ impl NorthMailApplication {
 
         // For other folders, look up by listing
         let folders = client.list_folders().await
-            .map_err(|e| format!("Failed to list folders: {}", e))?;
+            .map_err(|e| format!("{}: {}", tr("Failed to list folders"), e))?;
 
         folders.iter()
             .find(|f| f.display_name == folder_display_name)
             .map(|f| f.id.clone())
-            .ok_or_else(|| format!("Folder '{}' not found", folder_display_name))
+            .ok_or_else(|| format!("{}: '{}'", tr("Folder not found"), folder_display_name))
     }
 
     /// Fetch folder with streaming updates using password auth
@@ -4137,7 +4129,7 @@ impl NorthMailApplication {
                         Self::fetch_streaming(&mut client, &folder_path_clone, &sender, true, min_cached_uid).await;
                     }
                     Err(e) => {
-                        let _ = sender.send(FetchEvent::Error(format!("Authentication failed: {}", e)));
+                        let _ = sender.send(FetchEvent::Error(format!("{}: {}", tr("Authentication failed"), e)));
                     }
                 }
             });
@@ -4201,7 +4193,7 @@ impl NorthMailApplication {
                         let _ = sender.send(FetchEvent::InitialBatchDone { lowest_seq: initial_start });
                     }
                     Err(e) => {
-                        let _ = sender.send(FetchEvent::Error(format!("Fetch failed: {}", e)));
+                        let _ = sender.send(FetchEvent::Error(format!("{}: {}", tr("Fetch failed"), e)));
                         let _ = client.logout().await;
                         return;
                     }
@@ -4337,7 +4329,7 @@ impl NorthMailApplication {
             }
             Err(e) => {
                 let _ = client.logout().await;
-                let _ = sender.send(FetchEvent::Error(format!("Failed to select folder: {}", e)));
+                let _ = sender.send(FetchEvent::Error(format!("{}: {}", tr("Failed to select folder"), e)));
             }
         }
     }
@@ -4444,7 +4436,7 @@ impl NorthMailApplication {
                                     Self::fetch_streaming(&mut client, "INBOX", &sender, true, None).await;
                                 }
                                 Err(e) => {
-                                    let _ = sender.send(FetchEvent::Error(format!("Auth failed: {}", e)));
+                                    let _ = sender.send(FetchEvent::Error(format!("{}: {}", tr("Auth failed"), e)));
                                 }
                             }
                         });
@@ -4468,7 +4460,7 @@ impl NorthMailApplication {
                                     Self::fetch_streaming(&mut client, "INBOX", &sender, true, None).await;
                                 }
                                 Err(e) => {
-                                    let _ = sender.send(FetchEvent::Error(format!("Auth failed: {}", e)));
+                                    let _ = sender.send(FetchEvent::Error(format!("{}: {}", tr("Auth failed"), e)));
                                 }
                             }
                         });
@@ -4492,7 +4484,7 @@ impl NorthMailApplication {
                         info!("Background streaming {}: INBOX has {} messages", email, total_count);
                         if total_count > 0 {
                             self.update_simple_sync_status(
-                                &format!("Loading {}... 0/{}", email, format_number(total_count)),
+                                &format!("{} {}... 0/{}", tr("Loading"), email, format_number(total_count)),
                             );
                         }
                     }
@@ -4549,7 +4541,7 @@ impl NorthMailApplication {
                     }
                     FetchEvent::SyncProgress { synced, total } => {
                         self.update_simple_sync_status(
-                            &format!("Loading {}... {}/{}", email, format_number(synced), format_number(total)),
+                            &format!("{} {}... {}/{}", tr("Loading"), email, format_number(synced), format_number(total)),
                         );
                     }
                     FetchEvent::InitialBatchDone { .. } => {
@@ -4627,14 +4619,14 @@ impl NorthMailApplication {
 
                         if has_cache {
                             // Cache is displayed - use simple sidebar indicator for background sync
-                            app.update_simple_sync_status("Syncing...");
+                            app.update_simple_sync_status(&tr("Syncing..."));
                         } else {
                             // No cache - update the loading status in message list area
                             if let Some(window) = app.active_window() {
                                 if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
                                     win.update_loading_status(
-                                        "Loading messages...",
-                                        Some(&format!("0 of {}", total_count))
+                                        &tr("Loading messages..."),
+                                        Some(&format!("0 / {}", total_count))
                                     );
                                 }
                             }
@@ -4701,8 +4693,8 @@ impl NorthMailApplication {
                                 if let Some(window) = app.active_window() {
                                     if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
                                         win.update_loading_status(
-                                            "Loading messages...",
-                                            Some(&format!("{} of {}", loaded_count, total_count))
+                                            &tr("Loading messages..."),
+                                            Some(&format!("{} / {}", loaded_count, total_count))
                                         );
                                     }
                                 }
@@ -4857,7 +4849,7 @@ impl NorthMailApplication {
                     FetchEvent::SyncProgress { synced, total } => {
                         // Update sync progress in sidebar (non-intrusive)
                         if !is_stale {
-                            app.update_simple_sync_status(&format!("Syncing {}/{}...", format_number(synced), format_number(total)));
+                            app.update_simple_sync_status(&format!("{} {}/{}...", tr("Syncing"), format_number(synced), format_number(total)));
                         }
                     }
                     FetchEvent::InitialBatchDone { lowest_seq: seq } => {
@@ -4940,7 +4932,7 @@ impl NorthMailApplication {
 
                         // Update status to show background sync is continuing
                         if lowest_seq > 1 {
-                            app.update_simple_sync_status("Syncing older messages...");
+                            app.update_simple_sync_status(&tr("Syncing older messages..."));
                         }
                         // Don't return - keep processing background sync events
                     }
@@ -5058,7 +5050,7 @@ impl NorthMailApplication {
                             }
                         }
                     }
-                    return Err("Connection lost".to_string());
+                    return Err(tr("Connection lost"));
                 }
             }
         }
@@ -5083,7 +5075,7 @@ impl NorthMailApplication {
                         Self::fetch_more(&mut client, &state_for_thread, &sender).await;
                     }
                     Err(e) => {
-                        let _ = sender.send(FetchEvent::Error(format!("Auth failed: {}", e)));
+                        let _ = sender.send(FetchEvent::Error(format!("{}: {}", tr("Auth failed"), e)));
                     }
                 }
             });
@@ -5111,7 +5103,7 @@ impl NorthMailApplication {
                         Self::fetch_more(&mut client, &state_for_thread, &sender).await;
                     }
                     Err(e) => {
-                        let _ = sender.send(FetchEvent::Error(format!("Auth failed: {}", e)));
+                        let _ = sender.send(FetchEvent::Error(format!("{}: {}", tr("Auth failed"), e)));
                     }
                 }
             });
@@ -5140,7 +5132,7 @@ impl NorthMailApplication {
                         Self::fetch_more(&mut client, &state_for_thread, &sender).await;
                     }
                     Err(e) => {
-                        let _ = sender.send(FetchEvent::Error(format!("Auth failed: {}", e)));
+                        let _ = sender.send(FetchEvent::Error(format!("{}: {}", tr("Auth failed"), e)));
                     }
                 }
             });
@@ -5169,7 +5161,7 @@ impl NorthMailApplication {
                             let _ = sender.send(FetchEvent::InitialBatchDone { lowest_seq: start });
                         }
                         Err(e) => {
-                            let _ = sender.send(FetchEvent::Error(format!("Fetch failed: {}", e)));
+                            let _ = sender.send(FetchEvent::Error(format!("{}: {}", tr("Fetch failed"), e)));
                         }
                     }
                 } else {
@@ -5180,7 +5172,7 @@ impl NorthMailApplication {
             }
             Err(e) => {
                 let _ = client.logout().await;
-                let _ = sender.send(FetchEvent::Error(format!("Select failed: {}", e)));
+                let _ = sender.send(FetchEvent::Error(format!("{}: {}", tr("Select failed"), e)));
             }
         }
     }
@@ -5243,7 +5235,7 @@ impl NorthMailApplication {
                     glib::timeout_future(std::time::Duration::from_millis(50)).await;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return Err("Connection lost".to_string());
+                    return Err(tr("Connection lost"));
                 }
             }
         }
@@ -5363,7 +5355,7 @@ impl NorthMailApplication {
 
         // Update window title
         if let Some(window) = self.active_window() {
-            window.set_title(Some("All Inboxes — NorthMail"));
+            window.set_title(Some(&format!("{} — NorthMail", tr("All Inboxes"))));
         }
 
         // Clear previous load state and set unified sentinel
@@ -5378,7 +5370,7 @@ impl NorthMailApplication {
         let db = match self.database() {
             Some(db) => db.clone(),
             None => {
-                self.show_error("Database not available");
+                self.show_error(&tr("Database not available"));
                 return;
             }
         };
@@ -5447,7 +5439,7 @@ impl NorthMailApplication {
                 }
                 Some(Err(e)) => {
                     error!("Failed to load unified inbox: {}", e);
-                    app.show_error(&format!("Failed to load inbox: {}", e));
+                    app.show_error(&format!("{}: {}", tr("Failed to load inbox"), e));
                 }
                 None => {
                     warn!("Unified inbox load channel disconnected");
@@ -5592,13 +5584,13 @@ impl NorthMailApplication {
                 Some((aid, fp)) => (aid, fp),
                 None => {
                     error!("fetch_message_body: Could not resolve folder_id {}", fid);
-                    callback(Err("Could not resolve folder".to_string()));
+                    callback(Err(tr("Could not resolve folder")));
                     return;
                 }
             }
         } else {
             error!("fetch_message_body: No folder_load_state and no msg_folder_id!");
-            callback(Err("No folder selected".to_string()));
+            callback(Err(tr("No folder selected")));
             return;
         };
 
@@ -5611,7 +5603,7 @@ impl NorthMailApplication {
                 error!("fetch_message_body: Account not found! Looking for '{}', have: {:?}",
                     resolved_account_id,
                     accounts.iter().map(|a| &a.id).collect::<Vec<_>>());
-                callback(Err("Account not found".to_string()));
+                callback(Err(tr("Account not found")));
                 return;
             }
         };
@@ -5664,7 +5656,7 @@ impl NorthMailApplication {
                                         let result = rt.block_on(async {
                                             let client = northmail_graph::GraphMailClient::new(token);
                                             client.list_attachments(&graph_id).await
-                                                .map_err(|e| format!("Graph list_attachments failed: {}", e))
+                                                .map_err(|e| format!("{}: {}", tr("Graph list_attachments failed"), e))
                                         });
                                         let _ = sender.send(result);
                                     });
@@ -5675,7 +5667,7 @@ impl NorthMailApplication {
                                             Err(std::sync::mpsc::TryRecvError::Empty) => {
                                                 glib::timeout_future(std::time::Duration::from_millis(10)).await;
                                             }
-                                            Err(_) => break Err("Channel disconnected".to_string()),
+                                            Err(_) => break Err(tr("Channel disconnected")),
                                         }
                                     };
 
@@ -5730,7 +5722,7 @@ impl NorthMailApplication {
                                         let result = rt.block_on(async {
                                             let client = northmail_graph::GraphMailClient::new(access_token);
                                             client.fetch_mime_body(&graph_id).await
-                                                .map_err(|e| format!("Graph fetch body failed: {}", e))
+                                                .map_err(|e| format!("{}: {}", tr("Graph fetch body failed"), e))
                                         });
                                         let _ = sender.send(result);
                                     });
@@ -5743,7 +5735,7 @@ impl NorthMailApplication {
                                                 glib::timeout_future(std::time::Duration::from_millis(10)).await;
                                             }
                                             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                                break Err("Channel disconnected".to_string());
+                                                break Err(tr("Channel disconnected"));
                                             }
                                         }
                                     };
@@ -5762,13 +5754,13 @@ impl NorthMailApplication {
                                         }
                                     }
                                 } else {
-                                    callback(Err("Graph message ID not found in cache".to_string()));
+                                    callback(Err(tr("Graph message ID not found in cache")));
                                 }
                             }
-                            Err(e) => callback(Err(format!("Auth failed: {}", e))),
+                            Err(e) => callback(Err(format!("{}: {}", tr("Auth failed"), e))),
                         }
                     }
-                    Err(e) => callback(Err(format!("Auth manager failed: {}", e))),
+                    Err(e) => callback(Err(format!("{}: {}", tr("Auth manager failed"), e))),
                 }
                 return;
             }
@@ -5788,7 +5780,7 @@ impl NorthMailApplication {
                                 if let Some(cached) = cached_body {
                                     callback(Ok(cached));
                                 } else {
-                                    callback(Err(format!("Auth failed: {}", e)));
+                                    callback(Err(format!("{}: {}", tr("Auth failed"), e)));
                                 }
                                 return;
                             }
@@ -5802,7 +5794,7 @@ impl NorthMailApplication {
                                 if let Some(cached) = cached_body {
                                     callback(Ok(cached));
                                 } else {
-                                    callback(Err(format!("Auth failed: {}", e)));
+                                    callback(Err(format!("{}: {}", tr("Auth failed"), e)));
                                 }
                                 return;
                             }
@@ -5823,7 +5815,7 @@ impl NorthMailApplication {
                                 if let Some(cached) = cached_body {
                                     callback(Ok(cached));
                                 } else {
-                                    callback(Err(format!("Auth failed: {}", e)));
+                                    callback(Err(format!("{}: {}", tr("Auth failed"), e)));
                                 }
                                 return;
                             }
@@ -5834,7 +5826,7 @@ impl NorthMailApplication {
                         if let Some(cached) = cached_body {
                             callback(Ok(cached));
                         } else {
-                            callback(Err("Failed to get credentials".to_string()));
+                            callback(Err(tr("Failed to get credentials")));
                         }
                         return;
                     };
@@ -5884,7 +5876,7 @@ impl NorthMailApplication {
                     if let Some(cached) = cached_body {
                         callback(Ok(cached));
                     } else {
-                        callback(Err(format!("Auth manager error: {}", e)));
+                        callback(Err(format!("{}: {}", tr("Auth manager error"), e)));
                     }
                 }
             }
@@ -5903,7 +5895,7 @@ impl NorthMailApplication {
         // Try up to 2 times (retry once on connection failure)
         for attempt in 0..2 {
             let worker = pool.get_or_create(credentials.clone())
-                .map_err(|e| format!("Pool error: {}", e))?;
+                .map_err(|e| format!("{}: {}", tr("Pool error"), e))?;
 
             let (response_tx, response_rx) = std::sync::mpsc::channel();
 
@@ -5916,7 +5908,7 @@ impl NorthMailApplication {
                 warn!("fetch_body_via_pool: send failed (attempt {}): {}", attempt, e);
                 pool.remove_worker(&credentials);
                 if attempt == 0 { continue; }
-                return Err(format!("Failed to send command: {}", e));
+                return Err(format!("{}: {}", tr("Failed to send command"), e));
             }
 
             debug!("fetch_body_via_pool: command sent, waiting for response");
@@ -5948,7 +5940,7 @@ impl NorthMailApplication {
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
                         if start.elapsed() > timeout {
-                            return Err(format!("Timeout waiting for body of message {}", uid));
+                            return Err(format!("{} {}", tr("Timeout waiting for body of message"), uid));
                         }
                         glib::timeout_future(std::time::Duration::from_millis(50)).await;
                     }
@@ -5958,12 +5950,12 @@ impl NorthMailApplication {
                             pool.remove_worker(&credentials);
                             break;
                         }
-                        return Err("Pool worker disconnected".to_string());
+                        return Err(tr("Pool worker disconnected"));
                     }
                 }
             }
         }
-        Err(format!("Failed to fetch body for message {} after retries", uid))
+        Err(format!("{} {}", tr("Failed to fetch body for message after retries:"), uid))
     }
 
     /// Get cached message body from database
@@ -6836,11 +6828,11 @@ impl NorthMailApplication {
             .license_type(gtk4::License::Gpl30)
             .website("https://github.com/northmail/northmail")
             .issue_url("https://github.com/northmail/northmail/issues")
-            .comments("A modern email client for GNOME")
+            .comments(&tr("A modern email client for GNOME"))
             .build();
 
         about.add_acknowledgement_section(
-            Some("Built With"),
+            Some(&tr("Built With")),
             &["GTK4", "libadwaita", "Rust", "async-imap"],
         );
 
@@ -6883,8 +6875,8 @@ impl NorthMailApplication {
 
     fn show_goa_account_selector(&self, accounts: Vec<northmail_auth::GoaAccount>) {
         let dialog = adw::AlertDialog::builder()
-            .heading("Add Email Account")
-            .body("Select an account from GNOME Online Accounts or add a new one.")
+            .heading(&tr("Add Email Account"))
+            .body(&tr("Select an account from GNOME Online Accounts or add a new one."))
             .build();
 
         for account in &accounts {
@@ -6894,8 +6886,8 @@ impl NorthMailApplication {
             );
         }
 
-        dialog.add_response("settings", "Open Settings...");
-        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("settings", &tr("Open Settings..."));
+        dialog.add_response("cancel", &tr("Cancel"));
 
         dialog.set_response_appearance("cancel", adw::ResponseAppearance::Default);
         dialog.set_default_response(Some("cancel"));
@@ -6923,12 +6915,12 @@ impl NorthMailApplication {
 
     fn show_oauth2_account_dialog(&self) {
         let dialog = adw::AlertDialog::builder()
-            .heading("Add Gmail Account")
-            .body("NorthMail will open your browser to authenticate with Google.")
+            .heading(&tr("Add Gmail Account"))
+            .body(&tr("NorthMail will open your browser to authenticate with Google."))
             .build();
 
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("authenticate", "Authenticate");
+        dialog.add_response("cancel", &tr("Cancel"));
+        dialog.add_response("authenticate", &tr("Authenticate"));
         dialog.set_response_appearance("authenticate", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("authenticate"));
         dialog.set_close_response("cancel");
@@ -6968,17 +6960,17 @@ impl NorthMailApplication {
                             app.update_sidebar_with_accounts(&all_accounts);
                             app.sync_all_accounts();
 
-                            app.show_toast(&format!("Added account: {}", goa_account.email));
+                            app.show_toast(&format!("{} {}", tr("Added account:"), goa_account.email));
                         }
                     }
                     Err(e) => {
                         error!("Failed to get GOA account: {}", e);
-                        app.show_error(&format!("Failed to add account: {}", e));
+                        app.show_error(&format!("{} {}", tr("Failed to add account:"), e));
                     }
                 },
                 Err(e) => {
                     error!("Failed to create auth manager: {}", e);
-                    app.show_error(&format!("Failed to add account: {}", e));
+                    app.show_error(&format!("{} {}", tr("Failed to add account:"), e));
                 }
             }
         });
@@ -6989,12 +6981,12 @@ impl NorthMailApplication {
 
         // TODO: Implement standalone OAuth2 flow
         let dialog = adw::AlertDialog::builder()
-            .heading("Not Implemented")
-            .body("Standalone OAuth2 is not yet implemented. Please add your Gmail account in GNOME Settings → Online Accounts first.")
+            .heading(&tr("Not Implemented"))
+            .body(&tr("Standalone OAuth2 is not yet implemented. Please add your Gmail account in GNOME Settings → Online Accounts first."))
             .build();
 
-        dialog.add_response("ok", "OK");
-        dialog.add_response("settings", "Open Settings");
+        dialog.add_response("ok", &tr("OK"));
+        dialog.add_response("settings", &tr("Open Settings"));
         dialog.set_default_response(Some("settings"));
         dialog.set_close_response("ok");
 
@@ -7014,24 +7006,24 @@ impl NorthMailApplication {
 
     fn show_settings_window(&self) {
         let dialog = adw::PreferencesDialog::new();
-        dialog.set_title("Settings");
+        dialog.set_title(&tr("Settings"));
 
         // General page
         let general_page = adw::PreferencesPage::builder()
-            .title("General")
+            .title(&tr("General"))
             .icon_name("preferences-system-symbolic")
             .build();
 
         let appearance_group = adw::PreferencesGroup::builder()
-            .title("Appearance")
+            .title(&tr("Appearance"))
             .build();
 
         let theme_row = adw::ComboRow::builder()
-            .title("Color Scheme")
-            .subtitle("Choose the application color scheme")
+            .title(&tr("Color Scheme"))
+            .subtitle(&tr("Choose the application color scheme"))
             .build();
 
-        let themes = gtk4::StringList::new(&["System", "Light", "Dark"]);
+        let themes = gtk4::StringList::new(&[&tr("System"), &tr("Light"), &tr("Dark")]);
         theme_row.set_model(Some(&themes));
 
         // Set initial selection to match current color scheme
@@ -7081,7 +7073,7 @@ impl NorthMailApplication {
         };
 
         let custom_btn = make_icon_button("org.northmail.NorthMail", "NorthMail");
-        let system_btn = make_icon_button("email", "System");
+        let system_btn = make_icon_button("email", &tr("System"));
         system_btn.set_group(Some(&custom_btn));
 
         // Set initial state from GSettings
@@ -7099,7 +7091,7 @@ impl NorthMailApplication {
         restart_box.set_margin_top(8);
         restart_box.set_visible(false);
 
-        let restart_label = gtk4::Label::new(Some("Please restart for the changes to take effect."));
+        let restart_label = gtk4::Label::new(Some(&tr("Please restart for the changes to take effect.")));
         restart_label.add_css_class("dim-label");
         restart_box.append(&restart_label);
 
@@ -7141,7 +7133,7 @@ impl NorthMailApplication {
         icon_picker_box.append(&system_btn);
 
         let icon_group = adw::PreferencesGroup::builder()
-            .title("App Icon")
+            .title(&tr("App Icon"))
             .build();
         icon_group.add(&icon_picker_box);
         icon_group.add(&restart_box);
@@ -7151,22 +7143,22 @@ impl NorthMailApplication {
 
         // Sync group
         let sync_group = adw::PreferencesGroup::builder()
-            .title("Mail Checking")
+            .title(&tr("Mail Checking"))
             .build();
 
         let sync_interval_row = adw::ComboRow::builder()
-            .title("Check for New Mail")
-            .subtitle("How often to automatically check for new emails")
+            .title(&tr("Check for New Mail"))
+            .subtitle(&tr("How often to automatically check for new emails"))
             .build();
 
         // Sync interval options: 1, 2, 5, 10, 15, 30 minutes
         let intervals = gtk4::StringList::new(&[
-            "Every minute",
-            "Every 2 minutes",
-            "Every 5 minutes",
-            "Every 10 minutes",
-            "Every 15 minutes",
-            "Every 30 minutes",
+            &tr("Every minute"),
+            &tr("Every 2 minutes"),
+            &tr("Every 5 minutes"),
+            &tr("Every 10 minutes"),
+            &tr("Every 15 minutes"),
+            &tr("Every 30 minutes"),
         ]);
         sync_interval_row.set_model(Some(&intervals));
 
@@ -7204,12 +7196,12 @@ impl NorthMailApplication {
 
         // Notifications group
         let notifications_group = adw::PreferencesGroup::builder()
-            .title("Notifications")
+            .title(&tr("Notifications"))
             .build();
 
         let notifications_row = adw::SwitchRow::builder()
-            .title("Desktop Notifications")
-            .subtitle("Show notifications for new emails")
+            .title(&tr("Desktop Notifications"))
+            .subtitle(&tr("Show notifications for new emails"))
             .build();
 
         // Bind to GSettings
@@ -7218,8 +7210,8 @@ impl NorthMailApplication {
             .build();
 
         let sound_row = adw::SwitchRow::builder()
-            .title("Notification Sound")
-            .subtitle("Play a sound when new emails arrive")
+            .title(&tr("Notification Sound"))
+            .subtitle(&tr("Play a sound when new emails arrive"))
             .build();
 
         settings
@@ -7227,8 +7219,8 @@ impl NorthMailApplication {
             .build();
 
         let preview_row = adw::SwitchRow::builder()
-            .title("Show Message Preview")
-            .subtitle("Display sender and subject in notifications")
+            .title(&tr("Show Message Preview"))
+            .subtitle(&tr("Display sender and subject in notifications"))
             .build();
 
         settings
@@ -7236,8 +7228,8 @@ impl NorthMailApplication {
             .build();
 
         let dnd_row = adw::SwitchRow::builder()
-            .title("Do Not Disturb")
-            .subtitle("Suppress all notifications")
+            .title(&tr("Do Not Disturb"))
+            .subtitle(&tr("Suppress all notifications"))
             .build();
 
         settings
@@ -7254,13 +7246,13 @@ impl NorthMailApplication {
 
         // Accounts page
         let accounts_page = adw::PreferencesPage::builder()
-            .title("Accounts")
+            .title(&tr("Accounts"))
             .icon_name("system-users-symbolic")
             .build();
 
         // Info about GOA
         let info_group = adw::PreferencesGroup::builder()
-            .description("NorthMail uses GNOME Online Accounts to manage your email accounts. Add or remove accounts in System Settings.")
+            .description(&tr("NorthMail uses GNOME Online Accounts to manage your email accounts. Add or remove accounts in System Settings."))
             .build();
 
         accounts_page.add(&info_group);
@@ -7269,8 +7261,8 @@ impl NorthMailApplication {
         let settings_group = adw::PreferencesGroup::new();
 
         let open_settings_row = adw::ActionRow::builder()
-            .title("Online Accounts")
-            .subtitle("Manage accounts in GNOME Settings")
+            .title(&tr("Online Accounts"))
+            .subtitle(&tr("Manage accounts in GNOME Settings"))
             .activatable(true)
             .build();
 
@@ -7288,8 +7280,8 @@ impl NorthMailApplication {
 
         // Account cache statistics
         let cache_group = adw::PreferencesGroup::builder()
-            .title("Cached Messages")
-            .description("Messages stored locally for offline access and fast loading")
+            .title(&tr("Cached Messages"))
+            .description(&tr("Messages stored locally for offline access and fast loading"))
             .build();
 
         // Add a row for each account with message count
@@ -7299,7 +7291,7 @@ impl NorthMailApplication {
         for account in &accounts {
             let row = adw::ActionRow::builder()
                 .title(&account.email)
-                .subtitle("Loading...")
+                .subtitle(&tr("Loading..."))
                 .build();
 
             // Add loading indicator
@@ -7338,7 +7330,7 @@ impl NorthMailApplication {
                             Ok((msg_count, body_count)) => {
                                 spinner_clone.set_spinning(false);
                                 spinner_clone.set_visible(false);
-                                row_clone.set_subtitle(&format!("{} messages, {} bodies cached", format_number(msg_count), format_number(body_count)));
+                                row_clone.set_subtitle(&format!("{} {}, {} {}", format_number(msg_count), tr("messages"), format_number(body_count), tr("bodies cached")));
                                 break;
                             }
                             Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -7355,13 +7347,13 @@ impl NorthMailApplication {
 
         // Cache management buttons
         let cache_actions_group = adw::PreferencesGroup::builder()
-            .title("Cache Management")
+            .title(&tr("Cache Management"))
             .build();
 
         // Clear all cache button
         let clear_cache_row = adw::ActionRow::builder()
-            .title("Clear All Cache")
-            .subtitle("Delete all cached messages and bodies")
+            .title(&tr("Clear All Cache"))
+            .subtitle(&tr("Delete all cached messages and bodies"))
             .activatable(true)
             .build();
 
@@ -7417,8 +7409,8 @@ impl NorthMailApplication {
 
         // Reload all messages button
         let reload_row = adw::ActionRow::builder()
-            .title("Reload All Messages")
-            .subtitle("Re-sync all messages from all accounts")
+            .title(&tr("Reload All Messages"))
+            .subtitle(&tr("Re-sync all messages from all accounts"))
             .activatable(true)
             .build();
 
@@ -7438,7 +7430,7 @@ impl NorthMailApplication {
         let refresh_group = adw::PreferencesGroup::new();
 
         let refresh_button = gtk4::Button::builder()
-            .label("Refresh Accounts")
+            .label(&tr("Refresh Accounts"))
             .halign(gtk4::Align::Center)
             .css_classes(["pill"])
             .build();
@@ -7477,7 +7469,7 @@ impl NorthMailApplication {
         let account = match accounts.get(account_index as usize) {
             Some(a) => a.clone(),
             None => {
-                callback(Err("Invalid account selection".to_string()));
+                callback(Err(tr("Invalid account selection")));
                 return;
             }
         };
@@ -7573,8 +7565,7 @@ impl NorthMailApplication {
                             // Legacy windows_live provider uses wl.* scopes — incompatible with
                             // both Graph API (wrong audience) and SMTP XOAUTH2 (no SMTP.Send scope).
                             error!("Cannot send from windows_live account — token lacks mail.send scope");
-                            Err("This Microsoft account uses a legacy authentication method that doesn't support sending. \
-                                Please remove and re-add it in GNOME Settings → Online Accounts as \"Microsoft 365\".".to_string())
+                            Err(tr("This Microsoft account uses a legacy authentication method that doesn't support sending. Please remove and re-add it in GNOME Settings → Online Accounts as \"Microsoft 365\"."))
                         } else {
                             match auth_type.clone() {
                                 northmail_auth::GoaAuthType::OAuth2 => {
@@ -7598,7 +7589,7 @@ impl NorthMailApplication {
                                         .map_err(|e| format!("Send failed: {}", e))
                                 }
                                 northmail_auth::GoaAuthType::Unknown => {
-                                    Err("Unsupported auth type".to_string())
+                                    Err(tr("Unsupported auth type"))
                                 }
                             }
                         };
@@ -7641,7 +7632,7 @@ impl NorthMailApplication {
                         glib::timeout_future(std::time::Duration::from_millis(50)).await;
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        break Err("Send thread crashed".to_string());
+                        break Err(tr("Send thread crashed"));
                     }
                 }
             };
@@ -7685,7 +7676,7 @@ impl NorthMailApplication {
         let account = match accounts.get(account_index as usize) {
             Some(a) => a.clone(),
             None => {
-                callback(Err("Invalid account selection".to_string()));
+                callback(Err(tr("Invalid account selection")));
                 return;
             }
         };
@@ -7693,7 +7684,7 @@ impl NorthMailApplication {
         let db = match self.database_ref() {
             Some(db) => db.clone(),
             None => {
-                callback(Err("Database not initialized".to_string()));
+                callback(Err(tr("Database not initialized")));
                 return;
             }
         };
@@ -7832,7 +7823,7 @@ impl NorthMailApplication {
                                         .map_err(|e| format!("IMAP connect failed: {}", e))?;
                                 }
                                 northmail_auth::GoaAuthType::Unknown => {
-                                    return Err("Unsupported auth type".to_string());
+                                    return Err(tr("Unsupported auth type"));
                                 }
                             }
 
@@ -7858,7 +7849,7 @@ impl NorthMailApplication {
                         glib::timeout_future(std::time::Duration::from_millis(50)).await;
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        break Err("Draft save thread crashed".to_string());
+                        break Err(tr("Draft save thread crashed"));
                     }
                 }
             };
@@ -7916,7 +7907,7 @@ impl NorthMailApplication {
                     .map_err(|e| format!("IMAP connect failed: {}", e))?;
             }
             northmail_auth::GoaAuthType::Unknown => {
-                return Err("Unsupported auth type".to_string());
+                return Err(tr("Unsupported auth type"));
             }
         }
 
@@ -7940,7 +7931,7 @@ impl NorthMailApplication {
         if appended {
             Ok(())
         } else {
-            Err("Could not find Sent folder".to_string())
+            Err(tr("Could not find Sent folder"))
         }
     }
 
@@ -7955,7 +7946,7 @@ impl NorthMailApplication {
         let account = match accounts.get(account_index as usize) {
             Some(a) => a.clone(),
             None => {
-                callback(Err("Invalid account selection".to_string()));
+                callback(Err(tr("Invalid account selection")));
                 return;
             }
         };
@@ -7963,7 +7954,7 @@ impl NorthMailApplication {
         let db = match self.database_ref() {
             Some(db) => db.clone(),
             None => {
-                callback(Err("Database not initialized".to_string()));
+                callback(Err(tr("Database not initialized")));
                 return;
             }
         };
@@ -8049,7 +8040,7 @@ impl NorthMailApplication {
                                     .map_err(|e| format!("IMAP connect failed: {}", e))?;
                             }
                             northmail_auth::GoaAuthType::Unknown => {
-                                return Err("Unsupported auth type".to_string());
+                                return Err(tr("Unsupported auth type"));
                             }
                         }
 
@@ -8080,7 +8071,7 @@ impl NorthMailApplication {
                         glib::timeout_future(std::time::Duration::from_millis(50)).await;
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        break Err("Draft delete thread crashed".to_string());
+                        break Err(tr("Draft delete thread crashed"));
                     }
                 }
             };
