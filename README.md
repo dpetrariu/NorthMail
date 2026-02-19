@@ -2,6 +2,8 @@
 
 A modern email client for GNOME, built with GTK4/libadwaita and Rust.
 
+**Use at your own risk.** This project is in early development and may contain bugs.
+
 ## Features
 
 - Native GNOME look and feel with libadwaita
