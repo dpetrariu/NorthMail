@@ -15,9 +15,12 @@ use crate::i18n::tr;
 /// Sections:
 ///   0 — unified inbox
 ///   1 — per-account inboxes
+///   1000 — starred section (virtual)
 ///   2+ — per-account folder groups (2 = first account, 3 = second, …)
 ///
-/// Kinds: unified, inbox, header, folder
+/// Kinds: unified, inbox, header, folder, starred-header, starred-all, starred-account
+
+const STARRED_SECTION: usize = 1000;
 
 fn encode_row_name(section: usize, kind: &str, account_id: &str, folder_path: &str) -> String {
     format!("{}:{}:{}:{}", section, kind, account_id, folder_path)
@@ -63,6 +66,10 @@ mod imp {
         pub inboxes_list_box: RefCell<Option<gtk4::ListBox>>,
         /// Container for the inboxes section (to toggle active/inactive style)
         pub inboxes_container: RefCell<Option<gtk4::Box>>,
+        /// ListBox for the starred section
+        pub starred_list_box: RefCell<Option<gtk4::ListBox>>,
+        /// Container for the starred section
+        pub starred_container: RefCell<Option<gtk4::Box>>,
         /// ListBox for the folders section (collapsible per-account folders)
         pub folders_list_box: RefCell<Option<gtk4::ListBox>>,
         pub accounts: RefCell<Vec<super::AccountFolders>>,
@@ -70,6 +77,8 @@ mod imp {
         pub expanded_states: RefCell<HashMap<String, bool>>,
         /// Persisted expand/collapse state per folder (key: "account_id\0folder_path")
         pub folder_expanded_states: RefCell<HashMap<String, bool>>,
+        /// Starred section expansion state
+        pub starred_expanded: RefCell<bool>,
         // -- sync-status widgets (unchanged) --
         pub sync_status_box: RefCell<Option<gtk4::Box>>,
         pub sync_spinner: RefCell<Option<gtk4::Spinner>>,
@@ -411,10 +420,9 @@ impl FolderSidebar {
             /* Section header styling - smaller, non-bold */
             .folders-list .section-header-label {
                 font-weight: normal;
-                font-size: 0.9em;
             }
-            /* Folder entries - smaller */
-            .folders-list .folder-entry {
+            /* Folder entries and headers - smaller font */
+            .folders-list > row * {
                 font-size: 0.9em;
             }
             .folders-list .folder-entry-row {
@@ -426,6 +434,36 @@ impl FolderSidebar {
                 min-height: 18px;
                 padding: 0;
                 margin: 0;
+            }
+            /* Starred section - warm golden tint */
+            .starred-section {
+                background-color: alpha(@accent_bg_color, 0.08);
+                border-radius: 10px;
+                margin: 4px 8px;
+                padding: 2px;
+            }
+            .starred-section .starred-list {
+                background: transparent;
+            }
+            .starred-section .starred-list > row {
+                background: transparent;
+                border-radius: 8px;
+                margin: 2px 4px;
+            }
+            .starred-section .starred-list > row:selected {
+                background-color: alpha(@accent_bg_color, 0.25);
+            }
+            .starred-section .starred-list > row:selected image {
+                color: #f5c211;
+            }
+            .starred-section .starred-list > row {
+                min-height: 0;
+            }
+            .starred-section .starred-list > row * {
+                font-size: 0.9em;
+            }
+            .starred-section .starred-list > row:hover {
+                background-color: alpha(@accent_bg_color, 0.12);
             }
             /* Separators in folders list - add margins */
             .folders-list separator {
@@ -479,19 +517,24 @@ impl FolderSidebar {
 
         // Shared references for cross-list coordination
         let folders_list_cell = std::rc::Rc::new(RefCell::new(None::<gtk4::ListBox>));
+        let starred_list_cell = std::rc::Rc::new(RefCell::new(None::<gtk4::ListBox>));
         let inboxes_container_cell = std::rc::Rc::new(RefCell::new(inboxes_container.clone()));
 
         // Inboxes row activation handler
         let sidebar = self.clone();
         let folders_list_cell_clone = folders_list_cell.clone();
+        let starred_list_cell_for_inboxes = starred_list_cell.clone();
         let inboxes_container_for_inboxes = inboxes_container_cell.clone();
         inboxes_list_box.connect_row_activated(move |_list_box, row| {
             let name = row.widget_name();
             let (_section, kind, account_id, _folder_path) = decode_row_name(&name);
 
-            // Deselect folders list when inbox is selected
+            // Deselect folders list and starred list when inbox is selected
             if let Some(ref folders_list) = *folders_list_cell_clone.borrow() {
                 folders_list.unselect_all();
+            }
+            if let Some(ref starred_list) = *starred_list_cell_for_inboxes.borrow() {
+                starred_list.unselect_all();
             }
 
             // Set inboxes container to active (accent color)
@@ -516,6 +559,65 @@ impl FolderSidebar {
 
         inboxes_container.append(&inboxes_list_box);
         self.append(&inboxes_container);
+
+        // ── Starred section (between inboxes and folders) ──
+        let starred_container = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .css_classes(["starred-section"])
+            .build();
+
+        let starred_list_box = gtk4::ListBox::builder()
+            .selection_mode(gtk4::SelectionMode::Single)
+            .css_classes(["starred-list"])
+            .build();
+
+        // Store starred list reference
+        starred_list_cell.replace(Some(starred_list_box.clone()));
+
+        // Starred row activation handler
+        let sidebar_starred = self.clone();
+        let inboxes_list_for_starred = inboxes_list_box.clone();
+        let inboxes_container_for_starred = inboxes_container_cell.clone();
+        let folders_list_cell_for_starred = folders_list_cell.clone();
+        starred_list_box.connect_row_activated(move |list_box, row| {
+            let name = row.widget_name();
+            let (_section, kind, account_id, _folder_path) = decode_row_name(&name);
+
+            match kind {
+                "starred-header" => {
+                    // Deselect other lists
+                    inboxes_list_for_starred.unselect_all();
+                    inboxes_container_for_starred.borrow().add_css_class("inactive");
+                    if let Some(ref folders_list) = *folders_list_cell_for_starred.borrow() {
+                        folders_list.unselect_all();
+                    }
+
+                    sidebar_starred.emit_by_name::<()>(
+                        "folder-selected",
+                        &[&"", &"__STARRED__", &false],
+                    );
+                }
+                "starred-account" => {
+                    // Deselect other lists
+                    inboxes_list_for_starred.unselect_all();
+                    inboxes_container_for_starred.borrow().add_css_class("inactive");
+                    if let Some(ref folders_list) = *folders_list_cell_for_starred.borrow() {
+                        folders_list.unselect_all();
+                    }
+
+                    sidebar_starred.emit_by_name::<()>(
+                        "folder-selected",
+                        &[&account_id, &"__STARRED__", &false],
+                    );
+                }
+                _ => {
+                    list_box.unselect_row(row);
+                }
+            }
+        });
+
+        starred_container.append(&starred_list_box);
+        self.append(&starred_container);
 
         // ── Folders section (collapsible per-account folders) ──
         let folders_list_box = gtk4::ListBox::builder()
@@ -545,6 +647,7 @@ impl FolderSidebar {
         // Folders row activation handler
         let sidebar2 = self.clone();
         let inboxes_list_for_folders = inboxes_list_box.clone();
+        let starred_list_for_folders = starred_list_cell.clone();
         let inboxes_container_for_folders = inboxes_container_cell.clone();
         folders_list_box.connect_row_activated(move |list_box, row| {
             let name = row.widget_name();
@@ -557,8 +660,11 @@ impl FolderSidebar {
                     sidebar2.toggle_account_expansion(account_id);
                 }
                 "folder" => {
-                    // Deselect inboxes list when folder is selected
+                    // Deselect inboxes and starred lists
                     inboxes_list_for_folders.unselect_all();
+                    if let Some(ref starred_list) = *starred_list_for_folders.borrow() {
+                        starred_list.unselect_all();
+                    }
 
                     // Set inboxes container to inactive (grey)
                     inboxes_container_for_folders.borrow().add_css_class("inactive");
@@ -651,6 +757,8 @@ impl FolderSidebar {
         // Store references
         imp.inboxes_list_box.replace(Some(inboxes_list_box));
         imp.inboxes_container.replace(Some(inboxes_container));
+        imp.starred_list_box.replace(Some(starred_list_box));
+        imp.starred_container.replace(Some(starred_container));
         imp.folders_list_box.replace(Some(folders_list_box));
         imp.sync_status_box.replace(Some(sync_status_box));
         imp.sync_spinner.replace(Some(sync_spinner));
@@ -670,6 +778,10 @@ impl FolderSidebar {
             Some(lb) => lb.clone(),
             None => return,
         };
+        let starred_list = match imp.starred_list_box.borrow().as_ref() {
+            Some(lb) => lb.clone(),
+            None => return,
+        };
         let folders_list = match imp.folders_list_box.borrow().as_ref() {
             Some(lb) => lb.clone(),
             None => return,
@@ -678,11 +790,15 @@ impl FolderSidebar {
         // Remember the currently selected row so we can restore it after rebuild
         let selected_name = inboxes_list.selected_row()
             .map(|row| row.widget_name().to_string())
+            .or_else(|| starred_list.selected_row().map(|row| row.widget_name().to_string()))
             .or_else(|| folders_list.selected_row().map(|row| row.widget_name().to_string()));
 
-        // Clear all rows from both lists
+        // Clear all rows from all lists
         while let Some(row) = inboxes_list.row_at_index(0) {
             inboxes_list.remove(&row);
+        }
+        while let Some(row) = starred_list.row_at_index(0) {
+            starred_list.remove(&row);
         }
         while let Some(row) = folders_list.row_at_index(0) {
             folders_list.remove(&row);
@@ -714,6 +830,22 @@ impl FolderSidebar {
             );
             row.set_widget_name(&encode_row_name(1, "inbox", &account.id, ""));
             inboxes_list.append(&row);
+        }
+
+        // ── Starred section (in folders list, before per-account folders) ──
+        let starred_expanded = saved.get("__starred__").copied().unwrap_or(false);
+        imp.starred_expanded.replace(starred_expanded);
+        {
+            let header = self.create_starred_header_row(starred_expanded);
+            header.set_widget_name(&encode_row_name(STARRED_SECTION, "starred-header", "", ""));
+            starred_list.append(&header);
+
+            for account in &accounts {
+                let row = self.create_starred_account_row(&account.email);
+                row.set_widget_name(&encode_row_name(STARRED_SECTION, "starred-account", &account.id, ""));
+                row.set_visible(starred_expanded);
+                starred_list.append(&row);
+            }
         }
 
         // Load persisted folder expansion states
@@ -784,6 +916,10 @@ impl FolderSidebar {
         imp.expanded_states.replace(expanded_states);
         imp.folder_expanded_states.replace(folder_expanded_states);
 
+        // Ensure no spurious selection on starred/folders lists
+        starred_list.unselect_all();
+        folders_list.unselect_all();
+
         // Restore the previously selected row
         if let Some(ref name) = selected_name {
             // Try inboxes list first
@@ -792,10 +928,26 @@ impl FolderSidebar {
             while let Some(row) = inboxes_list.row_at_index(idx) {
                 if row.widget_name() == name.as_str() {
                     inboxes_list.select_row(Some(&row));
+                    starred_list.unselect_all();
+                    folders_list.unselect_all();
                     found = true;
                     break;
                 }
                 idx += 1;
+            }
+            // Try starred list
+            if !found {
+                idx = 0;
+                while let Some(row) = starred_list.row_at_index(idx) {
+                    if row.widget_name() == name.as_str() {
+                        starred_list.select_row(Some(&row));
+                        inboxes_list.unselect_all();
+                        folders_list.unselect_all();
+                        found = true;
+                        break;
+                    }
+                    idx += 1;
+                }
             }
             // Try folders list if not found
             if !found {
@@ -803,6 +955,8 @@ impl FolderSidebar {
                 while let Some(row) = folders_list.row_at_index(idx) {
                     if row.widget_name() == name.as_str() {
                         folders_list.select_row(Some(&row));
+                        inboxes_list.unselect_all();
+                        starred_list.unselect_all();
                         break;
                     }
                     idx += 1;
@@ -1110,6 +1264,91 @@ impl FolderSidebar {
         row
     }
 
+    /// Create the "Starred" row — selectable like a folder, with an expand arrow button
+    fn create_starred_header_row(&self, expanded: bool) -> gtk4::ListBoxRow {
+        let row = gtk4::ListBoxRow::builder()
+            .selectable(true)
+            .activatable(true)
+            .css_classes(["folder-entry-row"])
+            .build();
+
+        let content = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(4)
+            .margin_start(4)
+            .margin_end(12)
+            .margin_top(4)
+            .margin_bottom(4)
+            .css_classes(["folder-entry"])
+            .build();
+
+        // Disclosure arrow button (toggles expansion without selecting)
+        let arrow_icon = if expanded { "pan-down-symbolic" } else { "pan-end-symbolic" };
+        let arrow = gtk4::Image::builder()
+            .icon_name(arrow_icon)
+            .pixel_size(12)
+            .build();
+        arrow.set_widget_name("starred-disclosure-arrow");
+
+        let arrow_btn = gtk4::Button::builder()
+            .child(&arrow)
+            .css_classes(["flat", "circular"])
+            .valign(gtk4::Align::Center)
+            .build();
+        arrow_btn.set_size_request(20, 20);
+
+        let sidebar = self.clone();
+        arrow_btn.connect_clicked(move |_btn| {
+            sidebar.toggle_starred_expansion();
+        });
+
+        content.append(&arrow_btn);
+        content.append(&gtk4::Image::from_icon_name("starred-symbolic"));
+
+        content.append(
+            &gtk4::Label::builder()
+                .label(&tr("Starred"))
+                .xalign(0.0)
+                .hexpand(true)
+                .ellipsize(gtk4::pango::EllipsizeMode::End)
+                .build(),
+        );
+
+        row.set_child(Some(&content));
+        row
+    }
+
+    /// Create a starred per-account row
+    fn create_starred_account_row(&self, email: &str) -> gtk4::ListBoxRow {
+        let row = gtk4::ListBoxRow::builder()
+            .selectable(true)
+            .activatable(true)
+            .build();
+
+        let content = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(10)
+            .margin_start(28)
+            .margin_end(12)
+            .margin_top(4)
+            .margin_bottom(4)
+            .build();
+
+        content.append(&gtk4::Image::from_icon_name("starred-symbolic"));
+
+        content.append(
+            &gtk4::Label::builder()
+                .label(email)
+                .xalign(0.0)
+                .hexpand(true)
+                .ellipsize(gtk4::pango::EllipsizeMode::End)
+                .build(),
+        );
+
+        row.set_child(Some(&content));
+        row
+    }
+
     // ── Context menus ────────────────────────────────────────────────
 
     /// Create a context menu button with explicit dark text, left-aligned, normal weight.
@@ -1409,6 +1648,51 @@ impl FolderSidebar {
 
     // ── Expand / collapse ────────────────────────────────────────────
 
+    fn toggle_starred_expansion(&self) {
+        let imp = self.imp();
+        let current = *imp.starred_expanded.borrow();
+        let new_state = !current;
+        imp.starred_expanded.replace(new_state);
+
+        // Persist
+        self.save_expander_state("__starred__", new_state);
+
+        // Update row visibility + disclosure arrow in starred list
+        let starred_list = match imp.starred_list_box.borrow().as_ref() {
+            Some(lb) => lb.clone(),
+            None => return,
+        };
+
+        let mut idx = 0;
+        while let Some(row) = starred_list.row_at_index(idx) {
+            let name = row.widget_name();
+            let (_section, kind, _aid, _path) = decode_row_name(&name);
+            match kind {
+                "starred-header" => {
+                    // Update disclosure arrow (inside button -> image)
+                    if let Some(content) = row.child().and_then(|c| c.downcast::<gtk4::Box>().ok()) {
+                        if let Some(btn) = content.first_child().and_then(|c| c.downcast::<gtk4::Button>().ok()) {
+                            if let Some(arrow) = btn.child().and_then(|c| c.downcast::<gtk4::Image>().ok()) {
+                                if arrow.widget_name() == "starred-disclosure-arrow" {
+                                    arrow.set_icon_name(Some(if new_state {
+                                        "pan-down-symbolic"
+                                    } else {
+                                        "pan-end-symbolic"
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+                "starred-account" => {
+                    row.set_visible(new_state);
+                }
+                _ => {}
+            }
+            idx += 1;
+        }
+    }
+
     fn toggle_account_expansion(&self, account_id: &str) {
         let imp = self.imp();
         let mut states = imp.expanded_states.borrow_mut();
@@ -1572,9 +1856,12 @@ impl FolderSidebar {
             None => return,
         };
 
-        // Deselect folders list
+        // Deselect folders and starred lists
         if let Some(folders_list) = imp.folders_list_box.borrow().as_ref() {
             folders_list.unselect_all();
+        }
+        if let Some(starred_list) = imp.starred_list_box.borrow().as_ref() {
+            starred_list.unselect_all();
         }
 
         let mut idx = 0;
@@ -1603,6 +1890,9 @@ impl FolderSidebar {
 
         inboxes_list.unselect_all();
         folders_list.unselect_all();
+        if let Some(starred_list) = imp.starred_list_box.borrow().as_ref() {
+            starred_list.unselect_all();
+        }
 
         // Check if it's an inbox (in inboxes list)
         if folder_path.eq_ignore_ascii_case("INBOX") {

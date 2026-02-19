@@ -2086,6 +2086,221 @@ impl Database {
         Ok(count)
     }
 
+    // ── Starred messages ─────────────────────────────────────────────
+
+    /// Get starred messages across all accounts
+    pub async fn get_starred_messages(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> CoreResult<Vec<DbMessage>> {
+        let messages = sqlx::query_as::<_, DbMessage>(
+            r#"
+            SELECT m.id, m.folder_id, m.uid, m.message_id, m.subject, m.from_address,
+                   m.from_name, m.to_addresses, m.cc_addresses, m.date_sent, m.date_epoch, m.snippet,
+                   m.is_read, m.is_starred, m.has_attachments, m.size, m.maildir_path,
+                   m.body_text, m.body_html
+            FROM messages m
+            WHERE m.is_starred = 1
+            ORDER BY m.date_epoch DESC, m.uid DESC
+            LIMIT ? OFFSET ?
+            "#,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(messages)
+    }
+
+    /// Get starred message count across all accounts
+    pub async fn get_starred_count(&self) -> CoreResult<i64> {
+        let row = sqlx::query("SELECT COUNT(*) as count FROM messages WHERE is_starred = 1")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get::<i64, _>("count"))
+    }
+
+    /// Get starred messages for a specific account
+    pub async fn get_starred_messages_for_account(
+        &self,
+        account_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> CoreResult<Vec<DbMessage>> {
+        let messages = sqlx::query_as::<_, DbMessage>(
+            r#"
+            SELECT m.id, m.folder_id, m.uid, m.message_id, m.subject, m.from_address,
+                   m.from_name, m.to_addresses, m.cc_addresses, m.date_sent, m.date_epoch, m.snippet,
+                   m.is_read, m.is_starred, m.has_attachments, m.size, m.maildir_path,
+                   m.body_text, m.body_html
+            FROM messages m
+            JOIN folders f ON m.folder_id = f.id
+            WHERE m.is_starred = 1 AND f.account_id = ?
+            ORDER BY m.date_epoch DESC, m.uid DESC
+            LIMIT ? OFFSET ?
+            "#,
+        )
+        .bind(account_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(messages)
+    }
+
+    /// Get starred message count for a specific account
+    pub async fn get_starred_count_for_account(&self, account_id: &str) -> CoreResult<i64> {
+        let row = sqlx::query(
+            r#"SELECT COUNT(*) as count FROM messages m
+            JOIN folders f ON m.folder_id = f.id
+            WHERE m.is_starred = 1 AND f.account_id = ?"#,
+        )
+        .bind(account_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>("count"))
+    }
+
+    /// Get starred messages with filters applied (all accounts)
+    pub async fn get_starred_messages_filtered(
+        &self,
+        limit: i64,
+        offset: i64,
+        filter: &MessageFilter,
+    ) -> CoreResult<Vec<DbMessage>> {
+        let mut conditions = vec!["m.is_starred = 1".to_string()];
+        conditions.extend(filter.build_conditions());
+        let where_clause = conditions.join(" AND ");
+        let query_str = format!(
+            r#"SELECT m.id, m.folder_id, m.uid, m.message_id, m.subject, m.from_address,
+                   m.from_name, m.to_addresses, m.cc_addresses, m.date_sent, m.date_epoch, m.snippet,
+                   m.is_read, m.is_starred, m.has_attachments, m.size, m.maildir_path,
+                   m.body_text, m.body_html
+            FROM messages m
+            WHERE {}
+            ORDER BY m.date_epoch DESC, m.uid DESC
+            LIMIT ? OFFSET ?"#,
+            where_clause
+        );
+        let mut query = sqlx::query_as::<_, DbMessage>(&query_str);
+        if !filter.from_contains.is_empty() {
+            let pattern = format!("%{}%", filter.from_contains);
+            query = query.bind(pattern.clone()).bind(pattern);
+        }
+        if let Some(after) = filter.date_after {
+            query = query.bind(after);
+        }
+        if let Some(before) = filter.date_before {
+            query = query.bind(before);
+        }
+        let messages = query.bind(limit).bind(offset).fetch_all(&self.pool).await?;
+        Ok(messages)
+    }
+
+    /// Get starred message count with filters (all accounts)
+    pub async fn get_starred_messages_filtered_count(
+        &self,
+        filter: &MessageFilter,
+    ) -> CoreResult<i64> {
+        let mut conditions = vec!["m.is_starred = 1".to_string()];
+        conditions.extend(filter.build_conditions());
+        let where_clause = conditions.join(" AND ");
+        let query_str = format!(
+            "SELECT COUNT(*) as count FROM messages m WHERE {}",
+            where_clause
+        );
+        let mut query = sqlx::query(&query_str);
+        if !filter.from_contains.is_empty() {
+            let pattern = format!("%{}%", filter.from_contains);
+            query = query.bind(pattern.clone()).bind(pattern);
+        }
+        if let Some(after) = filter.date_after {
+            query = query.bind(after);
+        }
+        if let Some(before) = filter.date_before {
+            query = query.bind(before);
+        }
+        let row = query.fetch_one(&self.pool).await?;
+        Ok(row.get::<i64, _>("count"))
+    }
+
+    /// Get starred messages with filters applied (single account)
+    pub async fn get_starred_messages_for_account_filtered(
+        &self,
+        account_id: &str,
+        limit: i64,
+        offset: i64,
+        filter: &MessageFilter,
+    ) -> CoreResult<Vec<DbMessage>> {
+        let mut conditions = vec![
+            "m.is_starred = 1".to_string(),
+            "f.account_id = ?".to_string(),
+        ];
+        conditions.extend(filter.build_conditions());
+        let where_clause = conditions.join(" AND ");
+        let query_str = format!(
+            r#"SELECT m.id, m.folder_id, m.uid, m.message_id, m.subject, m.from_address,
+                   m.from_name, m.to_addresses, m.cc_addresses, m.date_sent, m.date_epoch, m.snippet,
+                   m.is_read, m.is_starred, m.has_attachments, m.size, m.maildir_path,
+                   m.body_text, m.body_html
+            FROM messages m
+            JOIN folders f ON m.folder_id = f.id
+            WHERE {}
+            ORDER BY m.date_epoch DESC, m.uid DESC
+            LIMIT ? OFFSET ?"#,
+            where_clause
+        );
+        let mut query = sqlx::query_as::<_, DbMessage>(&query_str).bind(account_id);
+        if !filter.from_contains.is_empty() {
+            let pattern = format!("%{}%", filter.from_contains);
+            query = query.bind(pattern.clone()).bind(pattern);
+        }
+        if let Some(after) = filter.date_after {
+            query = query.bind(after);
+        }
+        if let Some(before) = filter.date_before {
+            query = query.bind(before);
+        }
+        let messages = query.bind(limit).bind(offset).fetch_all(&self.pool).await?;
+        Ok(messages)
+    }
+
+    /// Get starred message count with filters (single account)
+    pub async fn get_starred_count_for_account_filtered(
+        &self,
+        account_id: &str,
+        filter: &MessageFilter,
+    ) -> CoreResult<i64> {
+        let mut conditions = vec![
+            "m.is_starred = 1".to_string(),
+            "f.account_id = ?".to_string(),
+        ];
+        conditions.extend(filter.build_conditions());
+        let where_clause = conditions.join(" AND ");
+        let query_str = format!(
+            r#"SELECT COUNT(*) as count FROM messages m
+            JOIN folders f ON m.folder_id = f.id
+            WHERE {}"#,
+            where_clause
+        );
+        let mut query = sqlx::query(&query_str).bind(account_id);
+        if !filter.from_contains.is_empty() {
+            let pattern = format!("%{}%", filter.from_contains);
+            query = query.bind(pattern.clone()).bind(pattern);
+        }
+        if let Some(after) = filter.date_after {
+            query = query.bind(after);
+        }
+        if let Some(before) = filter.date_before {
+            query = query.bind(before);
+        }
+        let row = query.fetch_one(&self.pool).await?;
+        Ok(row.get::<i64, _>("count"))
+    }
+
     /// Clear all cached data
     pub async fn clear_all_cache(&self) -> CoreResult<()> {
         sqlx::query("DELETE FROM messages")

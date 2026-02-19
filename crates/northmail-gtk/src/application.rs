@@ -366,6 +366,8 @@ mod imp {
         pub(super) cache_folder_id: Cell<i64>,
         /// Current folder type (inbox, drafts, sent, etc.) for UI behavior
         pub(super) current_folder_type: RefCell<String>,
+        /// When viewing starred for a specific account, stores that account_id
+        pub(super) starred_account_id: RefCell<Option<String>>,
         /// Cached contacts from EDS (preloaded at startup) — (name, email, photo_bytes)
         pub(super) contacts_cache: RefCell<Vec<(String, String, Option<Vec<u8>>)>>,
         /// Timer source ID for periodic mail checking
@@ -3125,6 +3127,12 @@ impl NorthMailApplication {
 
                             if is_unified {
                                 app.fetch_unified_inbox();
+                            } else if folder_path == "__STARRED__" {
+                                if account_id.is_empty() {
+                                    app.fetch_starred_all();
+                                } else {
+                                    app.fetch_starred_account(account_id);
+                                }
                             } else {
                                 app.fetch_folder(account_id, folder_path);
                             }
@@ -3363,13 +3371,18 @@ impl NorthMailApplication {
             None => return false,
         };
 
+        let starred_aid = self.imp().starred_account_id.borrow().clone();
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = if folder_id == -1 {
-                rt.block_on(db.get_inbox_message_count())
-            } else {
-                rt.block_on(db.get_message_count(folder_id))
+            let result = match folder_id {
+                -1 => rt.block_on(db.get_inbox_message_count()),
+                -2 => rt.block_on(db.get_starred_count()),
+                -3 => {
+                    let aid = starred_aid.as_deref().unwrap_or("");
+                    rt.block_on(db.get_starred_count_for_account(aid))
+                }
+                _ => rt.block_on(db.get_message_count(folder_id)),
             };
             let _ = sender.send(result);
         });
@@ -3429,6 +3442,7 @@ impl NorthMailApplication {
         let filter = filter.unwrap_or_default();
 
         let app = self.clone();
+        let starred_aid = self.imp().starred_account_id.borrow().clone();
 
         glib::spawn_future_local(async move {
             let (sender, receiver) = std::sync::mpsc::channel();
@@ -3438,27 +3452,43 @@ impl NorthMailApplication {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 let result = rt.block_on(async {
                     let (messages, total) = if f.is_active() {
-                        let msgs = if folder_id == -1 {
-                            db.get_inbox_messages_filtered(batch_size, offset, &f).await?
-                        } else {
-                            db.get_messages_filtered(folder_id, batch_size, offset, &f).await?
+                        let msgs = match folder_id {
+                            -1 => db.get_inbox_messages_filtered(batch_size, offset, &f).await?,
+                            -2 => db.get_starred_messages_filtered(batch_size, offset, &f).await?,
+                            -3 => {
+                                let aid = starred_aid.as_deref().unwrap_or("");
+                                db.get_starred_messages_for_account_filtered(aid, batch_size, offset, &f).await?
+                            }
+                            _ => db.get_messages_filtered(folder_id, batch_size, offset, &f).await?,
                         };
-                        let count = if folder_id == -1 {
-                            db.get_inbox_messages_filtered_count(&f).await?
-                        } else {
-                            db.get_messages_filtered_count(folder_id, &f).await?
+                        let count = match folder_id {
+                            -1 => db.get_inbox_messages_filtered_count(&f).await?,
+                            -2 => db.get_starred_messages_filtered_count(&f).await?,
+                            -3 => {
+                                let aid = starred_aid.as_deref().unwrap_or("");
+                                db.get_starred_count_for_account_filtered(aid, &f).await?
+                            }
+                            _ => db.get_messages_filtered_count(folder_id, &f).await?,
                         };
                         (msgs, count)
                     } else {
-                        let msgs = if folder_id == -1 {
-                            db.get_inbox_messages(batch_size, offset).await?
-                        } else {
-                            db.get_messages(folder_id, batch_size, offset).await?
+                        let msgs = match folder_id {
+                            -1 => db.get_inbox_messages(batch_size, offset).await?,
+                            -2 => db.get_starred_messages(batch_size, offset).await?,
+                            -3 => {
+                                let aid = starred_aid.as_deref().unwrap_or("");
+                                db.get_starred_messages_for_account(aid, batch_size, offset).await?
+                            }
+                            _ => db.get_messages(folder_id, batch_size, offset).await?,
                         };
-                        let count = if folder_id == -1 {
-                            db.get_inbox_message_count().await?
-                        } else {
-                            db.get_message_count(folder_id).await?
+                        let count = match folder_id {
+                            -1 => db.get_inbox_message_count().await?,
+                            -2 => db.get_starred_count().await?,
+                            -3 => {
+                                let aid = starred_aid.as_deref().unwrap_or("");
+                                db.get_starred_count_for_account(aid).await?
+                            }
+                            _ => db.get_message_count(folder_id).await?,
                         };
                         (msgs, count)
                     };
@@ -5373,6 +5403,12 @@ impl NorthMailApplication {
         self.imp().cache_folder_id.get() == -1
     }
 
+    /// Whether we are currently in starred mode (all or per-account)
+    pub fn is_starred_mode(&self) -> bool {
+        let fid = self.imp().cache_folder_id.get();
+        fid == -2 || fid == -3
+    }
+
     /// Resolve a folder_id to (account_id, folder_path) via DB lookup
     /// Used in unified inbox mode to find which account/folder a message belongs to
     pub fn resolve_folder_info(&self, folder_id: i64) -> Option<(String, String)> {
@@ -5523,6 +5559,197 @@ impl NorthMailApplication {
         });
     }
 
+    /// Fetch and display starred messages from all accounts
+    pub fn fetch_starred_all(&self) {
+        let app = self.clone();
+
+        *self.imp().current_folder_type.borrow_mut() = "starred".to_string();
+        self.imp().starred_account_id.replace(None);
+
+        if let Some(window) = self.active_window() {
+            window.set_title(Some(&format!("{} — NorthMail", tr("Starred"))));
+        }
+
+        self.imp().folder_load_state.replace(None);
+        self.imp().cache_offset.set(0);
+        self.imp().cache_folder_id.set(-2); // sentinel for starred-all
+
+        let generation = self.imp().fetch_generation.get() + 1;
+        self.imp().fetch_generation.set(generation);
+
+        let db = match self.database() {
+            Some(db) => db.clone(),
+            None => {
+                self.show_error(&tr("Database not available"));
+                return;
+            }
+        };
+
+        glib::spawn_future_local(async move {
+            info!("Fetching starred messages (all accounts)");
+
+            let (sender, receiver) = std::sync::mpsc::channel();
+
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result = rt.block_on(async {
+                    let messages = db.get_starred_messages(100, 0).await?;
+                    let total = db.get_starred_count().await?;
+                    Ok::<_, northmail_core::CoreError>((messages, total))
+                });
+                let _ = sender.send(result);
+            });
+
+            let result = loop {
+                match receiver.try_recv() {
+                    Ok(result) => break Some(result),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        glib::timeout_future(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break None,
+                }
+            };
+
+            match result {
+                Some(Ok((messages, total))) => {
+                    let loaded_count = messages.len() as i64;
+                    info!("Starred: loaded {} of {} messages", loaded_count, total);
+
+                    app.imp().cache_offset.set(loaded_count);
+
+                    let message_infos: Vec<MessageInfo> =
+                        messages.iter().map(MessageInfo::from).collect();
+
+                    if let Some(window) = app.active_window() {
+                        if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                            win.restore_message_list();
+                            if let Some(message_list) = win.message_list() {
+                                message_list.clear_search();
+                                message_list.set_folder_context("", "STARRED");
+                                message_list.set_messages(message_infos);
+
+                                let app_clone = app.clone();
+                                message_list.connect_load_more(move || {
+                                    app_clone.load_more_from_cache();
+                                });
+
+                                let has_more = loaded_count < total;
+                                message_list.set_can_load_more(has_more);
+                            }
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    error!("Failed to load starred messages: {}", e);
+                    app.show_error(&format!("{}: {}", tr("Failed to load starred"), e));
+                }
+                None => {
+                    warn!("Starred load channel disconnected");
+                }
+            }
+        });
+    }
+
+    /// Fetch and display starred messages for a specific account
+    pub fn fetch_starred_account(&self, account_id: &str) {
+        let app = self.clone();
+        let account_id_owned = account_id.to_string();
+
+        *self.imp().current_folder_type.borrow_mut() = "starred".to_string();
+        self.imp().starred_account_id.replace(Some(account_id_owned.clone()));
+
+        // Try to find account email for title
+        let email = self.imp().accounts.borrow().iter()
+            .find(|a| a.id == account_id_owned)
+            .map(|a| a.email.clone())
+            .unwrap_or_else(|| account_id_owned.clone());
+
+        if let Some(window) = self.active_window() {
+            window.set_title(Some(&format!("{} — {} — NorthMail", tr("Starred"), email)));
+        }
+
+        self.imp().folder_load_state.replace(None);
+        self.imp().cache_offset.set(0);
+        self.imp().cache_folder_id.set(-3); // sentinel for starred-per-account
+
+        let generation = self.imp().fetch_generation.get() + 1;
+        self.imp().fetch_generation.set(generation);
+
+        let db = match self.database() {
+            Some(db) => db.clone(),
+            None => {
+                self.show_error(&tr("Database not available"));
+                return;
+            }
+        };
+
+        glib::spawn_future_local(async move {
+            info!("Fetching starred messages for account {}", account_id_owned);
+
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let aid = account_id_owned.clone();
+
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result = rt.block_on(async {
+                    let messages = db.get_starred_messages_for_account(&aid, 100, 0).await?;
+                    let total = db.get_starred_count_for_account(&aid).await?;
+                    Ok::<_, northmail_core::CoreError>((messages, total))
+                });
+                let _ = sender.send(result);
+            });
+
+            let result = loop {
+                match receiver.try_recv() {
+                    Ok(result) => break Some(result),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        glib::timeout_future(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break None,
+                }
+            };
+
+            match result {
+                Some(Ok((messages, total))) => {
+                    let loaded_count = messages.len() as i64;
+                    info!("Starred (account {}): loaded {} of {} messages",
+                          account_id_owned, loaded_count, total);
+
+                    app.imp().cache_offset.set(loaded_count);
+
+                    let message_infos: Vec<MessageInfo> =
+                        messages.iter().map(MessageInfo::from).collect();
+
+                    if let Some(window) = app.active_window() {
+                        if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                            win.restore_message_list();
+                            if let Some(message_list) = win.message_list() {
+                                message_list.clear_search();
+                                message_list.set_folder_context(&account_id_owned, "STARRED");
+                                message_list.set_messages(message_infos);
+
+                                let app_clone = app.clone();
+                                message_list.connect_load_more(move || {
+                                    app_clone.load_more_from_cache();
+                                });
+
+                                let has_more = loaded_count < total;
+                                message_list.set_can_load_more(has_more);
+                            }
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    error!("Failed to load starred messages for account: {}", e);
+                    app.show_error(&format!("{}: {}", tr("Failed to load starred"), e));
+                }
+                None => {
+                    warn!("Starred account load channel disconnected");
+                }
+            }
+        });
+    }
+
     /// Handle filter-changed: re-query DB with current filter state
     pub fn handle_filter_changed(&self) {
         let folder_id = self.imp().cache_folder_id.get();
@@ -5552,6 +5779,7 @@ impl NorthMailApplication {
 
         let batch_size: i64 = 100;
         let app = self.clone();
+        let starred_aid = self.imp().starred_account_id.borrow().clone();
 
         glib::spawn_future_local(async move {
             let (sender, receiver) = std::sync::mpsc::channel();
@@ -5562,28 +5790,44 @@ impl NorthMailApplication {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 let result = rt.block_on(async {
                     let (messages, total) = if f.is_active() {
-                        let msgs = if fid == -1 {
-                            db.get_inbox_messages_filtered(batch_size, 0, &f).await?
-                        } else {
-                            db.get_messages_filtered(fid, batch_size, 0, &f).await?
+                        let msgs = match fid {
+                            -1 => db.get_inbox_messages_filtered(batch_size, 0, &f).await?,
+                            -2 => db.get_starred_messages_filtered(batch_size, 0, &f).await?,
+                            -3 => {
+                                let aid = starred_aid.as_deref().unwrap_or("");
+                                db.get_starred_messages_for_account_filtered(aid, batch_size, 0, &f).await?
+                            }
+                            _ => db.get_messages_filtered(fid, batch_size, 0, &f).await?,
                         };
-                        let count = if fid == -1 {
-                            db.get_inbox_messages_filtered_count(&f).await?
-                        } else {
-                            db.get_messages_filtered_count(fid, &f).await?
+                        let count = match fid {
+                            -1 => db.get_inbox_messages_filtered_count(&f).await?,
+                            -2 => db.get_starred_messages_filtered_count(&f).await?,
+                            -3 => {
+                                let aid = starred_aid.as_deref().unwrap_or("");
+                                db.get_starred_count_for_account_filtered(aid, &f).await?
+                            }
+                            _ => db.get_messages_filtered_count(fid, &f).await?,
                         };
                         (msgs, count)
                     } else {
                         // No filter active: reload default page
-                        let msgs = if fid == -1 {
-                            db.get_inbox_messages(batch_size, 0).await?
-                        } else {
-                            db.get_messages(fid, batch_size, 0).await?
+                        let msgs = match fid {
+                            -1 => db.get_inbox_messages(batch_size, 0).await?,
+                            -2 => db.get_starred_messages(batch_size, 0).await?,
+                            -3 => {
+                                let aid = starred_aid.as_deref().unwrap_or("");
+                                db.get_starred_messages_for_account(aid, batch_size, 0).await?
+                            }
+                            _ => db.get_messages(fid, batch_size, 0).await?,
                         };
-                        let count = if fid == -1 {
-                            db.get_inbox_message_count().await?
-                        } else {
-                            db.get_message_count(fid).await?
+                        let count = match fid {
+                            -1 => db.get_inbox_message_count().await?,
+                            -2 => db.get_starred_count().await?,
+                            -3 => {
+                                let aid = starred_aid.as_deref().unwrap_or("");
+                                db.get_starred_count_for_account(aid).await?
+                            }
+                            _ => db.get_message_count(fid).await?,
                         };
                         (msgs, count)
                     };
