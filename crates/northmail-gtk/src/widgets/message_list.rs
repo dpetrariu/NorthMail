@@ -1286,6 +1286,31 @@ impl MessageList {
                         }
                     });
                     list_box.add_controller(gesture);
+
+                    // Keyboard navigation: emit message-selected when row changes via arrow keys
+                    let widget_kb = self.clone();
+                    list_box.connect_row_selected(move |_lb, row| {
+                        if let Some(row) = row {
+                            let index = row.index();
+                            let imp = widget_kb.imp();
+                            let messages = imp.messages.borrow();
+                            let filtered: Vec<&MessageInfo> = messages.iter()
+                                .filter(|m| widget_kb.message_matches(m))
+                                .collect();
+                            if let Some(msg) = filtered.get(index as usize) {
+                                let uid = msg.uid;
+                                drop(filtered);
+                                drop(messages);
+                                let mut uids = imp.selected_uids.borrow_mut();
+                                uids.clear();
+                                uids.push(uid);
+                                drop(uids);
+                                imp.anchor_index.set(Some(index));
+                                widget_kb.emit_by_name::<()>("message-selected", &[&uid]);
+                            }
+                        }
+                    });
+
                     imp.row_handler_connected.set(true);
                     tracing::debug!("Click gesture handler connected");
                 }

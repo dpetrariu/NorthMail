@@ -453,9 +453,6 @@ impl FolderSidebar {
             .starred-section .starred-list > row:selected {
                 background-color: alpha(@accent_bg_color, 0.25);
             }
-            .starred-section .starred-list > row:selected image {
-                color: #f5c211;
-            }
             .starred-section .starred-list > row {
                 min-height: 0;
             }
@@ -1216,7 +1213,7 @@ impl FolderSidebar {
         let content = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
             .spacing(8)
-            .margin_start(12)
+            .margin_start(16)
             .margin_end(12)
             .margin_top(6)
             .margin_bottom(6)
@@ -1303,7 +1300,9 @@ impl FolderSidebar {
         });
 
         content.append(&arrow_btn);
-        content.append(&gtk4::Image::from_icon_name("starred-symbolic"));
+        let star_icon = gtk4::Image::from_icon_name("starred-symbolic");
+        star_icon.add_css_class("starred-icon");
+        content.append(&star_icon);
 
         content.append(
             &gtk4::Label::builder()
@@ -1334,7 +1333,9 @@ impl FolderSidebar {
             .margin_bottom(4)
             .build();
 
-        content.append(&gtk4::Image::from_icon_name("starred-symbolic"));
+        let star_icon = gtk4::Image::from_icon_name("starred-symbolic");
+        star_icon.add_css_class("starred-icon");
+        content.append(&star_icon);
 
         content.append(
             &gtk4::Label::builder()
