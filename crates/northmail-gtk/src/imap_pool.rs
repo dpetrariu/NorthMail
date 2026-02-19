@@ -43,6 +43,27 @@ pub enum ImapCommand {
         uid: u32,
         response_tx: mpsc::Sender<ImapResponse>,
     },
+    /// Create a new folder
+    CreateFolder {
+        folder_path: String,
+        response_tx: mpsc::Sender<ImapResponse>,
+    },
+    /// Rename a folder
+    RenameFolder {
+        from_path: String,
+        to_path: String,
+        response_tx: mpsc::Sender<ImapResponse>,
+    },
+    /// Delete a folder
+    DeleteFolder {
+        folder_path: String,
+        response_tx: mpsc::Sender<ImapResponse>,
+    },
+    /// Empty a folder (mark all messages as deleted, then expunge)
+    EmptyFolder {
+        folder_path: String,
+        response_tx: mpsc::Sender<ImapResponse>,
+    },
     /// Check connection health
     Noop {
         response_tx: mpsc::Sender<ImapResponse>,
@@ -302,6 +323,76 @@ impl ImapPool {
                                 Self::handle_move_message(&mut client, &source_folder, &dest_folder, uid, &response_tx, &mut current_folder)
                                     .await;
                             }
+                            ImapCommand::CreateFolder {
+                                folder_path,
+                                response_tx,
+                            } => {
+                                match client.create_folder(&folder_path).await {
+                                    Ok(_) => {
+                                        info!("IMAP: created folder {}", folder_path);
+                                        let _ = response_tx.send(ImapResponse::Ok);
+                                    }
+                                    Err(e) => {
+                                        error!("IMAP: create folder failed: {}", e);
+                                        let _ = response_tx.send(ImapResponse::Error(e.to_string()));
+                                    }
+                                }
+                            }
+                            ImapCommand::RenameFolder {
+                                from_path,
+                                to_path,
+                                response_tx,
+                            } => {
+                                match client.rename_folder(&from_path, &to_path).await {
+                                    Ok(_) => {
+                                        info!("IMAP: renamed folder {} -> {}", from_path, to_path);
+                                        // Invalidate current folder cache if it was renamed
+                                        if current_folder.as_deref() == Some(&from_path) {
+                                            current_folder = Some(to_path);
+                                        }
+                                        let _ = response_tx.send(ImapResponse::Ok);
+                                    }
+                                    Err(e) => {
+                                        error!("IMAP: rename folder failed: {}", e);
+                                        let _ = response_tx.send(ImapResponse::Error(e.to_string()));
+                                    }
+                                }
+                            }
+                            ImapCommand::DeleteFolder {
+                                folder_path,
+                                response_tx,
+                            } => {
+                                // Clear current folder if we're deleting it
+                                if current_folder.as_deref() == Some(&folder_path) {
+                                    current_folder = None;
+                                }
+                                match client.delete_folder(&folder_path).await {
+                                    Ok(_) => {
+                                        info!("IMAP: deleted folder {}", folder_path);
+                                        let _ = response_tx.send(ImapResponse::Ok);
+                                    }
+                                    Err(e) => {
+                                        error!("IMAP: delete folder failed: {}", e);
+                                        let _ = response_tx.send(ImapResponse::Error(e.to_string()));
+                                    }
+                                }
+                            }
+                            ImapCommand::EmptyFolder {
+                                folder_path,
+                                response_tx,
+                            } => {
+                                match client.empty_folder(&folder_path).await {
+                                    Ok(_) => {
+                                        info!("IMAP: emptied folder {}", folder_path);
+                                        current_folder = Some(folder_path);
+                                        let _ = response_tx.send(ImapResponse::Ok);
+                                    }
+                                    Err(e) => {
+                                        error!("IMAP: empty folder failed: {}", e);
+                                        let _ = response_tx.send(ImapResponse::Error(e.to_string()));
+                                    }
+                                }
+                            }
                         }
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -551,6 +642,18 @@ impl ImapPool {
                 let _ = response_tx.send(ImapResponse::Error(error.to_string()));
             }
             ImapCommand::MoveMessage { response_tx, .. } => {
+                let _ = response_tx.send(ImapResponse::Error(error.to_string()));
+            }
+            ImapCommand::CreateFolder { response_tx, .. } => {
+                let _ = response_tx.send(ImapResponse::Error(error.to_string()));
+            }
+            ImapCommand::RenameFolder { response_tx, .. } => {
+                let _ = response_tx.send(ImapResponse::Error(error.to_string()));
+            }
+            ImapCommand::DeleteFolder { response_tx, .. } => {
+                let _ = response_tx.send(ImapResponse::Error(error.to_string()));
+            }
+            ImapCommand::EmptyFolder { response_tx, .. } => {
                 let _ = response_tx.send(ImapResponse::Error(error.to_string()));
             }
             ImapCommand::Noop { response_tx } => {

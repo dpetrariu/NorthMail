@@ -2,6 +2,8 @@
 //! and collapsible per-account folder sections.
 
 use gtk4::{glib, prelude::*, subclass::prelude::*};
+use libadwaita as adw;
+use libadwaita::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -66,6 +68,8 @@ mod imp {
         pub accounts: RefCell<Vec<super::AccountFolders>>,
         /// Persisted expand/collapse state per account id.
         pub expanded_states: RefCell<HashMap<String, bool>>,
+        /// Persisted expand/collapse state per folder (key: "account_id\0folder_path")
+        pub folder_expanded_states: RefCell<HashMap<String, bool>>,
         // -- sync-status widgets (unchanged) --
         pub sync_status_box: RefCell<Option<gtk4::Box>>,
         pub sync_spinner: RefCell<Option<gtk4::Spinner>>,
@@ -101,6 +105,32 @@ mod imp {
                             String::static_type(), // source folder_path
                             String::static_type(), // target account_id
                             String::static_type(), // target folder_path
+                        ])
+                        .build(),
+                    Signal::builder("folder-create-requested")
+                        .param_types([
+                            String::static_type(), // account_id
+                            String::static_type(), // parent_path
+                            String::static_type(), // folder_name
+                        ])
+                        .build(),
+                    Signal::builder("folder-rename-requested")
+                        .param_types([
+                            String::static_type(), // account_id
+                            String::static_type(), // folder_path
+                            String::static_type(), // new_name
+                        ])
+                        .build(),
+                    Signal::builder("folder-delete-requested")
+                        .param_types([
+                            String::static_type(), // account_id
+                            String::static_type(), // folder_path
+                        ])
+                        .build(),
+                    Signal::builder("empty-trash-requested")
+                        .param_types([
+                            String::static_type(), // account_id
+                            String::static_type(), // folder_path
                         ])
                         .build(),
                 ]
@@ -167,6 +197,71 @@ impl FolderSidebar {
                                        target_account_id: &str,
                                        target_folder_path: &str| {
                 f(sidebar, uid, msg_id, source_account_id, source_folder_path, target_account_id, target_folder_path);
+            }),
+        )
+    }
+
+    /// Connect to the folder-create-requested signal
+    pub fn connect_folder_create_requested<F>(&self, f: F) -> glib::SignalHandlerId
+    where
+        F: Fn(&Self, &str, &str, &str) + 'static,
+    {
+        self.connect_closure(
+            "folder-create-requested",
+            false,
+            glib::closure_local!(move |sidebar: &FolderSidebar,
+                                       account_id: &str,
+                                       parent_path: &str,
+                                       folder_name: &str| {
+                f(sidebar, account_id, parent_path, folder_name);
+            }),
+        )
+    }
+
+    /// Connect to the folder-rename-requested signal
+    pub fn connect_folder_rename_requested<F>(&self, f: F) -> glib::SignalHandlerId
+    where
+        F: Fn(&Self, &str, &str, &str) + 'static,
+    {
+        self.connect_closure(
+            "folder-rename-requested",
+            false,
+            glib::closure_local!(move |sidebar: &FolderSidebar,
+                                       account_id: &str,
+                                       folder_path: &str,
+                                       new_name: &str| {
+                f(sidebar, account_id, folder_path, new_name);
+            }),
+        )
+    }
+
+    /// Connect to the folder-delete-requested signal
+    pub fn connect_folder_delete_requested<F>(&self, f: F) -> glib::SignalHandlerId
+    where
+        F: Fn(&Self, &str, &str) + 'static,
+    {
+        self.connect_closure(
+            "folder-delete-requested",
+            false,
+            glib::closure_local!(move |sidebar: &FolderSidebar,
+                                       account_id: &str,
+                                       folder_path: &str| {
+                f(sidebar, account_id, folder_path);
+            }),
+        )
+    }
+
+    pub fn connect_empty_trash_requested<F>(&self, f: F) -> glib::SignalHandlerId
+    where
+        F: Fn(&Self, &str, &str) + 'static,
+    {
+        self.connect_closure(
+            "empty-trash-requested",
+            false,
+            glib::closure_local!(move |sidebar: &FolderSidebar,
+                                       account_id: &str,
+                                       folder_path: &str| {
+                f(sidebar, account_id, folder_path);
             }),
         )
     }
@@ -324,6 +419,13 @@ impl FolderSidebar {
             }
             .folders-list .folder-entry-row {
                 min-height: 0;
+            }
+            /* Folder disclosure arrow button - compact */
+            .folder-entry button.circular {
+                min-width: 18px;
+                min-height: 18px;
+                padding: 0;
+                margin: 0;
             }
             /* Separators in folders list - add margins */
             .folders-list separator {
@@ -614,26 +716,49 @@ impl FolderSidebar {
             inboxes_list.append(&row);
         }
 
+        // Load persisted folder expansion states
+        let saved_folder_states = self.load_folder_expander_states();
+        let mut folder_expanded_states = HashMap::new();
+
         // ── Section 2+: Per-account folder groups (in folders list) ──
         for (i, account) in accounts.iter().enumerate() {
             let section = i + 2;
             let expanded = saved.get(&account.id).copied().unwrap_or(false);
             expanded_states.insert(account.id.clone(), expanded);
 
+            // Build a set of folder paths to detect which folders have children
+            let folder_paths: Vec<&str> = account.folders.iter().map(|f| f.full_path.as_str()).collect();
+
             // Section header row (not selectable, just toggles expansion)
-            let header = self.create_section_header_row(&account.email, expanded);
+            let header = self.create_section_header_row(&account.email, expanded, &account.id);
             header.set_widget_name(&encode_row_name(section, "header", &account.id, ""));
             folders_list.append(&header);
 
             // Folder rows (hidden when collapsed)
             for folder in &account.folders {
+                // Check if this folder has any children in the list
+                let has_children = folder_paths.iter().any(|p| {
+                    *p != folder.full_path
+                        && (p.starts_with(&format!("{}/", folder.full_path))
+                            || p.starts_with(&format!("{}.", folder.full_path)))
+                });
+
+                let folder_key = format!("{}\0{}", account.id, folder.full_path);
+                let folder_expanded = saved_folder_states.get(&folder_key).copied().unwrap_or(true);
+                if has_children {
+                    folder_expanded_states.insert(folder_key.clone(), folder_expanded);
+                }
+
                 let row = self.create_folder_row(
                     &folder.icon_name,
                     &folder.name,
                     folder.unread_count,
-                    true,
+                    folder.depth,
                     &account.id,
                     &folder.full_path,
+                    &folder.folder_type,
+                    has_children,
+                    folder_expanded,
                 );
                 row.set_widget_name(&encode_row_name(
                     section,
@@ -641,12 +766,23 @@ impl FolderSidebar {
                     &account.id,
                     &folder.full_path,
                 ));
-                row.set_visible(expanded);
+
+                // Visible if: account section is expanded AND all ancestor folders are expanded
+                let visible = if !expanded {
+                    false
+                } else if folder.depth == 0 {
+                    true
+                } else {
+                    // Check all ancestor paths are expanded
+                    self.are_ancestors_expanded(&account.id, &folder.full_path, &folder_expanded_states)
+                };
+                row.set_visible(visible);
                 folders_list.append(&row);
             }
         }
 
         imp.expanded_states.replace(expanded_states);
+        imp.folder_expanded_states.replace(folder_expanded_states);
 
         // Restore the previously selected row
         if let Some(ref name) = selected_name {
@@ -769,9 +905,12 @@ impl FolderSidebar {
         icon_name: &str,
         label: &str,
         unread_count: Option<u32>,
-        indent: bool,
+        depth: u32,
         account_id: &str,
         folder_path: &str,
+        folder_type: &str,
+        has_children: bool,
+        folder_expanded: bool,
     ) -> gtk4::ListBoxRow {
         let row = gtk4::ListBoxRow::builder()
             .selectable(true)
@@ -779,15 +918,47 @@ impl FolderSidebar {
             .css_classes(["folder-entry-row"])
             .build();
 
+        // Base indent of 32px + 16px per nesting level.
+        // If this folder has children, the arrow takes 12+4=16px so reduce margin by that
+        let base_margin = 32 + (depth as i32) * 16;
+        let margin_left = if has_children { base_margin - 16 } else { base_margin };
+
         let content = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
             .spacing(10)
-            .margin_start(if indent { 32 } else { 12 })
+            .margin_start(margin_left.max(4))
             .margin_end(12)
             .margin_top(4)
             .margin_bottom(4)
             .css_classes(["folder-entry"])
             .build();
+
+        // Disclosure arrow for folders with children
+        if has_children {
+            let arrow_icon = if folder_expanded { "pan-down-symbolic" } else { "pan-end-symbolic" };
+            let arrow = gtk4::Image::builder()
+                .icon_name(arrow_icon)
+                .pixel_size(12)
+                .build();
+            arrow.set_widget_name("folder-disclosure-arrow");
+
+            let arrow_btn = gtk4::Button::builder()
+                .child(&arrow)
+                .css_classes(["flat", "circular"])
+                .valign(gtk4::Align::Center)
+                .build();
+            // Make the button small
+            arrow_btn.set_size_request(20, 20);
+
+            let sidebar = self.clone();
+            let toggle_account_id = account_id.to_string();
+            let toggle_folder_path = folder_path.to_string();
+            arrow_btn.connect_clicked(move |_btn| {
+                sidebar.toggle_folder_expansion(&toggle_account_id, &toggle_folder_path);
+            });
+
+            content.append(&arrow_btn);
+        }
 
         content.append(&gtk4::Image::from_icon_name(icon_name));
 
@@ -848,10 +1019,41 @@ impl FolderSidebar {
         });
 
         row.add_controller(drop_target);
+
+        // Right-click context menu
+        let gesture = gtk4::GestureClick::new();
+        gesture.set_button(3); // right-click
+        let sidebar = self.clone();
+        let ctx_account_id = account_id.to_string();
+        let ctx_folder_path = folder_path.to_string();
+        let ctx_folder_name = label.to_string();
+        let ctx_folder_type = folder_type.to_string();
+        let row_weak = row.downgrade();
+        gesture.connect_pressed(move |gesture, _n, x, y| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            if let Some(row) = row_weak.upgrade() {
+                let is_system = matches!(
+                    ctx_folder_type.as_str(),
+                    "inbox" | "sent" | "drafts" | "trash" | "spam" | "archive"
+                );
+                sidebar.show_folder_context_menu(
+                    &row,
+                    x as i32,
+                    y as i32,
+                    &ctx_account_id,
+                    &ctx_folder_path,
+                    &ctx_folder_name,
+                    is_system,
+                    &ctx_folder_type,
+                );
+            }
+        });
+        row.add_controller(gesture);
+
         row
     }
 
-    fn create_section_header_row(&self, email: &str, expanded: bool) -> gtk4::ListBoxRow {
+    fn create_section_header_row(&self, email: &str, expanded: bool, account_id: &str) -> gtk4::ListBoxRow {
         let row = gtk4::ListBoxRow::builder()
             .selectable(false)
             .activatable(true)
@@ -890,7 +1092,319 @@ impl FolderSidebar {
         );
 
         row.set_child(Some(&content));
+
+        // Right-click on section header: "New Folder" at root level
+        let gesture = gtk4::GestureClick::new();
+        gesture.set_button(3);
+        let sidebar = self.clone();
+        let hdr_account_id = account_id.to_string();
+        let row_weak = row.downgrade();
+        gesture.connect_pressed(move |gesture, _n, x, y| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            if let Some(row) = row_weak.upgrade() {
+                sidebar.show_header_context_menu(&row, x as i32, y as i32, &hdr_account_id);
+            }
+        });
+        row.add_controller(gesture);
+
         row
+    }
+
+    // ── Context menus ────────────────────────────────────────────────
+
+    /// Create a context menu button with explicit dark text, left-aligned, normal weight.
+    /// Matches the style used in message_list.rs to avoid white-on-white on selected rows.
+    fn make_context_menu_item(vbox: &gtk4::Box, label: &str) -> gtk4::Button {
+        let lbl = gtk4::Label::new(None);
+        lbl.set_markup(&format!(
+            "<span color='#1c1c1c' weight='normal'>{}</span>",
+            glib::markup_escape_text(label)
+        ));
+        lbl.set_xalign(0.0);
+
+        let btn = gtk4::Button::new();
+        btn.set_child(Some(&lbl));
+        btn.add_css_class("flat");
+        btn.add_css_class("context-menu-item");
+        btn.set_hexpand(true);
+        btn.set_halign(gtk4::Align::Fill);
+        vbox.append(&btn);
+        btn
+    }
+
+    /// Show context menu for a folder row
+    fn show_folder_context_menu(
+        &self,
+        row: &gtk4::ListBoxRow,
+        x: i32,
+        y: i32,
+        account_id: &str,
+        folder_path: &str,
+        folder_name: &str,
+        is_system: bool,
+        folder_type: &str,
+    ) {
+        let popover = gtk4::Popover::new();
+        popover.set_parent(row);
+        popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x, y, 1, 1)));
+        popover.set_has_arrow(false);
+
+        let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        vbox.set_margin_top(4);
+        vbox.set_margin_bottom(4);
+        vbox.set_margin_start(4);
+        vbox.set_margin_end(4);
+
+        // "New Folder" — always available
+        {
+            let btn = Self::make_context_menu_item(&vbox, &tr("New Folder"));
+            let sidebar = self.clone();
+            let aid = account_id.to_string();
+            let fp = folder_path.to_string();
+            let pop = popover.clone();
+            btn.connect_clicked(move |_| {
+                pop.popdown();
+                sidebar.show_new_folder_dialog(&aid, &fp);
+            });
+        }
+
+        // "Rename" — disabled for system folders
+        {
+            let btn = Self::make_context_menu_item(&vbox, &tr("Rename Folder"));
+            btn.set_sensitive(!is_system);
+            let sidebar = self.clone();
+            let aid = account_id.to_string();
+            let fp = folder_path.to_string();
+            let fn_ = folder_name.to_string();
+            let pop = popover.clone();
+            btn.connect_clicked(move |_| {
+                pop.popdown();
+                sidebar.show_rename_folder_dialog(&aid, &fp, &fn_);
+            });
+        }
+
+        // "Delete" — disabled for system folders
+        {
+            let btn = Self::make_context_menu_item(&vbox, &tr("Delete Folder"));
+            btn.set_sensitive(!is_system);
+            let sidebar = self.clone();
+            let aid = account_id.to_string();
+            let fp = folder_path.to_string();
+            let fn_ = folder_name.to_string();
+            let pop = popover.clone();
+            btn.connect_clicked(move |_| {
+                pop.popdown();
+                sidebar.show_delete_folder_dialog(&aid, &fp, &fn_);
+            });
+        }
+
+        // "Empty Trash" — only for trash folder
+        if folder_type == "trash" {
+            let btn = Self::make_context_menu_item(&vbox, &tr("Empty Trash"));
+            let sidebar = self.clone();
+            let aid = account_id.to_string();
+            let fp = folder_path.to_string();
+            let pop = popover.clone();
+            btn.connect_clicked(move |_| {
+                pop.popdown();
+                sidebar.show_empty_trash_dialog(&aid, &fp);
+            });
+        }
+
+        popover.set_child(Some(&vbox));
+        popover.popup();
+    }
+
+    /// Show context menu for a section header (only "New Folder")
+    fn show_header_context_menu(
+        &self,
+        row: &gtk4::ListBoxRow,
+        x: i32,
+        y: i32,
+        account_id: &str,
+    ) {
+        let popover = gtk4::Popover::new();
+        popover.set_parent(row);
+        popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x, y, 1, 1)));
+        popover.set_has_arrow(false);
+
+        let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        vbox.set_margin_top(4);
+        vbox.set_margin_bottom(4);
+        vbox.set_margin_start(4);
+        vbox.set_margin_end(4);
+
+        let btn = Self::make_context_menu_item(&vbox, &tr("New Folder"));
+        let sidebar = self.clone();
+        let aid = account_id.to_string();
+        let pop = popover.clone();
+        btn.connect_clicked(move |_| {
+            pop.popdown();
+            sidebar.show_new_folder_dialog(&aid, "");
+        });
+
+        popover.set_child(Some(&vbox));
+        popover.popup();
+    }
+
+    // ── Dialogs ──────────────────────────────────────────────────────
+
+    /// Show dialog to create a new folder
+    fn show_new_folder_dialog(&self, account_id: &str, parent_path: &str) {
+        let dialog = adw::AlertDialog::builder()
+            .heading(&tr("New Folder"))
+            .body(&tr("Enter a name for the new folder:"))
+            .close_response("cancel")
+            .default_response("create")
+            .build();
+
+        dialog.add_response("cancel", &tr("Cancel"));
+        dialog.add_response("create", &tr("Create"));
+        dialog.set_response_appearance("create", adw::ResponseAppearance::Suggested);
+
+        let entry = gtk4::Entry::builder()
+            .placeholder_text(&tr("Folder name"))
+            .activates_default(true)
+            .build();
+
+        entry.connect_realize(|e| { e.grab_focus(); });
+
+        dialog.set_extra_child(Some(&entry));
+
+        let sidebar = self.clone();
+        let aid = account_id.to_string();
+        let pp = parent_path.to_string();
+
+        // Find a parent window for the dialog
+        let widget = self.upcast_ref::<gtk4::Widget>();
+        let window = widget.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+
+        dialog.connect_response(None, move |_dialog, response| {
+            if response == "create" {
+                let name = entry.text().trim().to_string();
+                if !name.is_empty() {
+                    sidebar.emit_by_name::<()>(
+                        "folder-create-requested",
+                        &[&aid, &pp, &name],
+                    );
+                }
+            }
+        });
+
+        dialog.present(window.as_ref());
+    }
+
+    /// Show dialog to rename a folder
+    fn show_rename_folder_dialog(&self, account_id: &str, folder_path: &str, current_name: &str) {
+        let dialog = adw::AlertDialog::builder()
+            .heading(&tr("Rename Folder"))
+            .body(&tr("Enter a new name:"))
+            .close_response("cancel")
+            .default_response("rename")
+            .build();
+
+        dialog.add_response("cancel", &tr("Cancel"));
+        dialog.add_response("rename", &tr("Rename"));
+        dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
+
+        let entry = gtk4::Entry::builder()
+            .text(current_name)
+            .activates_default(true)
+            .build();
+
+        entry.connect_realize(|e| { e.grab_focus(); });
+
+        dialog.set_extra_child(Some(&entry));
+
+        let sidebar = self.clone();
+        let aid = account_id.to_string();
+        let fp = folder_path.to_string();
+
+        let widget = self.upcast_ref::<gtk4::Widget>();
+        let window = widget.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+
+        dialog.connect_response(None, move |_dialog, response| {
+            if response == "rename" {
+                let new_name = entry.text().trim().to_string();
+                if !new_name.is_empty() {
+                    sidebar.emit_by_name::<()>(
+                        "folder-rename-requested",
+                        &[&aid, &fp, &new_name],
+                    );
+                }
+            }
+        });
+
+        dialog.present(window.as_ref());
+    }
+
+    /// Show confirmation dialog to delete a folder
+    fn show_delete_folder_dialog(&self, account_id: &str, folder_path: &str, folder_name: &str) {
+        let dialog = adw::AlertDialog::builder()
+            .heading(&tr("Delete Folder"))
+            .body(&format!(
+                "{} \"{}\"?\n{}",
+                tr("Are you sure you want to delete"),
+                folder_name,
+                tr("All messages in this folder will be permanently deleted.")
+            ))
+            .close_response("cancel")
+            .default_response("cancel")
+            .build();
+
+        dialog.add_response("cancel", &tr("Cancel"));
+        dialog.add_response("delete", &tr("Delete"));
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+
+        let sidebar = self.clone();
+        let aid = account_id.to_string();
+        let fp = folder_path.to_string();
+
+        let widget = self.upcast_ref::<gtk4::Widget>();
+        let window = widget.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+
+        dialog.connect_response(None, move |_dialog, response| {
+            if response == "delete" {
+                sidebar.emit_by_name::<()>(
+                    "folder-delete-requested",
+                    &[&aid, &fp],
+                );
+            }
+        });
+
+        dialog.present(window.as_ref());
+    }
+
+    /// Show confirmation dialog to empty the trash folder
+    fn show_empty_trash_dialog(&self, account_id: &str, folder_path: &str) {
+        let dialog = adw::AlertDialog::builder()
+            .heading(&tr("Empty Trash"))
+            .body(&tr("All messages in the Trash will be permanently deleted. This cannot be undone."))
+            .close_response("cancel")
+            .default_response("cancel")
+            .build();
+
+        dialog.add_response("cancel", &tr("Cancel"));
+        dialog.add_response("empty", &tr("Empty Trash"));
+        dialog.set_response_appearance("empty", adw::ResponseAppearance::Destructive);
+
+        let sidebar = self.clone();
+        let aid = account_id.to_string();
+        let fp = folder_path.to_string();
+
+        let widget = self.upcast_ref::<gtk4::Widget>();
+        let window = widget.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+
+        dialog.connect_response(None, move |_dialog, response| {
+            if response == "empty" {
+                sidebar.emit_by_name::<()>(
+                    "empty-trash-requested",
+                    &[&aid, &fp],
+                );
+            }
+        });
+
+        dialog.present(window.as_ref());
     }
 
     // ── Expand / collapse ────────────────────────────────────────────
@@ -933,13 +1447,119 @@ impl FolderSidebar {
                         }
                     }
                     "folder" => {
-                        row.set_visible(new_state);
+                        if !new_state {
+                            // Collapsing account section: hide all
+                            row.set_visible(false);
+                        } else {
+                            // Expanding account section: respect folder nesting
+                            let folder_states = imp.folder_expanded_states.borrow();
+                            let visible = self.is_folder_visible_in_hierarchy(
+                                account_id, _path, &folder_states,
+                            );
+                            row.set_visible(visible);
+                        }
                     }
                     _ => {}
                 }
             }
             idx += 1;
         }
+    }
+
+    /// Toggle expansion of a parent folder's children
+    fn toggle_folder_expansion(&self, account_id: &str, folder_path: &str) {
+        let imp = self.imp();
+        let key = format!("{}\0{}", account_id, folder_path);
+
+        let new_state = {
+            let mut states = imp.folder_expanded_states.borrow_mut();
+            let current = states.get(&key).copied().unwrap_or(true);
+            let new = !current;
+            states.insert(key.clone(), new);
+            new
+        };
+
+        // Persist
+        self.save_folder_expander_state(account_id, folder_path, new_state);
+
+        // Update row visibility + disclosure arrow
+        let folders_list = match imp.folders_list_box.borrow().as_ref() {
+            Some(lb) => lb.clone(),
+            None => return,
+        };
+
+        let folder_states = imp.folder_expanded_states.borrow().clone();
+
+        let prefix_slash = format!("{}/", folder_path);
+        let prefix_dot = format!("{}.", folder_path);
+
+        let mut idx = 0;
+        while let Some(row) = folders_list.row_at_index(idx) {
+            let name = row.widget_name();
+            let (_section, kind, aid, path) = decode_row_name(&name);
+
+            if aid == account_id && kind == "folder" {
+                if path == folder_path {
+                    // Update the disclosure arrow on this row
+                    if let Some(content) = row.child().and_then(|c| c.downcast::<gtk4::Box>().ok()) {
+                        if let Some(btn) = content.first_child().and_then(|c| c.downcast::<gtk4::Button>().ok()) {
+                            if let Some(arrow) = btn.child().and_then(|c| c.downcast::<gtk4::Image>().ok()) {
+                                if arrow.widget_name() == "folder-disclosure-arrow" {
+                                    arrow.set_icon_name(Some(if new_state {
+                                        "pan-down-symbolic"
+                                    } else {
+                                        "pan-end-symbolic"
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                } else if path.starts_with(&prefix_slash) || path.starts_with(&prefix_dot) {
+                    // This is a descendant — set visibility based on full hierarchy
+                    let visible = self.is_folder_visible_in_hierarchy(
+                        account_id, path, &folder_states,
+                    );
+                    row.set_visible(visible);
+                }
+            }
+            idx += 1;
+        }
+    }
+
+    /// Check if a folder should be visible based on all its ancestors' expansion state.
+    /// A folder at depth > 0 is visible only if every ancestor folder is expanded.
+    fn is_folder_visible_in_hierarchy(
+        &self,
+        account_id: &str,
+        folder_path: &str,
+        folder_states: &HashMap<String, bool>,
+    ) -> bool {
+        // Walk up the path, checking each ancestor
+        // Try "/" delimiter first, then "."
+        for delim in &['/', '.'] {
+            if let Some(pos) = folder_path.rfind(*delim) {
+                let parent = &folder_path[..pos];
+                let parent_key = format!("{}\0{}", account_id, parent);
+                let parent_expanded = folder_states.get(&parent_key).copied().unwrap_or(true);
+                if !parent_expanded {
+                    return false;
+                }
+                // Recurse up
+                return self.is_folder_visible_in_hierarchy(account_id, parent, folder_states);
+            }
+        }
+        // Top-level folder: always visible (when account section is expanded)
+        true
+    }
+
+    /// Check all ancestors are expanded (used during set_accounts initial build)
+    fn are_ancestors_expanded(
+        &self,
+        account_id: &str,
+        folder_path: &str,
+        folder_states: &HashMap<String, bool>,
+    ) -> bool {
+        self.is_folder_visible_in_hierarchy(account_id, folder_path, folder_states)
     }
 
     // ── Programmatic selection ───────────────────────────────────────
@@ -1038,6 +1658,32 @@ impl FolderSidebar {
         let path = Self::get_state_file_path();
         let mut states = self.load_expander_states();
         states.insert(account_id.to_string(), expanded);
+        if let Ok(content) = serde_json::to_string(&states) {
+            std::fs::write(&path, content).ok();
+        }
+    }
+
+    fn get_folder_state_file_path() -> std::path::PathBuf {
+        let data_dir = glib::user_data_dir().join("northmail");
+        std::fs::create_dir_all(&data_dir).ok();
+        data_dir.join("folder_expand_state.json")
+    }
+
+    fn load_folder_expander_states(&self) -> HashMap<String, bool> {
+        let path = Self::get_folder_state_file_path();
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(states) = serde_json::from_str(&content) {
+                return states;
+            }
+        }
+        HashMap::new()
+    }
+
+    fn save_folder_expander_state(&self, account_id: &str, folder_path: &str, expanded: bool) {
+        let path = Self::get_folder_state_file_path();
+        let mut states = self.load_folder_expander_states();
+        let key = format!("{}\0{}", account_id, folder_path);
+        states.insert(key, expanded);
         if let Ok(content) = serde_json::to_string(&states) {
             std::fs::write(&path, content).ok();
         }
@@ -1143,4 +1789,8 @@ pub struct FolderInfo {
     pub icon_name: String,
     pub unread_count: Option<u32>,
     pub is_header: bool,
+    /// Folder type from DB: "inbox", "sent", "drafts", "trash", "spam", "archive", "other"
+    pub folder_type: String,
+    /// Nesting depth (0 = top-level, 1 = child of top-level, etc.)
+    pub depth: u32,
 }

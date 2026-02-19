@@ -43,7 +43,7 @@ impl FolderType {
             FolderType::Sent
         } else if name_lower.contains("draft") {
             FolderType::Drafts
-        } else if name_lower.contains("trash") || name_lower.contains("bin") {
+        } else if name_lower.contains("trash") || name_lower.contains("bin") || name_lower.contains("deleted") {
             FolderType::Trash
         } else if name_lower.contains("spam") || name_lower.contains("junk") {
             FolderType::Spam

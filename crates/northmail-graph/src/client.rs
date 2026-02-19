@@ -20,7 +20,7 @@ impl GraphMailClient {
         }
     }
 
-    /// List all mail folders
+    /// List all mail folders (including child folders recursively)
     pub async fn list_folders(&self) -> GraphResult<Vec<GraphFolder>> {
         let url = format!("{}/me/mailFolders?$top=100", GRAPH_BASE);
         debug!("Graph: listing folders");
@@ -43,8 +43,64 @@ impl GraphMailClient {
             .await
             .map_err(|e| GraphError::ParseError(e.to_string()))?;
 
-        info!("Graph: found {} folders", list.value.len());
-        Ok(list.value)
+        let mut all_folders = Vec::new();
+
+        // Recursively fetch child folders, building full paths
+        for mut folder in list.value {
+            let has_children = folder.child_folder_count > 0;
+            let parent_path = folder.display_name.clone();
+            folder.full_path = Some(parent_path.clone());
+            all_folders.push(folder.clone());
+            if has_children {
+                self.list_child_folders_recursive(&folder.id, &parent_path, &mut all_folders).await?;
+            }
+        }
+
+        info!("Graph: found {} folders (including children)", all_folders.len());
+        Ok(all_folders)
+    }
+
+    /// Recursively list child folders, building hierarchical paths
+    async fn list_child_folders_recursive(
+        &self,
+        parent_id: &str,
+        parent_path: &str,
+        result: &mut Vec<GraphFolder>,
+    ) -> GraphResult<()> {
+        let url = format!(
+            "{}/me/mailFolders/{}/childFolders?$top=100",
+            GRAPH_BASE, parent_id
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.access_token)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(GraphError::ApiError { status, body });
+        }
+
+        let list: GraphListResponse<GraphFolder> = response
+            .json()
+            .await
+            .map_err(|e| GraphError::ParseError(e.to_string()))?;
+
+        for mut folder in list.value {
+            let has_children = folder.child_folder_count > 0;
+            let folder_path = format!("{}/{}", parent_path, folder.display_name);
+            folder.full_path = Some(folder_path.clone());
+            result.push(folder.clone());
+            if has_children {
+                Box::pin(self.list_child_folders_recursive(&folder.id, &folder_path, result)).await?;
+            }
+        }
+
+        Ok(())
     }
 
     /// List messages in a folder with pagination
@@ -434,6 +490,152 @@ impl GraphMailClient {
 
         info!("Graph: updated draft {}", message_id);
         Ok(())
+    }
+
+    /// Create a new mail folder. If parent_folder_id is provided, creates a child folder.
+    /// Returns the new folder's Graph ID.
+    pub async fn create_folder(
+        &self,
+        display_name: &str,
+        parent_folder_id: Option<&str>,
+    ) -> GraphResult<String> {
+        let url = match parent_folder_id {
+            Some(parent_id) => format!(
+                "{}/me/mailFolders/{}/childFolders",
+                GRAPH_BASE, parent_id
+            ),
+            None => format!("{}/me/mailFolders", GRAPH_BASE),
+        };
+        debug!("Graph: creating folder '{}' parent={:?}", display_name, parent_folder_id);
+
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.access_token)
+            .json(&serde_json::json!({ "displayName": display_name }))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(GraphError::ApiError { status, body });
+        }
+
+        let created: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| GraphError::ParseError(e.to_string()))?;
+
+        let id = created["id"]
+            .as_str()
+            .ok_or_else(|| GraphError::ParseError("No id in create folder response".to_string()))?
+            .to_string();
+
+        info!("Graph: created folder '{}', id={}", display_name, id);
+        Ok(id)
+    }
+
+    /// Rename a mail folder
+    pub async fn rename_folder(
+        &self,
+        folder_id: &str,
+        new_name: &str,
+    ) -> GraphResult<()> {
+        let url = format!("{}/me/mailFolders/{}", GRAPH_BASE, folder_id);
+        debug!("Graph: renaming folder {} to '{}'", folder_id, new_name);
+
+        let response = self
+            .client
+            .patch(&url)
+            .bearer_auth(&self.access_token)
+            .json(&serde_json::json!({ "displayName": new_name }))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(GraphError::ApiError { status, body });
+        }
+
+        info!("Graph: renamed folder {} to '{}'", folder_id, new_name);
+        Ok(())
+    }
+
+    /// Delete a mail folder
+    pub async fn delete_folder(&self, folder_id: &str) -> GraphResult<()> {
+        let url = format!("{}/me/mailFolders/{}", GRAPH_BASE, folder_id);
+        debug!("Graph: deleting folder {}", folder_id);
+
+        let response = self
+            .client
+            .delete(&url)
+            .bearer_auth(&self.access_token)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(GraphError::ApiError { status, body });
+        }
+
+        info!("Graph: deleted folder {}", folder_id);
+        Ok(())
+    }
+
+    /// Empty a folder by deleting all messages in it
+    pub async fn empty_folder(&self, folder_id: &str) -> GraphResult<u64> {
+        let mut deleted = 0u64;
+        loop {
+            // Fetch a batch of message IDs (only need the id field)
+            let url = format!(
+                "{}/me/mailFolders/{}/messages?$select=id&$top=100",
+                GRAPH_BASE, folder_id
+            );
+
+            let response = self
+                .client
+                .get(&url)
+                .bearer_auth(&self.access_token)
+                .send()
+                .await?;
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                return Err(GraphError::ApiError { status, body });
+            }
+
+            let list: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|e| GraphError::ParseError(e.to_string()))?;
+
+            let ids: Vec<String> = list["value"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if ids.is_empty() {
+                break;
+            }
+
+            for id in &ids {
+                self.delete_message(id).await?;
+                deleted += 1;
+            }
+
+            debug!("Graph: deleted {} messages so far from folder {}", deleted, folder_id);
+        }
+
+        info!("Graph: emptied folder {}, deleted {} messages", folder_id, deleted);
+        Ok(deleted)
     }
 
     /// Delete a message permanently

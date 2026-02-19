@@ -18,6 +18,11 @@ pub struct GraphFolder {
     pub total_item_count: i64,
     #[serde(rename = "unreadItemCount")]
     pub unread_item_count: i64,
+    #[serde(rename = "childFolderCount", default)]
+    pub child_folder_count: i64,
+    /// Full hierarchical path (e.g. "Parent/Child"). Built during recursive listing.
+    #[serde(skip)]
+    pub full_path: Option<String>,
 }
 
 /// A message envelope from Graph API (lightweight, no body)

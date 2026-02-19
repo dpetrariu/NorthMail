@@ -1566,6 +1566,173 @@ impl SimpleImapClient {
         Ok(())
     }
 
+    /// Create a new folder (mailbox) on the server
+    /// Empty a folder by marking all messages as \Deleted and expunging
+    pub async fn empty_folder(&mut self, folder_path: &str) -> ImapResult<()> {
+        // Select the folder
+        self.select(folder_path).await?;
+
+        // Mark all messages as \Deleted (1:* means all messages)
+        let tag = self.next_tag();
+        let cmd = format!("{} STORE 1:* +FLAGS (\\Deleted)\r\n", tag);
+
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or(ImapError::NotConnected)?;
+
+        stream
+            .get_mut()
+            .write_all(cmd.as_bytes())
+            .await
+            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+        loop {
+            let mut line = String::new();
+            stream
+                .read_line(&mut line)
+                .await
+                .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+            debug!("STORE response: {}", line.trim());
+
+            if line.starts_with(&tag) {
+                if !line.contains("OK") {
+                    // If folder is empty, STORE 1:* may fail — that's OK
+                    if line.contains("no matching messages") || line.contains("No matching") {
+                        break;
+                    }
+                    return Err(ImapError::ServerError(format!(
+                        "STORE failed: {}",
+                        line.trim()
+                    )));
+                }
+                break;
+            }
+        }
+
+        // Expunge to permanently remove
+        self.expunge().await?;
+
+        Ok(())
+    }
+
+    pub async fn create_folder(&mut self, folder_path: &str) -> ImapResult<()> {
+        let tag = self.next_tag();
+        let cmd = format!("{} CREATE \"{}\"\r\n", tag, folder_path);
+
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or(ImapError::NotConnected)?;
+
+        stream
+            .get_mut()
+            .write_all(cmd.as_bytes())
+            .await
+            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+        loop {
+            let mut line = String::new();
+            stream
+                .read_line(&mut line)
+                .await
+                .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+            debug!("CREATE response: {}", line.trim());
+
+            if line.starts_with(&tag) {
+                if !line.contains("OK") {
+                    return Err(ImapError::ServerError(format!(
+                        "CREATE failed: {}",
+                        line.trim()
+                    )));
+                }
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Rename a folder (mailbox) on the server
+    pub async fn rename_folder(&mut self, from: &str, to: &str) -> ImapResult<()> {
+        let tag = self.next_tag();
+        let cmd = format!("{} RENAME \"{}\" \"{}\"\r\n", tag, from, to);
+
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or(ImapError::NotConnected)?;
+
+        stream
+            .get_mut()
+            .write_all(cmd.as_bytes())
+            .await
+            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+        loop {
+            let mut line = String::new();
+            stream
+                .read_line(&mut line)
+                .await
+                .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+            debug!("RENAME response: {}", line.trim());
+
+            if line.starts_with(&tag) {
+                if !line.contains("OK") {
+                    return Err(ImapError::ServerError(format!(
+                        "RENAME failed: {}",
+                        line.trim()
+                    )));
+                }
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Delete a folder (mailbox) from the server
+    pub async fn delete_folder(&mut self, folder_path: &str) -> ImapResult<()> {
+        let tag = self.next_tag();
+        let cmd = format!("{} DELETE \"{}\"\r\n", tag, folder_path);
+
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or(ImapError::NotConnected)?;
+
+        stream
+            .get_mut()
+            .write_all(cmd.as_bytes())
+            .await
+            .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+        loop {
+            let mut line = String::new();
+            stream
+                .read_line(&mut line)
+                .await
+                .map_err(|e| ImapError::ServerError(e.to_string()))?;
+
+            debug!("DELETE response: {}", line.trim());
+
+            if line.starts_with(&tag) {
+                if !line.contains("OK") {
+                    return Err(ImapError::ServerError(format!(
+                        "DELETE failed: {}",
+                        line.trim()
+                    )));
+                }
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Logout
     /// Enter IDLE mode and wait for server events or timeout
     ///

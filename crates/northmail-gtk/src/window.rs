@@ -899,6 +899,50 @@ impl NorthMailWindow {
             }
         });
 
+        // Connect folder-create-requested signal
+        let window = self.clone();
+        folder_sidebar.connect_folder_create_requested(move |_sidebar, account_id, parent_path, folder_name| {
+            debug!("Folder create requested: account={}, parent={}, name={}", account_id, parent_path, folder_name);
+            if let Some(app) = window.application() {
+                if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                    app.create_folder(account_id, parent_path, folder_name);
+                }
+            }
+        });
+
+        // Connect folder-rename-requested signal
+        let window = self.clone();
+        folder_sidebar.connect_folder_rename_requested(move |_sidebar, account_id, folder_path, new_name| {
+            debug!("Folder rename requested: account={}, path={}, new_name={}", account_id, folder_path, new_name);
+            if let Some(app) = window.application() {
+                if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                    app.rename_folder(account_id, folder_path, new_name);
+                }
+            }
+        });
+
+        // Connect folder-delete-requested signal
+        let window = self.clone();
+        folder_sidebar.connect_folder_delete_requested(move |_sidebar, account_id, folder_path| {
+            debug!("Folder delete requested: account={}, path={}", account_id, folder_path);
+            if let Some(app) = window.application() {
+                if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                    app.delete_folder(account_id, folder_path);
+                }
+            }
+        });
+
+        // Connect empty-trash-requested signal
+        let window = self.clone();
+        folder_sidebar.connect_empty_trash_requested(move |_sidebar, account_id, folder_path| {
+            debug!("Empty trash requested: account={}, path={}", account_id, folder_path);
+            if let Some(app) = window.application() {
+                if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
+                    app.empty_trash(account_id, folder_path);
+                }
+            }
+        });
+
         imp.folder_sidebar.set(folder_sidebar).unwrap();
 
         // Create and add message list

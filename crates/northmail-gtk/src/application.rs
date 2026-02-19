@@ -1838,8 +1838,21 @@ impl NorthMailApplication {
                 }
             }
         } else if let Some((account_id, folder_path)) = state.last_folder {
-            // Restore last folder if account still exists
-            if accounts.iter().any(|a| a.id == account_id) {
+            // Restore last folder if account still exists and folder is in DB
+            let folder_exists = accounts.iter().any(|a| a.id == account_id)
+                && self.database().map(|db| {
+                    let db2 = db.clone();
+                    let aid = account_id.clone();
+                    let fp = folder_path.clone();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        let folders = rt.block_on(db2.get_folders(&aid)).unwrap_or_default();
+                        let _ = tx.send(folders.iter().any(|f| f.full_path == fp));
+                    });
+                    rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap_or(false)
+                }).unwrap_or(false);
+            if folder_exists {
                 info!("Restoring last folder: {}/{}", account_id, folder_path);
                 self.fetch_folder(&account_id, &folder_path);
             } else {
@@ -2207,6 +2220,8 @@ impl NorthMailApplication {
                     let folder_count = sr.folders.len();
                     let folders = sr.folders;
 
+                    let valid_paths: Vec<String> = folders.iter().map(|f| f.full_path.clone()).collect();
+
                     let (sender, receiver) = std::sync::mpsc::channel();
                     std::thread::spawn(move || {
                         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -2237,6 +2252,12 @@ impl NorthMailApplication {
                                 if let Err(e) = res {
                                     warn!("Failed to upsert folder {}: {}", f.full_path, e);
                                 }
+                            }
+                            // Remove stale folders no longer on the server
+                            match db.delete_stale_folders(&acct_id, &valid_paths).await {
+                                Ok(0) => {}
+                                Ok(n) => info!("Cleaned up {} stale folders for {}", n, acct_id),
+                                Err(e) => warn!("Failed to clean stale folders: {}", e),
                             }
                         });
                         let _ = sender.send(result);
@@ -2289,7 +2310,13 @@ impl NorthMailApplication {
                         // Get folder list: use cache or fetch from IMAP
                         let folder_entries: Vec<(String, String, String)> = if let Some(cached) = cached_folders {
                             debug!("Using {} cached folders, skipping LIST", cached.len());
-                            cached
+                            // Re-detect folder types in case detection logic improved
+                            cached.into_iter().map(|(path, name, _ft)| {
+                                let detected = folder_type_to_db_string(
+                                    &northmail_imap::FolderType::from_attributes_and_name(&[], &name)
+                                );
+                                (path, name, detected)
+                            }).collect()
                         } else {
                             match client.list_folders().await {
                                 Ok(folder_list) => {
@@ -2365,7 +2392,13 @@ impl NorthMailApplication {
                         // Get folder list: use cache or fetch from IMAP
                         let folder_entries: Vec<(String, String, String)> = if let Some(cached) = cached_folders {
                             debug!("Using {} cached folders, skipping LIST", cached.len());
-                            cached
+                            // Re-detect folder types in case detection logic improved
+                            cached.into_iter().map(|(path, name, _ft)| {
+                                let detected = folder_type_to_db_string(
+                                    &northmail_imap::FolderType::from_attributes_and_name(&[], &name)
+                                );
+                                (path, name, detected)
+                            }).collect()
                         } else {
                             match client.list_folders().await {
                                 Ok(folder_list) => {
@@ -2853,11 +2886,11 @@ impl NorthMailApplication {
                     if folder_type == "inbox" {
                         inbox_count = gf.total_item_count as usize;
                     }
-                    // Normalize full_path: use "INBOX" to match IMAP convention
+                    // Use the hierarchical full_path built during recursive listing
                     let full_path = if folder_type == "inbox" {
                         "INBOX".to_string()
                     } else {
-                        gf.display_name.clone()
+                        gf.full_path.clone().unwrap_or_else(|| gf.display_name.clone())
                     };
                     folders.push(SyncedFolder {
                         name: gf.display_name.clone(),
@@ -2901,7 +2934,13 @@ impl NorthMailApplication {
                         // Get folder list: use cache or fetch from IMAP
                         let folder_entries: Vec<(String, String, String)> = if let Some(cached) = cached_folders {
                             debug!("Using {} cached folders, skipping LIST", cached.len());
-                            cached
+                            // Re-detect folder types in case detection logic improved
+                            cached.into_iter().map(|(path, name, _ft)| {
+                                let detected = folder_type_to_db_string(
+                                    &northmail_imap::FolderType::from_attributes_and_name(&[], &name)
+                                );
+                                (path, name, detected)
+                            }).collect()
                         } else {
                             match client.list_folders().await {
                                 Ok(folder_list) => {
@@ -2963,39 +3002,68 @@ impl NorthMailApplication {
                 icon_name: "mail-inbox-symbolic".to_string(),
                 unread_count: Some(0),
                 is_header: false,
+                folder_type: "inbox".to_string(),
+                depth: 0,
             }];
         }
+
+        // Detect hierarchy delimiter: check if any path contains "/" or "."
+        // Gmail uses "/", some servers use "."
+        let delimiter = if db_folders.iter().any(|f| f.full_path.contains('/')) {
+            '/'
+        } else if db_folders.iter().any(|f| f.full_path.contains('.') && f.full_path != "INBOX") {
+            '.'
+        } else {
+            '/'
+        };
+
+        // Find the set of top-level prefixes to ignore for depth calculation.
+        // E.g., Gmail's "[Gmail]/Sent Mail" should have depth 0 since "[Gmail]" is
+        // just a namespace prefix, not a selectable parent folder.
+        // We detect this: if a prefix like "[Gmail]" has no corresponding selectable
+        // folder entry, its children are treated as top-level.
+        let all_paths: std::collections::HashSet<&str> = db_folders.iter().map(|f| f.full_path.as_str()).collect();
 
         let mut folders: Vec<crate::widgets::FolderInfo> = db_folders
             .iter()
             // Skip INBOX since it's shown as the top-level account row
             .filter(|f| f.folder_type != "inbox")
-            .map(|f| crate::widgets::FolderInfo {
-                name: f.name.clone(),
-                full_path: f.full_path.clone(),
-                icon_name: folder_type_to_icon(&f.folder_type).to_string(),
-                unread_count: f.unread_count.map(|c| c as u32),
-                is_header: false,
+            .map(|f| {
+                // Calculate depth: count delimiter occurrences, but subtract 1 if
+                // the first segment is a non-selectable namespace prefix
+                let parts: Vec<&str> = f.full_path.split(delimiter).collect();
+                let raw_depth = if parts.len() <= 1 {
+                    0u32
+                } else {
+                    // Check if the first segment exists as a standalone folder
+                    let first_segment = parts[0];
+                    if !all_paths.contains(first_segment) {
+                        // Namespace prefix (e.g. "[Gmail]") - don't count it
+                        (parts.len() as u32).saturating_sub(2)
+                    } else {
+                        (parts.len() as u32).saturating_sub(1)
+                    }
+                };
+
+                crate::widgets::FolderInfo {
+                    name: f.name.clone(),
+                    full_path: f.full_path.clone(),
+                    icon_name: folder_type_to_icon(&f.folder_type).to_string(),
+                    unread_count: f.unread_count.map(|c| c as u32),
+                    is_header: false,
+                    folder_type: f.folder_type.clone(),
+                    depth: raw_depth,
+                }
             })
             .collect();
 
-        // Sort: known types first by priority, then alphabetical for "other" folders
+        // Sort: system folders first by priority, then user folders sorted by
+        // full_path so that children appear directly after their parent.
         folders.sort_by(|a, b| {
-            let type_a = db_folders
-                .iter()
-                .find(|f| f.full_path == a.full_path)
-                .map(|f| f.folder_type.as_str())
-                .unwrap_or("other");
-            let type_b = db_folders
-                .iter()
-                .find(|f| f.full_path == b.full_path)
-                .map(|f| f.folder_type.as_str())
-                .unwrap_or("other");
+            let key_a = folder_type_sort_key(&a.folder_type);
+            let key_b = folder_type_sort_key(&b.folder_type);
 
-            let key_a = folder_type_sort_key(type_a);
-            let key_b = folder_type_sort_key(type_b);
-
-            key_a.cmp(&key_b).then_with(|| a.name.cmp(&b.name))
+            key_a.cmp(&key_b).then_with(|| a.full_path.cmp(&b.full_path))
         });
 
         folders
@@ -4009,12 +4077,25 @@ impl NorthMailApplication {
             rt.block_on(async {
                 let client = northmail_graph::GraphMailClient::new(access_token);
 
-                // Resolve Graph folder ID from display name
-                let graph_folder_id = match Self::resolve_graph_folder_id(&client, &folder_path_clone).await {
-                    Ok(id) => id,
-                    Err(e) => {
-                        let _ = sender.send(FetchEvent::Error(e));
-                        return;
+                // Resolve Graph folder ID: first try DB lookup, then fall back to display name match
+                let graph_folder_id = if let Some(ref db) = db {
+                    match db.get_graph_folder_id_by_path(&account_id_clone, &folder_path_clone).await {
+                        Ok(Some(id)) => id,
+                        _ => match Self::resolve_graph_folder_id(&client, &folder_path_clone).await {
+                            Ok(id) => id,
+                            Err(e) => {
+                                let _ = sender.send(FetchEvent::Error(e));
+                                return;
+                            }
+                        },
+                    }
+                } else {
+                    match Self::resolve_graph_folder_id(&client, &folder_path_clone).await {
+                        Ok(id) => id,
+                        Err(e) => {
+                            let _ = sender.send(FetchEvent::Error(e));
+                            return;
+                        }
                     }
                 };
 
@@ -4095,12 +4176,13 @@ impl NorthMailApplication {
             _ => {}
         }
 
-        // For other folders, look up by listing
+        // For other folders, look up by listing (checks both display_name and full_path)
         let folders = client.list_folders().await
             .map_err(|e| format!("{}: {}", tr("Failed to list folders"), e))?;
 
         folders.iter()
-            .find(|f| f.display_name == folder_display_name)
+            .find(|f| f.display_name == folder_display_name
+                || f.full_path.as_deref() == Some(folder_display_name))
             .map(|f| f.id.clone())
             .ok_or_else(|| format!("{}: '{}'", tr("Folder not found"), folder_display_name))
     }
@@ -4656,6 +4738,11 @@ impl NorthMailApplication {
                                 for msg in &mut messages {
                                     msg.folder_id = folder_id;
                                 }
+                                // Track UIDs for cache cleanup BEFORE filtering pending deletes,
+                                // so FullSyncDone knows the UID is still on the server and
+                                // keeps the pending_delete entry active.
+                                synced_uids.extend(messages.iter().map(|m| m.uid as i64));
+
                                 // Filter out messages with pending deletes
                                 {
                                     let pending = app.imp().pending_deletes.borrow();
@@ -4670,9 +4757,6 @@ impl NorthMailApplication {
                                 debug!("Updated {} messages with folder_id={}", messages.len(), folder_id);
                             }
                         }
-
-                        // Track UIDs for cache cleanup
-                        synced_uids.extend(messages.iter().map(|m| m.uid as i64));
 
                         // Always save to cache, even if viewing different folder
                         app.save_messages_to_cache(account_id, folder_path, &messages);
@@ -8492,15 +8576,44 @@ impl NorthMailApplication {
         };
 
         // Update database in a thread with tokio runtime
+        // Always prefer folder_id + uid lookup since message_id can be stale or wrong
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                if let Err(e) = db.set_message_read(message_id, is_read).await {
+                let result = if folder_id > 0 {
+                    db.set_message_read_by_uid(folder_id, uid as i64, is_read).await
+                } else if message_id > 0 {
+                    db.set_message_read(message_id, is_read).await
+                } else {
+                    warn!("set_message_read: no valid message_id or folder_id");
+                    return;
+                };
+                if let Err(e) = result {
                     error!("Failed to update read status in database: {}", e);
                 } else {
-                    info!("Updated read status for message {} to {}", uid, is_read);
+                    info!("Updated read status for uid {} to {}", uid, is_read);
                 }
             });
+            let _ = tx.send(());
+        });
+
+        // Refresh sidebar after DB update completes
+        let app = self.clone();
+        glib::spawn_future_local(async move {
+            let start = std::time::Instant::now();
+            loop {
+                match rx.try_recv() {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        if start.elapsed() > std::time::Duration::from_secs(5) { return; }
+                        glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(_) => return,
+                }
+            }
+            app.refresh_sidebar_folders();
+            app.update_unread_badge();
         });
 
         // Use passed folder_id if valid, otherwise fall back to current folder
@@ -8737,16 +8850,21 @@ impl NorthMailApplication {
             }
         };
 
-        // Delete from local database by folder_id + uid (reliable)
+        // Delete from local database by folder_id + uid (reliable), increment dest unread if needed
         if let Some(db) = self.database() {
             let db_clone = db.clone();
             let fid = effective_folder_id;
             let u = uid as i64;
+            let acct = account_id.clone();
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
+                    let was_unread = db_clone.is_message_unread(fid, u).await.unwrap_or(false);
                     if let Err(e) = db_clone.delete_message_by_uid(fid, u).await {
                         error!("archive_message: Failed to delete from database: {}", e);
+                    }
+                    if was_unread {
+                        let _ = db_clone.increment_folder_unread(&acct, "Archive").await;
                     }
                 });
             });
@@ -8754,6 +8872,13 @@ impl NorthMailApplication {
 
         // Move on IMAP
         self.move_message_imap(&account_id, &source_folder, uid, "Archive");
+
+        // Refresh sidebar unread counts
+        let app = self.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(1000), move || {
+            app.refresh_sidebar_folders();
+            app.update_unread_badge();
+        });
     }
 
     /// Move a message to spam folder
@@ -8782,16 +8907,21 @@ impl NorthMailApplication {
             }
         };
 
-        // Delete from local database by folder_id + uid (reliable)
+        // Delete from local database by folder_id + uid (reliable), increment dest unread if needed
         if let Some(db) = self.database() {
             let db_clone = db.clone();
             let fid = effective_folder_id;
             let u = uid as i64;
+            let acct = account_id.clone();
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
+                    let was_unread = db_clone.is_message_unread(fid, u).await.unwrap_or(false);
                     if let Err(e) = db_clone.delete_message_by_uid(fid, u).await {
                         error!("move_to_spam: Failed to delete from database: {}", e);
+                    }
+                    if was_unread {
+                        let _ = db_clone.increment_folder_unread(&acct, "Spam").await;
                     }
                 });
             });
@@ -8799,6 +8929,13 @@ impl NorthMailApplication {
 
         // Move on IMAP
         self.move_message_imap(&account_id, &source_folder, uid, "Spam");
+
+        // Refresh sidebar unread counts
+        let app = self.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(1000), move || {
+            app.refresh_sidebar_folders();
+            app.update_unread_badge();
+        });
     }
 
     /// Delete a message (move to Trash folder)
@@ -8865,6 +9002,9 @@ impl NorthMailApplication {
                     None
                 };
 
+                // Check if message is unread before deleting (for dest folder count)
+                let was_unread = db.is_message_unread(fid, u).await.unwrap_or(false);
+
                 // Delete from local database by folder_id + uid
                 if let Err(e) = db.delete_message_by_uid(fid, u).await {
                     error!("delete_message: Failed to delete from database: {}", e);
@@ -8872,10 +9012,7 @@ impl NorthMailApplication {
 
                 // Look up actual trash folder path from database
                 let trash_folder = match db.get_trash_folder(&account_id_clone).await {
-                    Ok(Some(path)) => {
-                        info!("delete_message: Using trash folder from DB: {}", path);
-                        path
-                    }
+                    Ok(Some(path)) => path,
                     Ok(None) => {
                         warn!("delete_message: No trash folder found for account {}, using fallback", account_id_clone);
                         "Trash".to_string()
@@ -8886,6 +9023,13 @@ impl NorthMailApplication {
                     }
                 };
 
+                // Increment destination folder's unread count if message was unread
+                if was_unread {
+                    if let Err(e) = db.increment_folder_unread(&account_id_clone, &trash_folder).await {
+                        warn!("delete_message: Failed to increment dest unread: {}", e);
+                    }
+                }
+
                 let result: (String, Option<String>) = (trash_folder, graph_id);
                 let _ = tx.send(result);
             });
@@ -8894,7 +9038,7 @@ impl NorthMailApplication {
         // Wait for trash folder lookup and then move via IMAP or Graph
         glib::spawn_future_local(async move {
             let start = std::time::Instant::now();
-            let timeout = std::time::Duration::from_secs(5);
+            let timeout = std::time::Duration::from_secs(30);
             loop {
                 match rx.try_recv() {
                     Ok((trash_folder, graph_id)) => {
@@ -8973,6 +9117,11 @@ impl NorthMailApplication {
                     }
                 }
             }
+            // Refresh sidebar unread counts after delete/move
+            // Wait a bit to ensure the DB delete thread has completed
+            glib::timeout_future(std::time::Duration::from_millis(500)).await;
+            app.refresh_sidebar_folders();
+            app.update_unread_badge();
         });
     }
 
@@ -9016,7 +9165,30 @@ impl NorthMailApplication {
             warn!("move_message_to_folder: No cached folder_id, pending delete not set for uid={}", uid);
         }
 
-        // Delete from DB in background
+        // For Graph accounts, look up graph_message_id BEFORE deleting from DB
+        let accounts = self.imp().accounts.borrow().clone();
+        let pre_fetched_graph_msg_id = if let Some(account) = accounts.iter().find(|a| a.id == source_account_id) {
+            if Self::is_ms_graph_account(account) {
+                if let Some(db) = self.database() {
+                    let db2 = db.clone();
+                    let aid = source_account_id.to_string();
+                    let fp = source_folder_path.to_string();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        let r = rt.block_on(async {
+                            let folder_id = db2.get_or_create_folder_id(&aid, &fp).await.ok()?;
+                            db2.get_graph_message_id(folder_id, uid as i64).await.ok()?
+                        });
+                        let _ = tx.send(r);
+                    });
+                    rx.recv_timeout(std::time::Duration::from_secs(5)).ok().flatten()
+                } else { None }
+            } else { None }
+        } else { None };
+
+        // Delete from DB in background, increment dest unread if needed
+        let dest_path_for_db = dest_folder_path.to_string();
         if let Some(db) = self.database() {
             let db_clone = db.clone();
             let aid = source_account_id.to_string();
@@ -9025,17 +9197,133 @@ impl NorthMailApplication {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
                     if let Ok(folder_id) = db_clone.get_or_create_folder_id(&aid, &fp).await {
+                        let was_unread = db_clone.is_message_unread(folder_id, uid as i64).await.unwrap_or(false);
                         if let Err(e) = db_clone.delete_message_by_uid(folder_id, uid as i64).await {
                             error!("move_message_to_folder: Failed to delete from database: {}", e);
+                        }
+                        if was_unread {
+                            let _ = db_clone.increment_folder_unread(&aid, &dest_path_for_db).await;
                         }
                     }
                 });
             });
         }
 
-        // Move on IMAP
-        self.move_message_imap(source_account_id, source_folder_path, uid, dest_folder_path);
+        // Move on IMAP/Graph
+        if let Some(graph_msg_id) = pre_fetched_graph_msg_id {
+            self.move_message_graph(source_account_id, uid, dest_folder_path, &graph_msg_id);
+        } else {
+            self.move_message_imap(source_account_id, source_folder_path, uid, dest_folder_path);
+        }
+
+        // Refresh sidebar unread counts after move
+        let app = self.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(1000), move || {
+            app.refresh_sidebar_folders();
+            app.update_unread_badge();
+        });
+
         true
+    }
+
+    /// Move a message via Graph API with a pre-fetched graph_message_id
+    fn move_message_graph(&self, account_id: &str, uid: u32, dest_folder_path: &str, graph_message_id: &str) {
+        let account_id = account_id.to_string();
+        let graph_id = graph_message_id.to_string();
+        let dest_path = dest_folder_path.to_string();
+        let db = self.database().cloned();
+
+        glib::spawn_future_local(async move {
+            let auth_manager = match AuthManager::new().await {
+                Ok(am) => am,
+                Err(e) => { error!("move_message_graph: auth error: {}", e); return; }
+            };
+            let access_token = match auth_manager.get_goa_token(&account_id).await {
+                Ok(token) => token,
+                Err(e) => { error!("move_message_graph: token error: {}", e); return; }
+            };
+
+            // Resolve destination folder to Graph folder ID
+            let graph_dest = match dest_path.as_str() {
+                "Archive" => "Archive".to_string(),
+                "Trash" | "Deleted Items" => "DeletedItems".to_string(),
+                "Spam" | "Junk Email" => "JunkEmail".to_string(),
+                "Inbox" | "INBOX" => "Inbox".to_string(),
+                "Drafts" => "Drafts".to_string(),
+                "Sent Items" => "SentItems".to_string(),
+                _ => {
+                    // User-created folder: look up graph_folder_id from DB
+                    if let Some(ref db) = db {
+                        let db2 = db.clone();
+                        let aid = account_id.clone();
+                        let dp = dest_path.clone();
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let rt = tokio::runtime::Runtime::new().unwrap();
+                            let r = rt.block_on(db2.get_graph_folder_id_by_path(&aid, &dp));
+                            let _ = tx.send(r);
+                        });
+                        let start = std::time::Instant::now();
+                        let folder_id = loop {
+                            match rx.try_recv() {
+                                Ok(Ok(Some(id))) => break Some(id),
+                                Ok(Ok(None)) => break None,
+                                Ok(Err(_)) => break None,
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                    if start.elapsed() > std::time::Duration::from_secs(10) { break None; }
+                                    glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                                }
+                                Err(_) => break None,
+                            }
+                        };
+                        match folder_id {
+                            Some(id) => id,
+                            None => {
+                                error!("move_message_graph: No graph_folder_id for '{}'", dest_path);
+                                return;
+                            }
+                        }
+                    } else {
+                        error!("move_message_graph: No DB for folder lookup");
+                        return;
+                    }
+                }
+            };
+
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let gd = graph_dest.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result = rt.block_on(async {
+                    let client = northmail_graph::GraphMailClient::new(access_token);
+                    client.move_message(&graph_id, &gd).await
+                        .map_err(|e| format!("Graph move failed: {}", e))
+                });
+                let _ = sender.send(result);
+            });
+
+            let start = std::time::Instant::now();
+            loop {
+                match receiver.try_recv() {
+                    Ok(Ok(new_id)) => {
+                        info!("move_message_graph: Moved uid {} to {}, new id={}", uid, graph_dest, new_id);
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        error!("move_message_graph: {}", e);
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        if start.elapsed() > std::time::Duration::from_secs(30) {
+                            error!("move_message_graph: Timeout");
+                            break;
+                        }
+                        glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+        });
     }
 
     /// Move a message to another folder on IMAP
@@ -9371,6 +9659,932 @@ impl NorthMailApplication {
                 }
             }
         });
+    }
+
+    // ── Folder management (create / rename / delete) ─────────────────
+
+    /// Create a new folder on the server, update DB, and refresh sidebar.
+    pub fn create_folder(&self, account_id: &str, parent_path: &str, folder_name: &str) {
+        let account_id = account_id.to_string();
+        let parent_path = parent_path.to_string();
+        let folder_name = folder_name.to_string();
+
+        info!("create_folder: '{}' under '{}' for account {}", folder_name, parent_path, account_id);
+
+        let accounts = self.imp().accounts.borrow().clone();
+        let account = match accounts.iter().find(|a| a.id == account_id) {
+            Some(a) => a.clone(),
+            None => {
+                warn!("create_folder: Account not found: {}", account_id);
+                return;
+            }
+        };
+
+        let db = self.database().cloned();
+        let app = self.clone();
+
+        if Self::is_ms_graph_account(&account) {
+            // Graph API: create folder
+            glib::spawn_future_local(async move {
+                let auth_manager = match AuthManager::new().await {
+                    Ok(am) => am,
+                    Err(e) => { error!("create_folder (graph): auth error: {}", e); return; }
+                };
+                let access_token = match auth_manager.get_goa_token(&account_id).await {
+                    Ok(t) => t,
+                    Err(e) => { error!("create_folder (graph): token error: {}", e); return; }
+                };
+
+                // Look up parent graph_folder_id if parent_path is non-empty
+                let parent_graph_id = if !parent_path.is_empty() {
+                    if let Some(ref db) = db {
+                        let db2 = db.clone();
+                        let aid = account_id.clone();
+                        let pp = parent_path.clone();
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let rt = tokio::runtime::Runtime::new().unwrap();
+                            let r = rt.block_on(db2.get_graph_folder_id_by_path(&aid, &pp));
+                            let _ = tx.send(r);
+                        });
+                        let start = std::time::Instant::now();
+                        loop {
+                            match rx.try_recv() {
+                                Ok(Ok(id)) => break id,
+                                Ok(Err(e)) => { error!("create_folder: DB error: {}", e); return; }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                    if start.elapsed() > std::time::Duration::from_secs(10) { return; }
+                                    glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                                }
+                                Err(_) => return,
+                            }
+                        }
+                    } else { None }
+                } else { None };
+
+                let (tx, rx) = std::sync::mpsc::channel();
+                let fname = folder_name.clone();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    let r = rt.block_on(async {
+                        let client = northmail_graph::GraphMailClient::new(access_token);
+                        client.create_folder(&fname, parent_graph_id.as_deref()).await
+                            .map_err(|e| format!("{}", e))
+                    });
+                    let _ = tx.send(r);
+                });
+                let start = std::time::Instant::now();
+                loop {
+                    match rx.try_recv() {
+                        Ok(Ok(new_id)) => {
+                            info!("create_folder (graph): created '{}', id={}", folder_name, new_id);
+                            // Insert into DB so refresh_sidebar_folders can find it
+                            let graph_full_path = if parent_path.is_empty() {
+                                folder_name.clone()
+                            } else {
+                                format!("{}/{}", parent_path, folder_name)
+                            };
+                            if let Some(ref db) = db {
+                                let db2 = db.clone();
+                                let aid = account_id.clone();
+                                let fname = folder_name.clone();
+                                let fpath = graph_full_path;
+                                let gid = new_id;
+                                let (tx2, rx2) = std::sync::mpsc::channel();
+                                std::thread::spawn(move || {
+                                    let rt = tokio::runtime::Runtime::new().unwrap();
+                                    let r = rt.block_on(db2.upsert_folder_graph(&aid, &fname, &fpath, "other", None, None, &gid));
+                                    let _ = tx2.send(r);
+                                });
+                                let start2 = std::time::Instant::now();
+                                loop {
+                                    match rx2.try_recv() {
+                                        Ok(Ok(_)) => break,
+                                        Ok(Err(e)) => { error!("create_folder (graph): DB error: {}", e); break; }
+                                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                            if start2.elapsed() > std::time::Duration::from_secs(10) { break; }
+                                            glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                        Ok(Err(e)) => { error!("create_folder (graph): {}", e); return; }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            if start.elapsed() > std::time::Duration::from_secs(30) { return; }
+                            glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                        }
+                        Err(_) => return,
+                    }
+                }
+                app.refresh_sidebar_folders();
+            });
+        } else {
+            // IMAP: create folder
+            let pool = self.imap_pool();
+            let is_google = Self::is_google_account(&account);
+            let is_microsoft = Self::is_microsoft_account(&account);
+            let imap_host = account.imap_host.clone();
+            let imap_username = account.imap_username.clone();
+
+            // Build full IMAP path: parent_path + delimiter + folder_name
+            let full_path = if parent_path.is_empty() {
+                folder_name.clone()
+            } else {
+                // Use "/" as default delimiter (most common)
+                format!("{}/{}", parent_path, folder_name)
+            };
+
+            glib::spawn_future_local(async move {
+                let auth_manager = match AuthManager::new().await {
+                    Ok(am) => am,
+                    Err(e) => { error!("create_folder: auth error: {}", e); return; }
+                };
+
+                let credentials = if is_google {
+                    match auth_manager.get_xoauth2_token_for_goa(&account.id).await {
+                        Ok((email, access_token)) => ImapCredentials::Gmail { email, access_token },
+                        Err(e) => { error!("create_folder: token error: {}", e); return; }
+                    }
+                } else if is_microsoft {
+                    match auth_manager.get_xoauth2_token_for_goa(&account.id).await {
+                        Ok((email, access_token)) => ImapCredentials::Microsoft { email, access_token },
+                        Err(e) => { error!("create_folder: token error: {}", e); return; }
+                    }
+                } else {
+                    let host = imap_host.unwrap_or_else(|| "imap.mail.me.com".to_string());
+                    let username = imap_username.unwrap_or(account.email.clone());
+                    match auth_manager.get_goa_password(&account.id).await {
+                        Ok(password) => ImapCredentials::Password { host, port: 993, username, password },
+                        Err(e) => { error!("create_folder: password error: {}", e); return; }
+                    }
+                };
+
+                let worker = match pool.get_or_create(credentials) {
+                    Ok(w) => w,
+                    Err(e) => { error!("create_folder: pool error: {}", e); return; }
+                };
+
+                let (response_tx, response_rx) = std::sync::mpsc::channel();
+                if let Err(e) = worker.send(ImapCommand::CreateFolder {
+                    folder_path: full_path.clone(),
+                    response_tx,
+                }) {
+                    error!("create_folder: send error: {}", e);
+                    return;
+                }
+
+                let start = std::time::Instant::now();
+                loop {
+                    match response_rx.try_recv() {
+                        Ok(ImapResponse::Ok) => {
+                            info!("create_folder: created '{}'", full_path);
+                            // Insert into DB so refresh_sidebar_folders can find it
+                            if let Some(ref db) = db {
+                                let db2 = db.clone();
+                                let aid = account_id.clone();
+                                let fname = folder_name.clone();
+                                let fpath = full_path.clone();
+                                let (tx2, rx2) = std::sync::mpsc::channel();
+                                std::thread::spawn(move || {
+                                    let rt = tokio::runtime::Runtime::new().unwrap();
+                                    let r = rt.block_on(db2.upsert_folder(&aid, &fname, &fpath, "other"));
+                                    let _ = tx2.send(r);
+                                });
+                                let start2 = std::time::Instant::now();
+                                loop {
+                                    match rx2.try_recv() {
+                                        Ok(Ok(_)) => break,
+                                        Ok(Err(e)) => { error!("create_folder: DB error: {}", e); break; }
+                                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                            if start2.elapsed() > std::time::Duration::from_secs(10) { break; }
+                                            glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                        Ok(ImapResponse::Error(e)) => {
+                            error!("create_folder: IMAP error: {}", e);
+                            return;
+                        }
+                        Ok(_) => {}
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            if start.elapsed() > std::time::Duration::from_secs(30) { return; }
+                            glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                        }
+                        Err(_) => return,
+                    }
+                }
+                app.refresh_sidebar_folders();
+            });
+        }
+    }
+
+    /// Rename a folder on the server, update DB, and refresh sidebar.
+    pub fn rename_folder(&self, account_id: &str, folder_path: &str, new_name: &str) {
+        let account_id = account_id.to_string();
+        let folder_path = folder_path.to_string();
+        let new_name = new_name.to_string();
+
+        info!("rename_folder: '{}' -> '{}' for account {}", folder_path, new_name, account_id);
+
+        let accounts = self.imp().accounts.borrow().clone();
+        let account = match accounts.iter().find(|a| a.id == account_id) {
+            Some(a) => a.clone(),
+            None => {
+                warn!("rename_folder: Account not found: {}", account_id);
+                return;
+            }
+        };
+
+        let db = self.database().cloned();
+        let app = self.clone();
+
+        // Compute new_path: replace the last segment of folder_path with new_name
+        let new_path = if let Some(pos) = folder_path.rfind('/') {
+            format!("{}/{}", &folder_path[..pos], new_name)
+        } else if let Some(pos) = folder_path.rfind('.') {
+            format!("{}.{}", &folder_path[..pos], new_name)
+        } else {
+            new_name.clone()
+        };
+
+        if Self::is_ms_graph_account(&account) {
+            // Graph API: rename folder
+            glib::spawn_future_local(async move {
+                let auth_manager = match AuthManager::new().await {
+                    Ok(am) => am,
+                    Err(e) => { error!("rename_folder (graph): auth error: {}", e); return; }
+                };
+                let access_token = match auth_manager.get_goa_token(&account_id).await {
+                    Ok(t) => t,
+                    Err(e) => { error!("rename_folder (graph): token error: {}", e); return; }
+                };
+
+                // Get graph_folder_id
+                let graph_folder_id = if let Some(ref db) = db {
+                    let db2 = db.clone();
+                    let aid = account_id.clone();
+                    let fp = folder_path.clone();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        let r = rt.block_on(db2.get_graph_folder_id_by_path(&aid, &fp));
+                        let _ = tx.send(r);
+                    });
+                    let start = std::time::Instant::now();
+                    loop {
+                        match rx.try_recv() {
+                            Ok(Ok(Some(id))) => break Some(id),
+                            Ok(Ok(None)) => { error!("rename_folder: No graph_folder_id for {}", folder_path); return; }
+                            Ok(Err(e)) => { error!("rename_folder: DB error: {}", e); return; }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                if start.elapsed() > std::time::Duration::from_secs(10) { return; }
+                                glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                } else { None };
+
+                let Some(gfid) = graph_folder_id else {
+                    error!("rename_folder (graph): No graph_folder_id");
+                    return;
+                };
+
+                let (tx, rx) = std::sync::mpsc::channel();
+                let nn = new_name.clone();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    let r = rt.block_on(async {
+                        let client = northmail_graph::GraphMailClient::new(access_token);
+                        client.rename_folder(&gfid, &nn).await
+                            .map_err(|e| format!("{}", e))
+                    });
+                    let _ = tx.send(r);
+                });
+                let start = std::time::Instant::now();
+                loop {
+                    match rx.try_recv() {
+                        Ok(Ok(())) => {
+                            info!("rename_folder (graph): renamed");
+                            break;
+                        }
+                        Ok(Err(e)) => { error!("rename_folder (graph): {}", e); return; }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            if start.elapsed() > std::time::Duration::from_secs(30) { return; }
+                            glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                        }
+                        Err(_) => return,
+                    }
+                }
+
+                // Update DB
+                if let Some(ref db) = db {
+                    let db2 = db.clone();
+                    let aid = account_id.clone();
+                    let fp = folder_path.clone();
+                    let np = new_path.clone();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        let r = rt.block_on(db2.rename_folder_path(&aid, &fp, &np));
+                        let _ = tx.send(r);
+                    });
+                    let start = std::time::Instant::now();
+                    loop {
+                        match rx.try_recv() {
+                            Ok(Ok(())) => break,
+                            Ok(Err(e)) => { warn!("rename_folder: DB update error: {}", e); break; }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                if start.elapsed() > std::time::Duration::from_secs(10) { break; }
+                                glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                app.refresh_sidebar_folders();
+            });
+        } else {
+            // IMAP: rename folder
+            let pool = self.imap_pool();
+            let is_google = Self::is_google_account(&account);
+            let is_microsoft = Self::is_microsoft_account(&account);
+            let imap_host = account.imap_host.clone();
+            let imap_username = account.imap_username.clone();
+
+            glib::spawn_future_local(async move {
+                let auth_manager = match AuthManager::new().await {
+                    Ok(am) => am,
+                    Err(e) => { error!("rename_folder: auth error: {}", e); return; }
+                };
+
+                let credentials = if is_google {
+                    match auth_manager.get_xoauth2_token_for_goa(&account.id).await {
+                        Ok((email, access_token)) => ImapCredentials::Gmail { email, access_token },
+                        Err(e) => { error!("rename_folder: token error: {}", e); return; }
+                    }
+                } else if is_microsoft {
+                    match auth_manager.get_xoauth2_token_for_goa(&account.id).await {
+                        Ok((email, access_token)) => ImapCredentials::Microsoft { email, access_token },
+                        Err(e) => { error!("rename_folder: token error: {}", e); return; }
+                    }
+                } else {
+                    let host = imap_host.unwrap_or_else(|| "imap.mail.me.com".to_string());
+                    let username = imap_username.unwrap_or(account.email.clone());
+                    match auth_manager.get_goa_password(&account.id).await {
+                        Ok(password) => ImapCredentials::Password { host, port: 993, username, password },
+                        Err(e) => { error!("rename_folder: password error: {}", e); return; }
+                    }
+                };
+
+                let worker = match pool.get_or_create(credentials) {
+                    Ok(w) => w,
+                    Err(e) => { error!("rename_folder: pool error: {}", e); return; }
+                };
+
+                let (response_tx, response_rx) = std::sync::mpsc::channel();
+                if let Err(e) = worker.send(ImapCommand::RenameFolder {
+                    from_path: folder_path.clone(),
+                    to_path: new_path.clone(),
+                    response_tx,
+                }) {
+                    error!("rename_folder: send error: {}", e);
+                    return;
+                }
+
+                let start = std::time::Instant::now();
+                loop {
+                    match response_rx.try_recv() {
+                        Ok(ImapResponse::Ok) => {
+                            info!("rename_folder: renamed '{}' -> '{}'", folder_path, new_path);
+                            break;
+                        }
+                        Ok(ImapResponse::Error(e)) => {
+                            error!("rename_folder: IMAP error: {}", e);
+                            return;
+                        }
+                        Ok(_) => {}
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            if start.elapsed() > std::time::Duration::from_secs(30) { return; }
+                            glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                        }
+                        Err(_) => return,
+                    }
+                }
+
+                // Update DB
+                if let Some(ref db) = db {
+                    let db2 = db.clone();
+                    let aid = account_id.clone();
+                    let fp = folder_path.clone();
+                    let np = new_path.clone();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        let r = rt.block_on(db2.rename_folder_path(&aid, &fp, &np));
+                        let _ = tx.send(r);
+                    });
+                    let start = std::time::Instant::now();
+                    loop {
+                        match rx.try_recv() {
+                            Ok(Ok(())) => break,
+                            Ok(Err(e)) => { warn!("rename_folder: DB update error: {}", e); break; }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                if start.elapsed() > std::time::Duration::from_secs(10) { break; }
+                                glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                app.refresh_sidebar_folders();
+            });
+        }
+    }
+
+    /// Delete a folder on the server, remove from DB, and refresh sidebar.
+    pub fn delete_folder(&self, account_id: &str, folder_path: &str) {
+        let account_id = account_id.to_string();
+        let folder_path = folder_path.to_string();
+
+        info!("delete_folder: '{}' for account {}", folder_path, account_id);
+
+        let accounts = self.imp().accounts.borrow().clone();
+        let account = match accounts.iter().find(|a| a.id == account_id) {
+            Some(a) => a.clone(),
+            None => {
+                warn!("delete_folder: Account not found: {}", account_id);
+                return;
+            }
+        };
+
+        let db = self.database().cloned();
+        let app = self.clone();
+
+        if Self::is_ms_graph_account(&account) {
+            // Graph API: delete folder
+            glib::spawn_future_local(async move {
+                let auth_manager = match AuthManager::new().await {
+                    Ok(am) => am,
+                    Err(e) => { error!("delete_folder (graph): auth error: {}", e); return; }
+                };
+                let access_token = match auth_manager.get_goa_token(&account_id).await {
+                    Ok(t) => t,
+                    Err(e) => { error!("delete_folder (graph): token error: {}", e); return; }
+                };
+
+                // Get graph_folder_id
+                let graph_folder_id = if let Some(ref db) = db {
+                    let db2 = db.clone();
+                    let aid = account_id.clone();
+                    let fp = folder_path.clone();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        let r = rt.block_on(db2.get_graph_folder_id_by_path(&aid, &fp));
+                        let _ = tx.send(r);
+                    });
+                    let start = std::time::Instant::now();
+                    loop {
+                        match rx.try_recv() {
+                            Ok(Ok(Some(id))) => break Some(id),
+                            Ok(Ok(None)) => { error!("delete_folder: No graph_folder_id for {}", folder_path); return; }
+                            Ok(Err(e)) => { error!("delete_folder: DB error: {}", e); return; }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                if start.elapsed() > std::time::Duration::from_secs(10) { return; }
+                                glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                } else { None };
+
+                let Some(gfid) = graph_folder_id else {
+                    error!("delete_folder (graph): No graph_folder_id");
+                    return;
+                };
+
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    let r = rt.block_on(async {
+                        let client = northmail_graph::GraphMailClient::new(access_token);
+                        client.delete_folder(&gfid).await
+                            .map_err(|e| format!("{}", e))
+                    });
+                    let _ = tx.send(r);
+                });
+                let start = std::time::Instant::now();
+                loop {
+                    match rx.try_recv() {
+                        Ok(Ok(())) => {
+                            info!("delete_folder (graph): deleted");
+                            break;
+                        }
+                        Ok(Err(e)) => {
+                            // If folder doesn't exist on server (404), still clean up DB
+                            if e.contains("404") || e.contains("not found") || e.contains("Not Found") {
+                                warn!("delete_folder (graph): folder already gone: {}", e);
+                                break;
+                            }
+                            error!("delete_folder (graph): {}", e);
+                            return;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            if start.elapsed() > std::time::Duration::from_secs(30) { return; }
+                            glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                        }
+                        Err(_) => return,
+                    }
+                }
+
+                // Remove from DB
+                if let Some(ref db) = db {
+                    let db2 = db.clone();
+                    let aid = account_id.clone();
+                    let fp = folder_path.clone();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        let r = rt.block_on(db2.delete_folder_by_path(&aid, &fp));
+                        let _ = tx.send(r);
+                    });
+                    let start = std::time::Instant::now();
+                    loop {
+                        match rx.try_recv() {
+                            Ok(Ok(())) => break,
+                            Ok(Err(e)) => { warn!("delete_folder: DB error: {}", e); break; }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                if start.elapsed() > std::time::Duration::from_secs(10) { break; }
+                                glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+
+                // Clear last_folder state if it points to the deleted folder or a child
+                {
+                    let mut state = app.imp().state.borrow_mut();
+                    if let Some((ref aid, ref fp)) = state.last_folder {
+                        if aid == &account_id && (fp == &folder_path || fp.starts_with(&format!("{}/", folder_path))) {
+                            state.last_folder = None;
+                            state.save();
+                        }
+                    }
+                }
+
+                app.refresh_sidebar_folders();
+            });
+        } else {
+            // IMAP: delete folder
+            let pool = self.imap_pool();
+            let is_google = Self::is_google_account(&account);
+            let is_microsoft = Self::is_microsoft_account(&account);
+            let imap_host = account.imap_host.clone();
+            let imap_username = account.imap_username.clone();
+
+            glib::spawn_future_local(async move {
+                let auth_manager = match AuthManager::new().await {
+                    Ok(am) => am,
+                    Err(e) => { error!("delete_folder: auth error: {}", e); return; }
+                };
+
+                let credentials = if is_google {
+                    match auth_manager.get_xoauth2_token_for_goa(&account.id).await {
+                        Ok((email, access_token)) => ImapCredentials::Gmail { email, access_token },
+                        Err(e) => { error!("delete_folder: token error: {}", e); return; }
+                    }
+                } else if is_microsoft {
+                    match auth_manager.get_xoauth2_token_for_goa(&account.id).await {
+                        Ok((email, access_token)) => ImapCredentials::Microsoft { email, access_token },
+                        Err(e) => { error!("delete_folder: token error: {}", e); return; }
+                    }
+                } else {
+                    let host = imap_host.unwrap_or_else(|| "imap.mail.me.com".to_string());
+                    let username = imap_username.unwrap_or(account.email.clone());
+                    match auth_manager.get_goa_password(&account.id).await {
+                        Ok(password) => ImapCredentials::Password { host, port: 993, username, password },
+                        Err(e) => { error!("delete_folder: password error: {}", e); return; }
+                    }
+                };
+
+                let worker = match pool.get_or_create(credentials) {
+                    Ok(w) => w,
+                    Err(e) => { error!("delete_folder: pool error: {}", e); return; }
+                };
+
+                let (response_tx, response_rx) = std::sync::mpsc::channel();
+                if let Err(e) = worker.send(ImapCommand::DeleteFolder {
+                    folder_path: folder_path.clone(),
+                    response_tx,
+                }) {
+                    error!("delete_folder: send error: {}", e);
+                    return;
+                }
+
+                let start = std::time::Instant::now();
+                loop {
+                    match response_rx.try_recv() {
+                        Ok(ImapResponse::Ok) => {
+                            info!("delete_folder: deleted '{}'", folder_path);
+                            break;
+                        }
+                        Ok(ImapResponse::Error(e)) => {
+                            // If folder doesn't exist on server, still clean up DB
+                            if e.contains("NONEXISTENT") || e.contains("Unknown") || e.contains("not found") {
+                                warn!("delete_folder: folder already gone on server: {}", e);
+                                break;
+                            }
+                            error!("delete_folder: IMAP error: {}", e);
+                            return;
+                        }
+                        Ok(_) => {}
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            if start.elapsed() > std::time::Duration::from_secs(30) { return; }
+                            glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                        }
+                        Err(_) => return,
+                    }
+                }
+
+                // Remove from DB
+                if let Some(ref db) = db {
+                    let db2 = db.clone();
+                    let aid = account_id.clone();
+                    let fp = folder_path.clone();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        let r = rt.block_on(db2.delete_folder_by_path(&aid, &fp));
+                        let _ = tx.send(r);
+                    });
+                    let start = std::time::Instant::now();
+                    loop {
+                        match rx.try_recv() {
+                            Ok(Ok(())) => break,
+                            Ok(Err(e)) => { warn!("delete_folder: DB error: {}", e); break; }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                if start.elapsed() > std::time::Duration::from_secs(10) { break; }
+                                glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+
+                // Clear last_folder state if it points to the deleted folder or a child
+                {
+                    let mut state = app.imp().state.borrow_mut();
+                    if let Some((ref aid, ref fp)) = state.last_folder {
+                        if aid == &account_id && (fp == &folder_path || fp.starts_with(&format!("{}/", folder_path))) {
+                            state.last_folder = None;
+                            state.save();
+                        }
+                    }
+                }
+
+                app.refresh_sidebar_folders();
+            });
+        }
+    }
+    /// Empty the trash folder (delete all messages in it)
+    pub fn empty_trash(&self, account_id: &str, folder_path: &str) {
+        let account_id = account_id.to_string();
+        let folder_path = folder_path.to_string();
+
+        info!("empty_trash: '{}' for account {}", folder_path, account_id);
+
+        let accounts = self.imp().accounts.borrow().clone();
+        let account = match accounts.iter().find(|a| a.id == account_id) {
+            Some(a) => a.clone(),
+            None => {
+                warn!("empty_trash: Account not found: {}", account_id);
+                return;
+            }
+        };
+
+        let db = self.database().cloned();
+        let app = self.clone();
+
+        if Self::is_ms_graph_account(&account) {
+            // Graph API: empty folder
+            glib::spawn_future_local(async move {
+                let auth_manager = match AuthManager::new().await {
+                    Ok(am) => am,
+                    Err(e) => { error!("empty_trash (graph): auth error: {}", e); return; }
+                };
+                let access_token = match auth_manager.get_goa_token(&account_id).await {
+                    Ok(t) => t,
+                    Err(e) => { error!("empty_trash (graph): token error: {}", e); return; }
+                };
+
+                // Get graph_folder_id from DB
+                let graph_folder_id = if let Some(ref db) = db {
+                    let db2 = db.clone();
+                    let aid = account_id.clone();
+                    let fp = folder_path.clone();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        let r = rt.block_on(db2.get_graph_folder_id_by_path(&aid, &fp));
+                        let _ = tx.send(r);
+                    });
+                    let start = std::time::Instant::now();
+                    loop {
+                        match rx.try_recv() {
+                            Ok(Ok(Some(id))) => break Some(id),
+                            Ok(Ok(None)) => { error!("empty_trash: No graph_folder_id for {}", folder_path); return; }
+                            Ok(Err(e)) => { error!("empty_trash: DB error: {}", e); return; }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                if start.elapsed() > std::time::Duration::from_secs(10) { return; }
+                                glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                } else { None };
+
+                let Some(gfid) = graph_folder_id else {
+                    error!("empty_trash (graph): No graph_folder_id");
+                    return;
+                };
+
+                // Delete all messages via Graph API
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    let r = rt.block_on(async {
+                        let client = northmail_graph::GraphMailClient::new(access_token);
+                        client.empty_folder(&gfid).await
+                            .map_err(|e| format!("{}", e))
+                    });
+                    let _ = tx.send(r);
+                });
+                let start = std::time::Instant::now();
+                loop {
+                    match rx.try_recv() {
+                        Ok(Ok(count)) => {
+                            info!("empty_trash (graph): deleted {} messages", count);
+                            break;
+                        }
+                        Ok(Err(e)) => {
+                            error!("empty_trash (graph): {}", e);
+                            return;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            if start.elapsed() > std::time::Duration::from_secs(120) { return; }
+                            glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                        }
+                        Err(_) => return,
+                    }
+                }
+
+                // Clear messages from DB
+                if let Some(ref db) = db {
+                    let db2 = db.clone();
+                    let aid = account_id.clone();
+                    let fp = folder_path.clone();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        let r = rt.block_on(db2.delete_messages_in_folder(&aid, &fp));
+                        let _ = tx.send(r);
+                    });
+                    let start = std::time::Instant::now();
+                    loop {
+                        match rx.try_recv() {
+                            Ok(Ok(count)) => { info!("empty_trash: cleared {} messages from DB", count); break; }
+                            Ok(Err(e)) => { warn!("empty_trash: DB error: {}", e); break; }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                if start.elapsed() > std::time::Duration::from_secs(10) { break; }
+                                glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+
+                // Clear message list if currently viewing this folder
+                if let Some(window) = app.active_window() {
+                    if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                        if let Some(message_list) = win.message_list() {
+                            message_list.set_messages(vec![]);
+                        }
+                    }
+                }
+                app.refresh_sidebar_folders();
+            });
+        } else {
+            // IMAP: empty folder
+            let pool = self.imap_pool();
+            let is_google = Self::is_google_account(&account);
+            let is_microsoft = Self::is_microsoft_account(&account);
+            let imap_host = account.imap_host.clone();
+            let imap_username = account.imap_username.clone();
+
+            glib::spawn_future_local(async move {
+                let auth_manager = match AuthManager::new().await {
+                    Ok(am) => am,
+                    Err(e) => { error!("empty_trash: auth error: {}", e); return; }
+                };
+
+                let credentials = if is_google {
+                    match auth_manager.get_xoauth2_token_for_goa(&account.id).await {
+                        Ok((email, access_token)) => ImapCredentials::Gmail { email, access_token },
+                        Err(e) => { error!("empty_trash: token error: {}", e); return; }
+                    }
+                } else if is_microsoft {
+                    match auth_manager.get_xoauth2_token_for_goa(&account.id).await {
+                        Ok((email, access_token)) => ImapCredentials::Microsoft { email, access_token },
+                        Err(e) => { error!("empty_trash: token error: {}", e); return; }
+                    }
+                } else {
+                    let host = imap_host.unwrap_or_else(|| "imap.mail.me.com".to_string());
+                    let username = imap_username.unwrap_or(account.email.clone());
+                    match auth_manager.get_goa_password(&account.id).await {
+                        Ok(password) => ImapCredentials::Password { host, port: 993, username, password },
+                        Err(e) => { error!("empty_trash: password error: {}", e); return; }
+                    }
+                };
+
+                let worker = match pool.get_or_create(credentials) {
+                    Ok(w) => w,
+                    Err(e) => { error!("empty_trash: pool error: {}", e); return; }
+                };
+
+                let (response_tx, response_rx) = std::sync::mpsc::channel();
+                if let Err(e) = worker.send(ImapCommand::EmptyFolder {
+                    folder_path: folder_path.clone(),
+                    response_tx,
+                }) {
+                    error!("empty_trash: send error: {}", e);
+                    return;
+                }
+
+                let start = std::time::Instant::now();
+                loop {
+                    match response_rx.try_recv() {
+                        Ok(ImapResponse::Ok) => {
+                            info!("empty_trash: emptied '{}'", folder_path);
+                            break;
+                        }
+                        Ok(ImapResponse::Error(e)) => {
+                            error!("empty_trash: IMAP error: {}", e);
+                            return;
+                        }
+                        Ok(_) => {}
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            if start.elapsed() > std::time::Duration::from_secs(120) { return; }
+                            glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                        }
+                        Err(_) => return,
+                    }
+                }
+
+                // Clear messages from DB
+                if let Some(ref db) = db {
+                    let db2 = db.clone();
+                    let aid = account_id.clone();
+                    let fp = folder_path.clone();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        let r = rt.block_on(db2.delete_messages_in_folder(&aid, &fp));
+                        let _ = tx.send(r);
+                    });
+                    let start = std::time::Instant::now();
+                    loop {
+                        match rx.try_recv() {
+                            Ok(Ok(count)) => { info!("empty_trash: cleared {} messages from DB", count); break; }
+                            Ok(Err(e)) => { warn!("empty_trash: DB error: {}", e); break; }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                if start.elapsed() > std::time::Duration::from_secs(10) { break; }
+                                glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+
+                // Clear message list if currently viewing this folder
+                if let Some(window) = app.active_window() {
+                    if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                        if let Some(message_list) = win.message_list() {
+                            message_list.set_messages(vec![]);
+                        }
+                    }
+                }
+                app.refresh_sidebar_folders();
+            });
+        }
     }
 }
 

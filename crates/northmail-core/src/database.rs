@@ -1,7 +1,7 @@
 //! Database storage using SQLite
 
 use crate::{CoreError, CoreResult};
-use sqlx::{sqlite::SqlitePoolOptions, Pool, Row, Sqlite};
+use sqlx::{sqlite::{SqliteConnectOptions, SqlitePoolOptions}, Pool, Row, Sqlite};
 use std::path::Path;
 use tracing::{debug, info, warn};
 
@@ -153,23 +153,20 @@ impl Database {
             std::fs::create_dir_all(parent)?;
         }
 
-        let db_url = format!("sqlite:{}?mode=rwc", path.display());
         info!("Opening database at {}", path.display());
+
+        let connect_options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(30));
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(&db_url)
+            .connect_with(connect_options)
             .await?;
 
         let db = Self { pool };
-
-        // Enable WAL mode for better concurrency and set busy timeout
-        sqlx::query("PRAGMA journal_mode = WAL")
-            .execute(&db.pool)
-            .await?;
-        sqlx::query("PRAGMA busy_timeout = 30000")  // 30 second busy timeout
-            .execute(&db.pool)
-            .await?;
 
         db.initialize().await?;
 
@@ -746,66 +743,71 @@ impl Database {
         folder_id: i64,
         messages: &[(DbMessage, String)], // (message, graph_message_id)
     ) -> CoreResult<usize> {
-        let mut tx = self.pool.begin().await?;
         let mut count = 0;
 
-        for (msg, graph_id) in messages {
-            let result = sqlx::query(
-                r#"
-                INSERT INTO messages (
-                    folder_id, uid, message_id, subject, from_address, from_name,
-                    to_addresses, cc_addresses, date_sent, date_epoch, snippet, is_read, is_starred,
-                    has_attachments, size, maildir_path, graph_message_id
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(folder_id, uid) DO UPDATE SET
-                    message_id = excluded.message_id,
-                    subject = excluded.subject,
-                    from_address = excluded.from_address,
-                    from_name = excluded.from_name,
-                    to_addresses = excluded.to_addresses,
-                    cc_addresses = excluded.cc_addresses,
-                    date_sent = excluded.date_sent,
-                    date_epoch = excluded.date_epoch,
-                    snippet = excluded.snippet,
-                    is_read = excluded.is_read,
-                    is_starred = excluded.is_starred,
-                    has_attachments = excluded.has_attachments,
-                    size = excluded.size,
-                    maildir_path = excluded.maildir_path,
-                    graph_message_id = excluded.graph_message_id,
-                    updated_at = datetime('now')
-                "#,
-            )
-            .bind(folder_id)
-            .bind(msg.uid)
-            .bind(&msg.message_id)
-            .bind(&msg.subject)
-            .bind(&msg.from_address)
-            .bind(&msg.from_name)
-            .bind(&msg.to_addresses)
-            .bind(&msg.cc_addresses)
-            .bind(&msg.date_sent)
-            .bind(msg.date_epoch)
-            .bind(&msg.snippet)
-            .bind(msg.is_read)
-            .bind(msg.is_starred)
-            .bind(msg.has_attachments)
-            .bind(msg.size)
-            .bind(&msg.maildir_path)
-            .bind(graph_id)
-            .execute(&mut *tx)
-            .await;
+        // Process in chunks to avoid holding write lock too long
+        for chunk in messages.chunks(50) {
+            let mut tx = self.pool.begin().await?;
 
-            match result {
-                Ok(_) => count += 1,
-                Err(e) => {
-                    tracing::warn!("Failed to upsert graph message uid={}: {}", msg.uid, e);
+            for (msg, graph_id) in chunk {
+                let result = sqlx::query(
+                    r#"
+                    INSERT INTO messages (
+                        folder_id, uid, message_id, subject, from_address, from_name,
+                        to_addresses, cc_addresses, date_sent, date_epoch, snippet, is_read, is_starred,
+                        has_attachments, size, maildir_path, graph_message_id
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(folder_id, uid) DO UPDATE SET
+                        message_id = excluded.message_id,
+                        subject = excluded.subject,
+                        from_address = excluded.from_address,
+                        from_name = excluded.from_name,
+                        to_addresses = excluded.to_addresses,
+                        cc_addresses = excluded.cc_addresses,
+                        date_sent = excluded.date_sent,
+                        date_epoch = excluded.date_epoch,
+                        snippet = excluded.snippet,
+                        is_read = excluded.is_read,
+                        is_starred = excluded.is_starred,
+                        has_attachments = excluded.has_attachments,
+                        size = excluded.size,
+                        maildir_path = excluded.maildir_path,
+                        graph_message_id = excluded.graph_message_id,
+                        updated_at = datetime('now')
+                    "#,
+                )
+                .bind(folder_id)
+                .bind(msg.uid)
+                .bind(&msg.message_id)
+                .bind(&msg.subject)
+                .bind(&msg.from_address)
+                .bind(&msg.from_name)
+                .bind(&msg.to_addresses)
+                .bind(&msg.cc_addresses)
+                .bind(&msg.date_sent)
+                .bind(msg.date_epoch)
+                .bind(&msg.snippet)
+                .bind(msg.is_read)
+                .bind(msg.is_starred)
+                .bind(msg.has_attachments)
+                .bind(msg.size)
+                .bind(&msg.maildir_path)
+                .bind(graph_id)
+                .execute(&mut *tx)
+                .await;
+
+                match result {
+                    Ok(_) => count += 1,
+                    Err(e) => {
+                        tracing::warn!("Failed to upsert graph message uid={}: {}", msg.uid, e);
+                    }
                 }
             }
+
+            tx.commit().await?;
         }
 
-        tx.commit().await?;
         Ok(count)
     }
 
@@ -850,64 +852,69 @@ impl Database {
         folder_id: i64,
         messages: &[DbMessage],
     ) -> CoreResult<usize> {
-        let mut tx = self.pool.begin().await?;
         let mut count = 0;
 
-        for msg in messages {
-            let result = sqlx::query(
-                r#"
-                INSERT INTO messages (
-                    folder_id, uid, message_id, subject, from_address, from_name,
-                    to_addresses, cc_addresses, date_sent, date_epoch, snippet, is_read, is_starred,
-                    has_attachments, size, maildir_path
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(folder_id, uid) DO UPDATE SET
-                    message_id = excluded.message_id,
-                    subject = excluded.subject,
-                    from_address = excluded.from_address,
-                    from_name = excluded.from_name,
-                    to_addresses = excluded.to_addresses,
-                    cc_addresses = excluded.cc_addresses,
-                    date_sent = excluded.date_sent,
-                    date_epoch = excluded.date_epoch,
-                    snippet = excluded.snippet,
-                    is_read = excluded.is_read,
-                    is_starred = excluded.is_starred,
-                    has_attachments = excluded.has_attachments,
-                    size = excluded.size,
-                    maildir_path = excluded.maildir_path,
-                    updated_at = datetime('now')
-                "#,
-            )
-            .bind(folder_id)
-            .bind(msg.uid)
-            .bind(&msg.message_id)
-            .bind(&msg.subject)
-            .bind(&msg.from_address)
-            .bind(&msg.from_name)
-            .bind(&msg.to_addresses)
-            .bind(&msg.cc_addresses)
-            .bind(&msg.date_sent)
-            .bind(msg.date_epoch)
-            .bind(&msg.snippet)
-            .bind(msg.is_read)
-            .bind(msg.is_starred)
-            .bind(msg.has_attachments)
-            .bind(msg.size)
-            .bind(&msg.maildir_path)
-            .execute(&mut *tx)
-            .await;
+        // Process in chunks to avoid holding write lock too long
+        for chunk in messages.chunks(50) {
+            let mut tx = self.pool.begin().await?;
 
-            match result {
-                Ok(_) => count += 1,
-                Err(e) => {
-                    tracing::warn!("Failed to upsert message uid={}: {}", msg.uid, e);
+            for msg in chunk {
+                let result = sqlx::query(
+                    r#"
+                    INSERT INTO messages (
+                        folder_id, uid, message_id, subject, from_address, from_name,
+                        to_addresses, cc_addresses, date_sent, date_epoch, snippet, is_read, is_starred,
+                        has_attachments, size, maildir_path
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(folder_id, uid) DO UPDATE SET
+                        message_id = excluded.message_id,
+                        subject = excluded.subject,
+                        from_address = excluded.from_address,
+                        from_name = excluded.from_name,
+                        to_addresses = excluded.to_addresses,
+                        cc_addresses = excluded.cc_addresses,
+                        date_sent = excluded.date_sent,
+                        date_epoch = excluded.date_epoch,
+                        snippet = excluded.snippet,
+                        is_read = excluded.is_read,
+                        is_starred = excluded.is_starred,
+                        has_attachments = excluded.has_attachments,
+                        size = excluded.size,
+                        maildir_path = excluded.maildir_path,
+                        updated_at = datetime('now')
+                    "#,
+                )
+                .bind(folder_id)
+                .bind(msg.uid)
+                .bind(&msg.message_id)
+                .bind(&msg.subject)
+                .bind(&msg.from_address)
+                .bind(&msg.from_name)
+                .bind(&msg.to_addresses)
+                .bind(&msg.cc_addresses)
+                .bind(&msg.date_sent)
+                .bind(msg.date_epoch)
+                .bind(&msg.snippet)
+                .bind(msg.is_read)
+                .bind(msg.is_starred)
+                .bind(msg.has_attachments)
+                .bind(msg.size)
+                .bind(&msg.maildir_path)
+                .execute(&mut *tx)
+                .await;
+
+                match result {
+                    Ok(_) => count += 1,
+                    Err(e) => {
+                        tracing::warn!("Failed to upsert message uid={}: {}", msg.uid, e);
+                    }
                 }
             }
+
+            tx.commit().await?;
         }
 
-        tx.commit().await?;
         Ok(count)
     }
 
@@ -1216,6 +1223,42 @@ impl Database {
             .bind(message_id)
             .execute(&self.pool)
             .await?;
+
+        // Update the folder's unread_count
+        let delta: i64 = if is_read { -1 } else { 1 };
+        sqlx::query(
+            r#"
+            UPDATE folders SET unread_count = MAX(0, COALESCE(unread_count, 0) + ?)
+            WHERE id = (SELECT folder_id FROM messages WHERE id = ?)
+            "#,
+        )
+        .bind(delta)
+        .bind(message_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Update read status by folder_id + UID (for Graph messages where DB id may be 0)
+    pub async fn set_message_read_by_uid(&self, folder_id: i64, uid: i64, is_read: bool) -> CoreResult<()> {
+        sqlx::query("UPDATE messages SET is_read = ?, updated_at = datetime('now') WHERE folder_id = ? AND uid = ?")
+            .bind(is_read)
+            .bind(folder_id)
+            .bind(uid)
+            .execute(&self.pool)
+            .await?;
+
+        // Update the folder's unread_count
+        let delta: i64 = if is_read { -1 } else { 1 };
+        sqlx::query(
+            "UPDATE folders SET unread_count = MAX(0, COALESCE(unread_count, 0) + ?) WHERE id = ?",
+        )
+        .bind(delta)
+        .bind(folder_id)
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 
@@ -1278,11 +1321,32 @@ impl Database {
     /// Delete a single message by folder_id and IMAP UID
     /// More reliable than delete_message() since the UID is always known from IMAP
     pub async fn delete_message_by_uid(&self, folder_id: i64, uid: i64) -> CoreResult<()> {
+        // Check if message is unread before deleting, to update folder count
+        let is_unread: bool = sqlx::query_scalar(
+            "SELECT CASE WHEN is_read = 0 THEN 1 ELSE 0 END FROM messages WHERE folder_id = ? AND uid = ?",
+        )
+        .bind(folder_id)
+        .bind(uid)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(false);
+
         sqlx::query("DELETE FROM messages WHERE folder_id = ? AND uid = ?")
             .bind(folder_id)
             .bind(uid)
             .execute(&self.pool)
             .await?;
+
+        // Decrement unread count if the deleted message was unread
+        if is_unread {
+            sqlx::query(
+                "UPDATE folders SET unread_count = MAX(0, COALESCE(unread_count, 0) - 1) WHERE id = ?",
+            )
+            .bind(folder_id)
+            .execute(&self.pool)
+            .await?;
+        }
+
         Ok(())
     }
 
@@ -1300,19 +1364,36 @@ impl Database {
             return Ok(result.rows_affected());
         }
 
-        // SQLite doesn't support arrays, so we build the IN clause
-        let placeholders: String = uids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let query = format!(
-            "DELETE FROM messages WHERE folder_id = ? AND uid NOT IN ({})",
-            placeholders
-        );
+        // Use a temp table within a single connection to avoid SQLite's variable limit
+        let mut conn = self.pool.acquire().await?;
 
-        let mut q = sqlx::query(&query).bind(folder_id);
-        for uid in uids {
-            q = q.bind(uid);
+        sqlx::query("CREATE TEMP TABLE IF NOT EXISTS _valid_uids (uid INTEGER PRIMARY KEY)")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("DELETE FROM _valid_uids")
+            .execute(&mut *conn)
+            .await?;
+
+        // Insert UIDs in chunks of 500
+        for chunk in uids.chunks(500) {
+            let placeholders: String = chunk.iter().map(|_| "(?)").collect::<Vec<_>>().join(",");
+            let query = format!("INSERT OR IGNORE INTO _valid_uids (uid) VALUES {}", placeholders);
+            let mut q = sqlx::query(&query);
+            for uid in chunk {
+                q = q.bind(uid);
+            }
+            q.execute(&mut *conn).await?;
         }
 
-        let result = q.execute(&self.pool).await?;
+        let result = sqlx::query(
+            "DELETE FROM messages WHERE folder_id = ? AND uid NOT IN (SELECT uid FROM _valid_uids)"
+        )
+        .bind(folder_id)
+        .execute(&mut *conn)
+        .await?;
+
+        sqlx::query("DELETE FROM _valid_uids").execute(&mut *conn).await?;
+
         Ok(result.rows_affected())
     }
 
@@ -1354,6 +1435,183 @@ impl Database {
         let folder_type = Self::guess_folder_type(folder_path);
         self.upsert_folder(account_id, folder_name, folder_path, &folder_type)
             .await
+    }
+
+    /// Delete a folder and all its messages from the database
+    pub async fn delete_folder_by_path(
+        &self,
+        account_id: &str,
+        full_path: &str,
+    ) -> CoreResult<()> {
+        // Delete the folder and all child folders (messages cascade via FK)
+        sqlx::query(
+            "DELETE FROM folders WHERE account_id = ? AND (full_path = ? OR full_path LIKE ? OR full_path LIKE ?)",
+        )
+        .bind(account_id)
+        .bind(full_path)
+        .bind(format!("{}/%", full_path))
+        .bind(format!("{}.%", full_path))
+        .execute(&self.pool)
+        .await?;
+
+        debug!("Deleted folder {} (and children) for account {}", full_path, account_id);
+        Ok(())
+    }
+
+    /// Delete all messages in a folder (by account_id and folder path), keeping the folder itself
+    pub async fn delete_messages_in_folder(
+        &self,
+        account_id: &str,
+        folder_path: &str,
+    ) -> CoreResult<u64> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM messages WHERE folder_id IN (
+                SELECT id FROM folders WHERE account_id = ? AND full_path = ?
+            )
+            "#,
+        )
+        .bind(account_id)
+        .bind(folder_path)
+        .execute(&self.pool)
+        .await?;
+
+        // Reset folder counts to 0
+        sqlx::query(
+            "UPDATE folders SET message_count = 0, unread_count = 0 WHERE account_id = ? AND full_path = ?",
+        )
+        .bind(account_id)
+        .bind(folder_path)
+        .execute(&self.pool)
+        .await?;
+
+        debug!("Deleted {} messages in folder {} for account {}", result.rows_affected(), folder_path, account_id);
+        Ok(result.rows_affected())
+    }
+
+    /// Check if a message is unread (by folder_id + uid)
+    pub async fn is_message_unread(&self, folder_id: i64, uid: i64) -> CoreResult<bool> {
+        let is_unread: bool = sqlx::query_scalar(
+            "SELECT CASE WHEN is_read = 0 THEN 1 ELSE 0 END FROM messages WHERE folder_id = ? AND uid = ?",
+        )
+        .bind(folder_id)
+        .bind(uid)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(false);
+        Ok(is_unread)
+    }
+
+    /// Increment unread count for a folder (used when moving an unread message into a folder)
+    pub async fn increment_folder_unread(
+        &self,
+        account_id: &str,
+        folder_path: &str,
+    ) -> CoreResult<()> {
+        sqlx::query(
+            "UPDATE folders SET unread_count = COALESCE(unread_count, 0) + 1 WHERE account_id = ? AND full_path = ?",
+        )
+        .bind(account_id)
+        .bind(folder_path)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Delete folders not in the given set of paths (cleanup stale folders after sync)
+    pub async fn delete_stale_folders(
+        &self,
+        account_id: &str,
+        valid_paths: &[String],
+    ) -> CoreResult<u64> {
+        if valid_paths.is_empty() {
+            return Ok(0);
+        }
+        // Build a query with placeholders for the valid paths
+        let placeholders: Vec<&str> = valid_paths.iter().map(|_| "?").collect();
+        let query = format!(
+            "DELETE FROM folders WHERE account_id = ? AND full_path NOT IN ({})",
+            placeholders.join(", ")
+        );
+        let mut q = sqlx::query(&query).bind(account_id);
+        for path in valid_paths {
+            q = q.bind(path);
+        }
+        let result = q.execute(&self.pool).await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Rename a folder path in the database, updating child folder paths too
+    pub async fn rename_folder_path(
+        &self,
+        account_id: &str,
+        old_path: &str,
+        new_path: &str,
+    ) -> CoreResult<()> {
+        let new_name = new_path.rsplit('/').next()
+            .or_else(|| new_path.rsplit('.').next())
+            .unwrap_or(new_path);
+
+        // Update the folder itself
+        sqlx::query(
+            "UPDATE folders SET full_path = ?, name = ? WHERE account_id = ? AND full_path = ?",
+        )
+        .bind(new_path)
+        .bind(new_name)
+        .bind(account_id)
+        .bind(old_path)
+        .execute(&self.pool)
+        .await?;
+
+        // Update child folders whose paths start with old_path + delimiter
+        // Try both "/" and "." delimiters
+        for delim in &["/", "."] {
+            let old_prefix = format!("{}{}", old_path, delim);
+            let new_prefix = format!("{}{}", new_path, delim);
+
+            // Find child folders
+            let children: Vec<(i64, String)> = sqlx::query_as(
+                "SELECT id, full_path FROM folders WHERE account_id = ? AND full_path LIKE ?",
+            )
+            .bind(account_id)
+            .bind(format!("{}%", old_prefix))
+            .fetch_all(&self.pool)
+            .await?;
+
+            for (child_id, child_path) in children {
+                let updated_path = format!("{}{}", new_prefix, &child_path[old_prefix.len()..]);
+                let child_name = updated_path.rsplit(*delim).next().unwrap_or(&updated_path);
+                sqlx::query("UPDATE folders SET full_path = ?, name = ? WHERE id = ?")
+                    .bind(&updated_path)
+                    .bind(child_name)
+                    .bind(child_id)
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+
+        debug!(
+            "Renamed folder {} -> {} for account {}",
+            old_path, new_path, account_id
+        );
+        Ok(())
+    }
+
+    /// Get the graph_folder_id for a folder identified by account_id and full_path
+    pub async fn get_graph_folder_id_by_path(
+        &self,
+        account_id: &str,
+        folder_path: &str,
+    ) -> CoreResult<Option<String>> {
+        let result = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT graph_folder_id FROM folders WHERE account_id = ? AND full_path = ?",
+        )
+        .bind(account_id)
+        .bind(folder_path)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(result.flatten())
     }
 
     /// Get all message UIDs in a folder (for sync comparison)
