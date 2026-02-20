@@ -161,6 +161,8 @@ mod imp {
         pub context_menu_open: Cell<bool>,
         /// Anchor row index for Shift+click range selection
         pub anchor_index: Cell<Option<i32>>,
+        /// Whether current messages are FTS search results (skip client-side search filter)
+        pub is_search_results: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -1109,6 +1111,10 @@ impl MessageList {
     fn set_messages_inner(&self, messages: Vec<MessageInfo>, is_search_results: bool) {
         let imp = self.imp();
 
+        // Track whether these are FTS results so click/keyboard handlers
+        // skip the client-side search text filter (DB already filtered)
+        imp.is_search_results.set(is_search_results);
+
         // Clear loading state
         imp.is_loading.set(false);
 
@@ -1214,8 +1220,9 @@ impl MessageList {
                         let index = row.index();
                         let imp = widget.imp();
                         let messages = imp.messages.borrow();
+                        let skip_search = imp.is_search_results.get();
                         let filtered: Vec<&MessageInfo> = messages.iter()
-                            .filter(|m| widget.message_matches(m))
+                            .filter(|m| widget.message_matches_with_options(m, skip_search))
                             .collect();
 
                         if has_shift {
@@ -1294,8 +1301,9 @@ impl MessageList {
                             let index = row.index();
                             let imp = widget_kb.imp();
                             let messages = imp.messages.borrow();
+                            let skip_search = imp.is_search_results.get();
                             let filtered: Vec<&MessageInfo> = messages.iter()
-                                .filter(|m| widget_kb.message_matches(m))
+                                .filter(|m| widget_kb.message_matches_with_options(m, skip_search))
                                 .collect();
                             if let Some(msg) = filtered.get(index as usize) {
                                 let uid = msg.uid;
@@ -1349,9 +1357,15 @@ impl MessageList {
     }
 
     /// Re-filter the displayed messages based on current filter state.
-    /// If a filter-changed callback is wired up, delegate to DB-level filtering;
+    /// If viewing search results, always filter client-side to preserve FTS results.
+    /// Otherwise, if a filter-changed callback is wired up, delegate to DB-level filtering;
     /// otherwise fall back to client-side filtering of loaded messages.
     fn apply_filter(&self) {
+        if self.imp().is_search_results.get() {
+            // Search results: filter client-side to avoid losing FTS results
+            self.rebuild_visible_rows_direct();
+            return;
+        }
         if let Some(callback) = self.imp().on_filter_changed.borrow().as_ref() {
             callback();
         } else {
@@ -2044,8 +2058,8 @@ impl MessageList {
             msg.is_starred = is_starred;
         }
         drop(messages);
-        // Rebuild the list to reflect the change
-        self.rebuild_visible_rows();
+        // Rebuild directly to preserve FTS search results
+        self.rebuild_visible_rows_direct();
     }
 
     /// Update a message's read status in the list
@@ -2056,7 +2070,7 @@ impl MessageList {
             msg.is_read = is_read;
         }
         drop(messages);
-        self.rebuild_visible_rows();
+        self.rebuild_visible_rows_direct();
     }
 
     /// Remove a message from the list by UID
@@ -2066,8 +2080,9 @@ impl MessageList {
         messages.retain(|m| m.uid != uid);
         imp.message_count.set(messages.len());
         drop(messages);
-        // Rebuild the list to reflect the change
-        self.rebuild_visible_rows();
+        // Rebuild directly — the message is already removed from the in-memory
+        // list, so no need to re-query the DB (which would lose FTS results)
+        self.rebuild_visible_rows_direct();
     }
 
     /// Rebuild visible rows from stored messages (used after status updates)
@@ -2108,8 +2123,10 @@ impl MessageList {
             imp.load_more_row.replace(None);
 
             // Rebuild with current filters (client-side)
+            // Skip search text filter for FTS results (DB already filtered)
+            let skip_search = imp.is_search_results.get();
             let visible: Vec<&MessageInfo> = messages.iter()
-                .filter(|m| self.message_matches(m))
+                .filter(|m| self.message_matches_with_options(m, skip_search))
                 .collect();
 
             for msg in &visible {
@@ -2175,7 +2192,7 @@ impl MessageList {
             let mut sel = imp.selected_uids.borrow_mut();
             sel.retain(|uid| !uids.contains(uid));
         }
-        self.rebuild_visible_rows();
+        self.rebuild_visible_rows_direct();
     }
 
     /// Encode selected messages as pipe-delimited string "uid:msg_id:folder_id|..."
