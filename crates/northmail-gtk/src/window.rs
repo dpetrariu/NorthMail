@@ -579,7 +579,7 @@ impl NorthMailWindow {
              #message_list_box {
                  background-color: @view_bg_color;
              }
-             /* Make entire message view area white */
+             /* Make entire message view area use theme background */
              #inner_paned,
              #message_view_box,
              #message_view_box > *,
@@ -588,17 +588,17 @@ impl NorthMailWindow {
              #message_view_box viewport,
              #message_view_box viewport > *,
              .message-view-content {
-                 background-color: white;
-                 background: white;
+                 background-color: @view_bg_color;
+                 background: @view_bg_color;
              }
-             /* Force white on inner paned end child */
+             /* Force theme bg on inner paned end child */
              #inner_paned > :last-child {
-                 background-color: white;
-                 background: white;
+                 background-color: @view_bg_color;
+                 background: @view_bg_color;
              }
              /* Message view header card */
              .message-header-card {
-                 background-color: #f5f5f5;
+                 background-color: alpha(@view_fg_color, 0.04);
                  border-radius: 12px;
                  margin: 12px;
              }
@@ -677,14 +677,14 @@ impl NorthMailWindow {
                  border-radius: 6px;
              }
              .message-body-area {
-                 background-color: white;
+                 background-color: @view_bg_color;
                  padding: 0 16px 16px 16px;
              }
              .message-body-scrolled,
              .message-body-scrolled > *,
              .message-body-box {
-                 background-color: white;
-                 background: white;
+                 background-color: @view_bg_color;
+                 background: @view_bg_color;
              }
              /* Hide paned separators */
              paned > separator {
@@ -2724,7 +2724,7 @@ impl NorthMailWindow {
             .kb-highlight { background: alpha(@accent_bg_color, 0.15); }
             .warning { color: @warning_color; }
             .compose-send { min-height: 24px; padding-top: 2px; padding-bottom: 2px; }
-            .format-bar { background-color: white; }
+            .format-bar { background-color: @view_bg_color; }
             .format-bar button { min-height: 18px; min-width: 18px; padding: 4px; font-weight: 400; }
             .format-bar button image { -gtk-icon-size: 12px; }
             .format-bar dropdown { min-height: 18px; }

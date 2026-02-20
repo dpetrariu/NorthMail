@@ -333,11 +333,12 @@ impl MessageList {
                 color: @accent_fg_color;
                 border-radius: 8px;
             }
-            .message-list > row:selected * {
+            .message-list > row:selected .message-row-content,
+            .message-list > row:selected .message-row-content * {
                 color: @accent_fg_color;
             }
-            .message-list > row:selected .dim-label,
-            .message-list > row:selected .caption {
+            .message-list > row:selected .message-row-content .dim-label,
+            .message-list > row:selected .message-row-content .caption {
                 color: alpha(@accent_fg_color, 0.85);
             }
             .unread-dot {
@@ -348,10 +349,10 @@ impl MessageList {
                 background-color: @accent_fg_color;
             }
             .message-list-container {
-                background-color: white;
+                background-color: @view_bg_color;
             }
             .search-bar-container {
-                background-color: white;
+                background-color: @view_bg_color;
             }
             /* Drag preview styling */
             .drag-preview {
@@ -386,6 +387,10 @@ impl MessageList {
                 padding: 4px 8px;
                 min-height: 28px;
                 border-radius: 6px;
+                font-weight: normal;
+            }
+            button.context-menu-item label {
+                font-weight: normal;
             }
             button.context-menu-item:hover {
                 background-color: alpha(@view_fg_color, 0.08);
@@ -1439,6 +1444,7 @@ impl MessageList {
             .margin_end(12)
             .margin_top(8)
             .margin_bottom(8)
+            .css_classes(["message-row-content"])
             .build();
 
         // Indicator column (unread dot only)
@@ -1737,10 +1743,9 @@ impl MessageList {
         list_box.append(&row);
     }
 
-    /// Helper to create a context menu item button in a popover vbox
+    /// Helper to create a context menu item button in a popover vbox.
     fn make_context_menu_item(vbox: &gtk4::Box, label: &str) -> gtk4::Button {
-        let lbl = gtk4::Label::new(None);
-        lbl.set_markup(&format!("<span color='#1c1c1c' weight='normal'>{}</span>", glib::markup_escape_text(label)));
+        let lbl = gtk4::Label::new(Some(label));
         lbl.set_xalign(0.0);
         let btn = gtk4::Button::new();
         btn.set_child(Some(&lbl));

@@ -375,9 +375,9 @@ impl FolderSidebar {
             .inboxes-list > row .dim-label {
                 color: alpha(@accent_fg_color, 0.85);
             }
-            /* Selected inbox: inverted (white bg, accent text) */
+            /* Selected inbox: inverted (light bg, accent text) */
             .inboxes-list > row:selected {
-                background-color: white;
+                background-color: @view_bg_color;
                 color: @accent_bg_color;
             }
             .inboxes-list > row:selected * {
@@ -388,7 +388,7 @@ impl FolderSidebar {
             }
             /* Separator inside inboxes list */
             .inboxes-list separator {
-                background-color: alpha(white, 0.4);
+                background-color: alpha(@accent_fg_color, 0.4);
                 min-height: 1px;
                 margin-left: 8px;
                 margin-right: 8px;
@@ -421,8 +421,9 @@ impl FolderSidebar {
             .folders-list .section-header-label {
                 font-weight: normal;
             }
-            /* Folder entries and headers - smaller font (exclude popovers) */
-            .folders-list > row *:not(popover *) {
+            /* Folder entries and headers - smaller font */
+            .folders-list > row label,
+            .folders-list > row image {
                 font-size: 0.9em;
             }
             .folders-list .folder-entry-row {
@@ -475,7 +476,7 @@ impl FolderSidebar {
             }
             /* Drop highlight for inbox rows - more visible on accent background */
             .inboxes-list > row.drop-highlight {
-                background-color: alpha(white, 0.4);
+                background-color: alpha(@accent_fg_color, 0.4);
             }
             "
         );
@@ -1352,14 +1353,9 @@ impl FolderSidebar {
 
     // ── Context menus ────────────────────────────────────────────────
 
-    /// Create a context menu button with explicit dark text, left-aligned, normal weight.
-    /// Matches the style used in message_list.rs to avoid white-on-white on selected rows.
+    /// Create a context menu button, left-aligned, normal weight.
     fn make_context_menu_item(vbox: &gtk4::Box, label: &str) -> gtk4::Button {
-        let lbl = gtk4::Label::new(None);
-        lbl.set_markup(&format!(
-            "<span color='#1c1c1c' weight='normal'>{}</span>",
-            glib::markup_escape_text(label)
-        ));
+        let lbl = gtk4::Label::new(Some(label));
         lbl.set_xalign(0.0);
 
         let btn = gtk4::Button::new();

@@ -145,7 +145,7 @@ impl MessageView {
         css_provider.load_from_string(
             r#"
             .message-view-container {
-                background-color: white;
+                background-color: @view_bg_color;
             }
             .message-header-card {
                 background-color: alpha(@view_bg_color, 0.7);
@@ -200,7 +200,7 @@ impl MessageView {
                 min-height: 40px;
             }
             .message-content-area {
-                background-color: white;
+                background-color: @view_bg_color;
                 padding: 16px;
             }
             "#,
