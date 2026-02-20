@@ -5,7 +5,9 @@ use libadwaita as adw;
 use std::cell::Cell;
 use std::rc::Rc;
 
+use crate::application::NorthMailApplication;
 use crate::i18n::{tr, ntr};
+use crate::window::base_domain;
 
 /// Escape XML/Pango markup special characters
 fn escape_markup(text: &str) -> String {
@@ -163,6 +165,8 @@ mod imp {
         pub anchor_index: Cell<Option<i32>>,
         /// Whether current messages are FTS search results (skip client-side search filter)
         pub is_search_results: Cell<bool>,
+        /// Guard flag to suppress message-selected emission during list rebuilds
+        pub is_rebuilding: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -1302,6 +1306,9 @@ impl MessageList {
                     // Keyboard navigation: emit message-selected when row changes via arrow keys
                     let widget_kb = self.clone();
                     list_box.connect_row_selected(move |_lb, row| {
+                        if widget_kb.imp().is_rebuilding.get() {
+                            return;
+                        }
                         if let Some(row) = row {
                             let index = row.index();
                             let imp = widget_kb.imp();
@@ -1439,8 +1446,8 @@ impl MessageList {
         // Main horizontal box
         let hbox = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
-            .spacing(8)
-            .margin_start(12)
+            .spacing(4)
+            .margin_start(8)
             .margin_end(12)
             .margin_top(8)
             .margin_bottom(8)
@@ -1450,7 +1457,7 @@ impl MessageList {
         // Indicator column (unread dot only)
         let indicator_box = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
-            .width_request(12)
+            .width_request(10)
             .valign(gtk4::Align::Start)
             .margin_top(4)
             .spacing(4)
@@ -1468,6 +1475,60 @@ impl MessageList {
         }
 
         hbox.append(&indicator_box);
+
+        // Avatar (32px circle: contact photo → favicon → initials)
+        let app_ref = self.root()
+            .and_then(|r| r.downcast_ref::<gtk4::Window>().cloned())
+            .and_then(|w| w.application())
+            .and_then(|a| a.downcast_ref::<NorthMailApplication>().cloned());
+
+        let contact_photo = app_ref.as_ref()
+            .and_then(|app| app.get_contact_photo(&msg.from_address));
+
+        let (avatar_widget, favicon_slot) = crate::window::create_avatar(
+            &msg.from, &msg.from_address, contact_photo.as_deref(),
+        );
+
+        // Shrink to 32px for the list
+        if let Some(da) = avatar_widget.downcast_ref::<gtk4::DrawingArea>() {
+            da.set_width_request(32);
+            da.set_height_request(32);
+        }
+
+        // Kick off favicon fetch if no contact photo
+        if let (Some((drawing_area, slot)), Some(app)) = (favicon_slot, app_ref) {
+            if let Some(domain) = msg.from_address.rsplit('@').next().map(base_domain) {
+                let da = drawing_area.clone();
+                let slot_cb = slot.clone();
+                app.fetch_favicon_async(domain, move |png_bytes| {
+                    if let Some(bytes) = png_bytes {
+                        let gbytes = glib::Bytes::from(&bytes);
+                        if let Ok(tex) = gtk4::gdk::Texture::from_bytes(&gbytes) {
+                            let tw = tex.width();
+                            let th = tex.height();
+                            let stride = gtk4::cairo::Format::ARgb32
+                                .stride_for_width(tw as u32)
+                                .unwrap_or(tw * 4);
+                            let mut pixel_data = vec![0u8; (stride * th) as usize];
+                            tex.download(&mut pixel_data, stride as usize);
+                            if let Ok(surface) = gtk4::cairo::ImageSurface::create_for_data(
+                                pixel_data,
+                                gtk4::cairo::Format::ARgb32,
+                                tw,
+                                th,
+                                stride,
+                            ) {
+                                *slot_cb.borrow_mut() = Some(surface);
+                                da.queue_draw();
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        avatar_widget.set_margin_end(6);
+        hbox.append(&avatar_widget);
 
         // Content area (sender, subject, preview)
         let content_box = gtk4::Box::builder()
@@ -1744,11 +1805,19 @@ impl MessageList {
     }
 
     /// Helper to create a context menu item button in a popover vbox.
-    fn make_context_menu_item(vbox: &gtk4::Box, label: &str) -> gtk4::Button {
+    fn make_context_menu_item(vbox: &gtk4::Box, label: &str, icon_name: Option<&str>) -> gtk4::Button {
+        let content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        if let Some(icon) = icon_name {
+            let img = gtk4::Image::from_icon_name(icon);
+            img.set_pixel_size(16);
+            content.append(&img);
+        }
         let lbl = gtk4::Label::new(Some(label));
         lbl.set_xalign(0.0);
+        lbl.set_hexpand(true);
+        content.append(&lbl);
         let btn = gtk4::Button::new();
-        btn.set_child(Some(&lbl));
+        btn.set_child(Some(&content));
         btn.add_css_class("flat");
         btn.add_css_class("context-menu-item");
         btn.set_hexpand(true);
@@ -1785,7 +1854,7 @@ impl MessageList {
         // Read/Unread toggle
         let widget = self.clone();
         if is_read {
-            let btn = Self::make_context_menu_item(&vbox, &tr("Mark as Unread"));
+            let btn = Self::make_context_menu_item(&vbox, &tr("Mark as Unread"), Some("mail-unread-symbolic"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1794,7 +1863,7 @@ impl MessageList {
                 w.emit_by_name::<()>("mark-read", &[&msg_uid, &msg_id, &msg_folder_id, &false]);
             });
         } else {
-            let btn = Self::make_context_menu_item(&vbox, &tr("Mark as Read"));
+            let btn = Self::make_context_menu_item(&vbox, &tr("Mark as Read"), Some("mail-read-symbolic"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1806,7 +1875,7 @@ impl MessageList {
 
         // Star toggle
         if is_starred {
-            let btn = Self::make_context_menu_item(&vbox, &tr("Unstar"));
+            let btn = Self::make_context_menu_item(&vbox, &tr("Unstar"), Some("non-starred-symbolic"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1815,7 +1884,7 @@ impl MessageList {
                 w.emit_by_name::<()>("star-toggled", &[&msg_uid, &msg_id, &msg_folder_id, &false]);
             });
         } else {
-            let btn = Self::make_context_menu_item(&vbox, &tr("Star"));
+            let btn = Self::make_context_menu_item(&vbox, &tr("Star"), Some("starred-symbolic"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1829,7 +1898,7 @@ impl MessageList {
 
         // Reply / Reply All / Forward
         {
-            let btn = Self::make_context_menu_item(&vbox, &tr("Reply"));
+            let btn = Self::make_context_menu_item(&vbox, &tr("Reply"), Some("mail-reply-sender-symbolic"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1839,7 +1908,7 @@ impl MessageList {
             });
         }
         {
-            let btn = Self::make_context_menu_item(&vbox, &tr("Reply All"));
+            let btn = Self::make_context_menu_item(&vbox, &tr("Reply All"), Some("mail-reply-all-symbolic"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1849,7 +1918,7 @@ impl MessageList {
             });
         }
         {
-            let btn = Self::make_context_menu_item(&vbox, &tr("Forward"));
+            let btn = Self::make_context_menu_item(&vbox, &tr("Forward"), Some("mail-forward-symbolic"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1863,7 +1932,7 @@ impl MessageList {
 
         // Archive / Trash / Spam
         {
-            let btn = Self::make_context_menu_item(&vbox, &tr("Archive"));
+            let btn = Self::make_context_menu_item(&vbox, &tr("Archive"), Some("folder-symbolic"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1873,7 +1942,7 @@ impl MessageList {
             });
         }
         {
-            let btn = Self::make_context_menu_item(&vbox, &tr("Move to Trash"));
+            let btn = Self::make_context_menu_item(&vbox, &tr("Move to Trash"), Some("user-trash-symbolic"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1883,7 +1952,7 @@ impl MessageList {
             });
         }
         {
-            let btn = Self::make_context_menu_item(&vbox, &tr("Mark as Spam"));
+            let btn = Self::make_context_menu_item(&vbox, &tr("Mark as Spam"), Some("mail-mark-junk-symbolic"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1911,7 +1980,7 @@ impl MessageList {
 
         // Mark as Read / Mark as Unread
         {
-            let btn = Self::make_context_menu_item(&vbox, &ntr("Mark {} as Read", "Mark {} as Read", count as u32).replace("{}", &count.to_string()));
+            let btn = Self::make_context_menu_item(&vbox, &ntr("Mark {} as Read", "Mark {} as Read", count as u32).replace("{}", &count.to_string()), Some("mail-read-symbolic"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1922,7 +1991,7 @@ impl MessageList {
             });
         }
         {
-            let btn = Self::make_context_menu_item(&vbox, &ntr("Mark {} as Unread", "Mark {} as Unread", count as u32).replace("{}", &count.to_string()));
+            let btn = Self::make_context_menu_item(&vbox, &ntr("Mark {} as Unread", "Mark {} as Unread", count as u32).replace("{}", &count.to_string()), Some("mail-unread-symbolic"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1935,7 +2004,7 @@ impl MessageList {
 
         // Star / Unstar
         {
-            let btn = Self::make_context_menu_item(&vbox, &ntr("Star {}", "Star {}", count as u32).replace("{}", &count.to_string()));
+            let btn = Self::make_context_menu_item(&vbox, &ntr("Star {}", "Star {}", count as u32).replace("{}", &count.to_string()), Some("starred-symbolic"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1946,7 +2015,7 @@ impl MessageList {
             });
         }
         {
-            let btn = Self::make_context_menu_item(&vbox, &ntr("Unstar {}", "Unstar {}", count as u32).replace("{}", &count.to_string()));
+            let btn = Self::make_context_menu_item(&vbox, &ntr("Unstar {}", "Unstar {}", count as u32).replace("{}", &count.to_string()), Some("non-starred-symbolic"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1961,7 +2030,7 @@ impl MessageList {
 
         // Archive / Trash / Spam
         {
-            let btn = Self::make_context_menu_item(&vbox, &ntr("Archive {} Message", "Archive {} Messages", count as u32).replace("{}", &count.to_string()));
+            let btn = Self::make_context_menu_item(&vbox, &ntr("Archive {} Message", "Archive {} Messages", count as u32).replace("{}", &count.to_string()), Some("folder-symbolic"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1972,7 +2041,7 @@ impl MessageList {
             });
         }
         {
-            let btn = Self::make_context_menu_item(&vbox, &ntr("Move {} to Trash", "Move {} to Trash", count as u32).replace("{}", &count.to_string()));
+            let btn = Self::make_context_menu_item(&vbox, &ntr("Move {} to Trash", "Move {} to Trash", count as u32).replace("{}", &count.to_string()), Some("user-trash-symbolic"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -1983,7 +2052,7 @@ impl MessageList {
             });
         }
         {
-            let btn = Self::make_context_menu_item(&vbox, &ntr("Mark {} as Spam", "Mark {} as Spam", count as u32).replace("{}", &count.to_string()));
+            let btn = Self::make_context_menu_item(&vbox, &ntr("Mark {} as Spam", "Mark {} as Spam", count as u32).replace("{}", &count.to_string()), Some("mail-mark-junk-symbolic"));
             let w = widget.clone();
             let p = popover.clone();
             btn.connect_clicked(move |_| {
@@ -2067,15 +2136,95 @@ impl MessageList {
         self.rebuild_visible_rows_direct();
     }
 
-    /// Update a message's read status in the list
+    /// Update a message's read status in the list (in-place, no rebuild)
     pub fn update_message_read(&self, uid: u32, is_read: bool) {
         let imp = self.imp();
-        let mut messages = imp.messages.borrow_mut();
-        if let Some(msg) = messages.iter_mut().find(|m| m.uid == uid) {
-            msg.is_read = is_read;
+
+        // Find the row index for this UID
+        let row_index = {
+            let messages = imp.messages.borrow();
+            let skip_search = imp.is_search_results.get();
+            let filtered: Vec<&MessageInfo> = messages.iter()
+                .filter(|m| self.message_matches_with_options(m, skip_search))
+                .collect();
+            filtered.iter().position(|m| m.uid == uid)
+        };
+
+        // Update the data model
+        {
+            let mut messages = imp.messages.borrow_mut();
+            if let Some(msg) = messages.iter_mut().find(|m| m.uid == uid) {
+                msg.is_read = is_read;
+            }
         }
-        drop(messages);
-        self.rebuild_visible_rows_direct();
+
+        // Update the row widget in-place
+        let list_box = imp.list_box.borrow();
+        if let (Some(idx), Some(list_box)) = (row_index, list_box.as_ref()) {
+            if let Some(row) = list_box.row_at_index(idx as i32) {
+                // Row → hbox → [indicator_box, avatar, content_box]
+                if let Some(hbox) = row.child() {
+                    // indicator_box is first child
+                    if let Some(indicator_box) = hbox.first_child() {
+                        // Remove or add unread dot
+                        if is_read {
+                            // Remove dot if present
+                            if let Some(dot) = indicator_box.first_child() {
+                                if dot.has_css_class("unread-dot") {
+                                    indicator_box.downcast_ref::<gtk4::Box>()
+                                        .map(|b| b.remove(&dot));
+                                }
+                            }
+                        } else {
+                            // Add dot if not present
+                            let has_dot = indicator_box.first_child()
+                                .map(|c| c.has_css_class("unread-dot"))
+                                .unwrap_or(false);
+                            if !has_dot {
+                                let dot = gtk4::Box::builder()
+                                    .width_request(8)
+                                    .height_request(8)
+                                    .css_classes(["unread-dot"])
+                                    .halign(gtk4::Align::Center)
+                                    .build();
+                                if let Some(b) = indicator_box.downcast_ref::<gtk4::Box>() {
+                                    b.prepend(&dot);
+                                }
+                            }
+                        }
+
+                        // content_box is after indicator and avatar
+                        // Navigate: indicator → avatar → content_box
+                        if let Some(avatar) = indicator_box.next_sibling() {
+                            if let Some(content_box) = avatar.next_sibling() {
+                                // top_row is first child of content_box
+                                if let Some(top_row) = content_box.first_child() {
+                                    // sender_label is first child of top_row
+                                    if let Some(sender_label) = top_row.first_child() {
+                                        if is_read {
+                                            sender_label.remove_css_class("heading");
+                                        } else {
+                                            sender_label.add_css_class("heading");
+                                        }
+                                    }
+                                    // middle_row is next sibling of top_row
+                                    if let Some(middle_row) = top_row.next_sibling() {
+                                        // subject_label is first child of middle_row
+                                        if let Some(subject_label) = middle_row.first_child() {
+                                            if is_read {
+                                                subject_label.add_css_class("dim-label");
+                                            } else {
+                                                subject_label.remove_css_class("dim-label");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Remove a message from the list by UID
@@ -2112,14 +2261,17 @@ impl MessageList {
     /// Used by append_messages where the DB query already applied filters.
     fn rebuild_visible_rows_direct(&self) {
         let imp = self.imp();
+        imp.is_rebuilding.set(true);
 
         let list_box = imp.list_box.borrow();
         let scrolled = imp.scrolled.borrow();
         let messages = imp.messages.borrow();
 
-        if let (Some(list_box), Some(_scrolled)) = (list_box.as_ref(), scrolled.as_ref()) {
-            // Remember selected UIDs
+        if let (Some(list_box), Some(scrolled)) = (list_box.as_ref(), scrolled.as_ref()) {
+            // Remember selected UIDs and scroll position
             let selected_uids = imp.selected_uids.borrow().clone();
+            let vadj = scrolled.vadjustment();
+            let saved_scroll = vadj.value();
 
             // Clear existing rows
             while let Some(child) = list_box.first_child() {
@@ -2146,8 +2298,9 @@ impl MessageList {
                 imp.load_more_row.replace(Some(load_row));
             }
 
-            // Restore user's selection or deselect (deferred to idle so GTK finishes layout first)
+            // Restore user's selection and scroll position (deferred to idle so GTK finishes layout first)
             let lb = list_box.clone();
+            let widget = self.clone();
             if !selected_uids.is_empty() {
                 let restore: Vec<i32> = visible.iter().enumerate()
                     .filter(|(_, m)| selected_uids.contains(&m.uid))
@@ -2160,12 +2313,18 @@ impl MessageList {
                             lb.select_row(Some(&row));
                         }
                     }
+                    vadj.set_value(saved_scroll);
+                    widget.imp().is_rebuilding.set(false);
                 });
             } else {
                 glib::idle_add_local_once(move || {
                     lb.unselect_all();
+                    vadj.set_value(saved_scroll);
+                    widget.imp().is_rebuilding.set(false);
                 });
             }
+        } else {
+            imp.is_rebuilding.set(false);
         }
     }
 

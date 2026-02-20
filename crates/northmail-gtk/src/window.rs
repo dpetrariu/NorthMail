@@ -102,7 +102,7 @@ fn parse_bulk_data(data: &str) -> Vec<(u32, i64, i64)> {
 }
 
 /// Generate a color from a string (for avatar background)
-fn string_to_avatar_color(s: &str) -> (f64, f64, f64) {
+pub(crate) fn string_to_avatar_color(s: &str) -> (f64, f64, f64) {
     let colors: [(f64, f64, f64); 12] = [
         (0.29, 0.56, 0.85), // #4A90D9
         (0.91, 0.30, 0.24), // #E74C3C
@@ -123,7 +123,7 @@ fn string_to_avatar_color(s: &str) -> (f64, f64, f64) {
 }
 
 /// Get initials from a name or email
-fn get_initials(name: &str, email: &str) -> String {
+pub(crate) fn get_initials(name: &str, email: &str) -> String {
     let display = if name.is_empty() || name == email || name.contains('@') {
         email.split('@').next().unwrap_or("?")
     } else {
@@ -149,7 +149,7 @@ fn get_initials(name: &str, email: &str) -> String {
 
 /// Extract the registrable domain from a full domain string.
 /// e.g. "accounts.nintendo.com" → "nintendo.com", "mail.co.uk" → "mail.co.uk"
-fn base_domain(domain: &str) -> &str {
+pub(crate) fn base_domain(domain: &str) -> &str {
     // Common two-part TLDs where the registrable domain needs 3 segments
     const TWO_PART_TLDS: &[&str] = &[
         "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "net.uk",
@@ -197,7 +197,7 @@ fn base_domain(domain: &str) -> &str {
 /// Create an avatar widget with contact photo or colored initials.
 /// Returns `(widget, Option<favicon_slot>)`. If the contact has a photo, favicon_slot is None.
 /// Otherwise, favicon_slot is a shared slot that can be filled later to swap initials for a favicon.
-fn create_avatar(
+pub(crate) fn create_avatar(
     name: &str,
     email: &str,
     photo: Option<&[u8]>,
