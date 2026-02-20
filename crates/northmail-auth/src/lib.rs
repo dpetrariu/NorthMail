@@ -148,16 +148,22 @@ impl AuthManager {
                 Ok(XOAuth2Token::new(&account.email, &access_token))
             }
             AuthMethod::OAuth2 { email } => {
-                let tokens = self
+                let mut tokens = self
                     .secret_store
                     .get_tokens(email)
                     .await?
                     .ok_or_else(|| AuthError::TokenNotFound(email.clone()))?;
 
-                // Check if token needs refresh
+                // Refresh expired token if we have a refresh token
                 if tokens.is_expired() {
-                    // TODO: Implement token refresh
-                    return Err(AuthError::TokenExpired);
+                    let refresh_token = tokens.refresh_token.as_ref()
+                        .ok_or(AuthError::TokenExpired)?;
+
+                    // Use Gmail config by default (only standalone OAuth2 provider currently)
+                    let config = gmail::oauth2_config("");
+                    let flow = OAuth2Flow::new(config)?;
+                    tokens = flow.refresh_token(refresh_token).await?;
+                    self.secret_store.store_tokens(email, &tokens).await?;
                 }
 
                 Ok(XOAuth2Token::new(email, &tokens.access_token))

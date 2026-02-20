@@ -49,7 +49,7 @@ install_data(
 icon_sizes = ['16x16', '32x32', '48x48', '64x64', '128x128', '256x256', '512x512']
 foreach size : icon_sizes
   install_data(
-    'data' / 'icons' / 'hicolor' / size / 'apps' / 'org.northmail.NorthMail.png',
+    'data' / 'icons' / 'hicolor' / size / 'apps' / 'org.northmail.NorthMail.svg',
     install_dir: datadir / 'icons' / 'hicolor' / size / 'apps',
   )
 endforeach
@@ -84,7 +84,7 @@ else
 endif
 
 cargo_env = environment()
-cargo_env.set('CARGO_HOME', meson.project_build_root() / 'cargo-home')
+cargo_env.set('CARGO_HOME', meson.project_source_root() / 'cargo')
 
 cargo_build = custom_target(
   'cargo-build',

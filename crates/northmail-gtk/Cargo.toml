@@ -39,6 +39,7 @@ northmail-imap = { workspace = true }
 northmail-smtp = { workspace = true }
 northmail-graph = { workspace = true }
 reqwest = { workspace = true }
+ammonia = { workspace = true }
 regex = "1.12.3"
 urlencoding = "2.1.3"
 gettext-rs = "0.7"

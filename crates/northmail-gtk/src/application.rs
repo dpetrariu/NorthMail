@@ -16,6 +16,15 @@ use tracing::{debug, error, info, warn};
 
 const APP_ID: &str = "org.northmail.NorthMail";
 
+/// Resolve which icon to use: "email" if user chose system and theme has it, else custom
+fn resolve_app_icon(settings: &gio::Settings, theme: &gtk4::IconTheme) -> String {
+    if settings.string("app-icon") == "system" && theme.has_icon("email") {
+        "email".to_string()
+    } else {
+        "org.northmail.NorthMail".to_string()
+    }
+}
+
 /// Map a DB folder_type string to a GTK icon name
 fn folder_type_to_icon(folder_type: &str) -> &'static str {
     match folder_type {
@@ -424,6 +433,14 @@ mod imp {
 
             window.present();
 
+            // Set the header bar app icon to match the user's preference
+            {
+                let icon_settings = gio::Settings::new(APP_ID);
+                let theme = gtk4::IconTheme::for_display(&gtk4::gdk::Display::default().unwrap());
+                let icon_name = resolve_app_icon(&icon_settings, &theme);
+                window.imp().app_icon_image.set_icon_name(Some(&icon_name));
+            }
+
             // Load accounts on startup
             app.load_accounts();
 
@@ -445,6 +462,11 @@ mod imp {
             // Gracefully stop all IDLE workers
             if let Some(idle_manager) = self.idle_manager.get() {
                 idle_manager.shutdown();
+            }
+            // Clean up temp attachment files
+            let temp_dir = std::env::temp_dir().join("northmail-attachments");
+            if temp_dir.exists() {
+                let _ = std::fs::remove_dir_all(&temp_dir);
             }
             self.parent_shutdown();
         }
@@ -494,12 +516,24 @@ mod imp {
                 // Set the default window icon based on user preference
                 let icon_settings = gio::Settings::new(APP_ID);
                 let theme = gtk4::IconTheme::for_display(&gtk4::gdk::Display::default().unwrap());
-                let icon_name = if icon_settings.string("app-icon") == "system" && theme.has_icon("email") {
-                    "email"
-                } else {
-                    "org.northmail.NorthMail"
-                };
-                gtk4::Window::set_default_icon_name(icon_name);
+                let icon_name = resolve_app_icon(&icon_settings, &theme);
+                gtk4::Window::set_default_icon_name(&icon_name);
+
+                // Watch for icon theme changes (e.g. user switches theme)
+                // If "system" icon was selected but the new theme lacks it, fall back to custom
+                let app_weak = self.obj().downgrade();
+                theme.connect_changed(move |theme| {
+                    if let Some(app) = app_weak.upgrade() {
+                        let settings = gio::Settings::new(APP_ID);
+                        let icon = resolve_app_icon(&settings, theme);
+                        gtk4::Window::set_default_icon_name(&icon);
+                        if let Some(window) = app.active_window() {
+                            if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                                win.imp().app_icon_image.set_icon_name(Some(&icon));
+                            }
+                        }
+                    }
+                });
             }
 
             let app = self.obj();
@@ -6021,7 +6055,6 @@ impl NorthMailApplication {
             if let Some(mut cached) = cached_body.take() {
                 let has_empty_attachments = cached.attachments.iter().any(|a| a.data.is_empty() && a.size > 0);
                 if !has_empty_attachments {
-                    info!("📧 Using cached body for message {} (instant, all attachment data present)", uid);
                     callback(Ok(cached));
                     return;
                 }
@@ -6981,13 +7014,26 @@ impl NorthMailApplication {
 
             let data = attachment.contents().to_vec();
 
-            // Parts with Content-ID are inline resources for the HTML body (images, etc.)
-            // Collect them for cid: replacement, don't show as attachment pills
+            // Check Content-Disposition to distinguish inline vs attachment parts
+            let disposition = mail_parser::MimeHeaders::content_disposition(attachment);
+            let is_inline_disposition = disposition
+                .as_ref()
+                .map(|d| d.ctype().eq_ignore_ascii_case("inline"))
+                // No Content-Disposition: treat images with CID as inline, others as attachment
+                .unwrap_or_else(|| mime_lower.starts_with("image/"));
+
+            // Parts with Content-ID that are inline (images, etc.) go to cid_map for HTML replacement
+            // Parts with Content-ID but disposition=attachment are real attachments (Gmail adds CIDs to everything)
             if let Some(cid) = attachment.content_id() {
                 let cid_clean = cid.trim_start_matches('<').trim_end_matches('>').to_string();
-                debug!("parse_email_body: inline CID part: {} ({})", cid_clean, mime_type);
-                cid_map.push((cid_clean, mime_type, data));
-                continue;
+                if is_inline_disposition {
+                    debug!("parse_email_body: inline CID part: {} ({})", cid_clean, mime_type);
+                    cid_map.push((cid_clean, mime_type, data));
+                    continue;
+                }
+                // Attachment with CID: add to both cid_map (for HTML) and attachments list (for download)
+                debug!("parse_email_body: attachment with CID: {} ({})", cid_clean, mime_type);
+                cid_map.push((cid_clean.clone(), mime_type.clone(), data.clone()));
             }
 
             let filename = attachment
@@ -6996,12 +7042,13 @@ impl NorthMailApplication {
                 .to_string();
 
             let size = data.len();
+            let cid = attachment.content_id().map(|c| c.trim_start_matches('<').trim_end_matches('>').to_string());
             result.attachments.push(ParsedAttachment {
                 filename,
                 mime_type,
                 data,
                 size,
-                content_id: None,
+                content_id: cid,
             });
         }
 
@@ -7477,28 +7524,25 @@ impl NorthMailApplication {
             custom_btn.set_active(true);
         }
 
-        // Restart banner (hidden until icon choice changes)
-        let restart_box = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-        restart_box.set_halign(gtk4::Align::Center);
-        restart_box.set_margin_top(8);
-        restart_box.set_visible(false);
-
-        let restart_label = gtk4::Label::new(Some(&tr("Please restart for the changes to take effect.")));
-        restart_label.add_css_class("dim-label");
-        restart_box.append(&restart_label);
-
-        let initial_icon = current_icon.to_string();
-        let restart_box_ref = restart_box.clone();
         let settings_for_icon = self.settings();
+        let app_for_icon = self.clone();
         system_btn.connect_toggled(move |btn| {
-            let (value, icon) = if btn.is_active() {
-                ("system", "email")
-            } else {
-                ("custom", "org.northmail.NorthMail")
-            };
+            let value = if btn.is_active() { "system" } else { "custom" };
             let _ = settings_for_icon.set_string("app-icon", value);
-            gtk4::Window::set_default_icon_name(icon);
-            restart_box_ref.set_visible(value != initial_icon.as_str());
+
+            // Resolve icon with fallback (system icon may not exist in current theme)
+            let theme = gtk4::IconTheme::for_display(&gtk4::gdk::Display::default().unwrap());
+            let icon = resolve_app_icon(&settings_for_icon, &theme);
+            gtk4::Window::set_default_icon_name(&icon);
+
+            // Update the app icon in the header bar in real time
+            if let Some(window) = app_for_icon.active_window() {
+                if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                    win.imp().app_icon_image.set_icon_name(Some(&icon));
+                }
+            }
+
+            let icon = icon.as_str();
 
             // Update desktop file immediately so GNOME has the right icon on next launch
             if let Ok(home) = std::env::var("HOME") {
@@ -7528,7 +7572,6 @@ impl NorthMailApplication {
             .title(&tr("App Icon"))
             .build();
         icon_group.add(&icon_picker_box);
-        icon_group.add(&restart_box);
 
         general_page.add(&appearance_group);
         if has_system_email_icon {
@@ -8535,10 +8578,16 @@ impl NorthMailApplication {
             .and_then(|(_, _, photo)| photo.clone())
     }
 
-    /// Returns the favicon cache directory, creating it if needed
+    /// Returns the favicon cache directory, creating it if needed with restricted permissions
     fn favicon_cache_dir() -> std::path::PathBuf {
         let dir = glib::user_cache_dir().join("northmail").join("favicons");
-        let _ = std::fs::create_dir_all(&dir);
+        if std::fs::create_dir_all(&dir).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            }
+        }
         dir
     }
 
@@ -8605,11 +8654,22 @@ impl NorthMailApplication {
         });
     }
 
+    /// Sanitize a domain string for safe use as a cache filename
+    fn sanitize_domain_for_filename(domain: &str) -> String {
+        domain.chars()
+            .map(|c| match c {
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '.' => c,
+                _ => '_',
+            })
+            .collect()
+    }
+
     /// Inner async function that checks disk cache then fetches from network
     async fn fetch_favicon_inner(domain: &str) -> Option<Vec<u8>> {
         let cache_dir = Self::favicon_cache_dir();
-        let png_path = cache_dir.join(format!("{}.png", domain));
-        let none_path = cache_dir.join(format!("{}.none", domain));
+        let safe_name = Self::sanitize_domain_for_filename(domain);
+        let png_path = cache_dir.join(format!("{}.png", safe_name));
+        let none_path = cache_dir.join(format!("{}.none", safe_name));
 
         // Check disk cache
         if none_path.exists() {
@@ -8624,7 +8684,7 @@ impl NorthMailApplication {
         // Fetch from Google favicon service
         let url = format!(
             "https://www.google.com/s2/favicons?domain={}&sz=128",
-            domain
+            urlencoding::encode(domain)
         );
 
         let client = reqwest::Client::builder()
@@ -8642,6 +8702,12 @@ impl NorthMailApplication {
 
         // Reject tiny placeholders (Google returns ~120-byte default icon for unknown domains)
         if bytes.len() <= 200 {
+            let _ = std::fs::write(&none_path, b"");
+            return None;
+        }
+
+        // Reject oversized responses (max 512KB)
+        if bytes.len() > 512 * 1024 {
             let _ = std::fs::write(&none_path, b"");
             return None;
         }

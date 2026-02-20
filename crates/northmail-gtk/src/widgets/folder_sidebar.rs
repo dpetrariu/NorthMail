@@ -1354,12 +1354,20 @@ impl FolderSidebar {
     // ── Context menus ────────────────────────────────────────────────
 
     /// Create a context menu button, left-aligned, normal weight.
-    fn make_context_menu_item(vbox: &gtk4::Box, label: &str) -> gtk4::Button {
+    fn make_context_menu_item(vbox: &gtk4::Box, label: &str, icon_name: Option<&str>) -> gtk4::Button {
+        let content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        if let Some(icon) = icon_name {
+            let img = gtk4::Image::from_icon_name(icon);
+            img.set_pixel_size(16);
+            content.append(&img);
+        }
         let lbl = gtk4::Label::new(Some(label));
         lbl.set_xalign(0.0);
+        lbl.set_hexpand(true);
+        content.append(&lbl);
 
         let btn = gtk4::Button::new();
-        btn.set_child(Some(&lbl));
+        btn.set_child(Some(&content));
         btn.add_css_class("flat");
         btn.add_css_class("context-menu-item");
         btn.set_hexpand(true);
@@ -1393,7 +1401,7 @@ impl FolderSidebar {
 
         // "New Folder" — always available
         {
-            let btn = Self::make_context_menu_item(&vbox, &tr("New Folder"));
+            let btn = Self::make_context_menu_item(&vbox, &tr("New Folder"), Some("folder-new-symbolic"));
             let sidebar = self.clone();
             let aid = account_id.to_string();
             let fp = folder_path.to_string();
@@ -1406,7 +1414,7 @@ impl FolderSidebar {
 
         // "Rename" — disabled for system folders
         {
-            let btn = Self::make_context_menu_item(&vbox, &tr("Rename Folder"));
+            let btn = Self::make_context_menu_item(&vbox, &tr("Rename Folder"), Some("document-edit-symbolic"));
             btn.set_sensitive(!is_system);
             let sidebar = self.clone();
             let aid = account_id.to_string();
@@ -1421,7 +1429,7 @@ impl FolderSidebar {
 
         // "Delete" — disabled for system folders
         {
-            let btn = Self::make_context_menu_item(&vbox, &tr("Delete Folder"));
+            let btn = Self::make_context_menu_item(&vbox, &tr("Delete Folder"), Some("edit-delete-symbolic"));
             btn.set_sensitive(!is_system);
             let sidebar = self.clone();
             let aid = account_id.to_string();
@@ -1436,7 +1444,7 @@ impl FolderSidebar {
 
         // "Empty Trash" — only for trash folder
         if folder_type == "trash" {
-            let btn = Self::make_context_menu_item(&vbox, &tr("Empty Trash"));
+            let btn = Self::make_context_menu_item(&vbox, &tr("Empty Trash"), Some("user-trash-symbolic"));
             let sidebar = self.clone();
             let aid = account_id.to_string();
             let fp = folder_path.to_string();
@@ -1470,7 +1478,7 @@ impl FolderSidebar {
         vbox.set_margin_start(4);
         vbox.set_margin_end(4);
 
-        let btn = Self::make_context_menu_item(&vbox, &tr("New Folder"));
+        let btn = Self::make_context_menu_item(&vbox, &tr("New Folder"), Some("folder-new-symbolic"));
         let sidebar = self.clone();
         let aid = account_id.to_string();
         let pop = popover.clone();

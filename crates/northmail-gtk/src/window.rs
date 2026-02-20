@@ -2226,7 +2226,7 @@ impl NorthMailWindow {
             // Date on right — format nicely
             let formatted_date = if let Some(epoch) = msg.date_epoch {
                 glib::DateTime::from_unix_local(epoch)
-                    .and_then(|dt| dt.format("%b %d, %Y %H:%M"))
+                    .and_then(|dt| dt.format("%x %X"))
                     .map(|s| s.to_string())
                     .unwrap_or_else(|_| msg.date.clone())
             } else {
@@ -2466,18 +2466,27 @@ impl NorthMailWindow {
             {
                 use webkit6::prelude::WebViewExt;
 
-                /// Strip `<script>` tags and inline JS event handlers from email HTML
-                /// to prevent malicious JS execution while keeping our UserScript active.
+                /// Sanitize email HTML using ammonia to strip dangerous content
+                /// while preserving safe formatting tags for display.
                 fn sanitize_email_html(html: &str) -> String {
-                    // Remove <script>...</script> blocks (including multiline)
-                    let re_script = regex::Regex::new(r"(?is)<script[\s>].*?</script>").unwrap();
-                    let pass1 = re_script.replace_all(html, "");
-                    // Remove inline event handlers: on*="..." or on*='...'
-                    let re_on = regex::Regex::new(r#"(?i)\s+on\w+\s*=\s*(?:"[^"]*"|'[^']*')"#).unwrap();
-                    let pass2 = re_on.replace_all(&pass1, "");
-                    // Remove javascript: hrefs
-                    let re_js_href = regex::Regex::new(r##"(?i)href\s*=\s*(?:"javascript:[^"]*"|'javascript:[^']*')"##).unwrap();
-                    re_js_href.replace_all(&pass2, "href=\"#\"").into_owned()
+                    let mut builder = ammonia::Builder::default();
+                    // Allow <style> blocks: must remove from clean_content_tags first to avoid panic
+                    builder
+                        .rm_clean_content_tags(&["style"])
+                        .add_tags(&["style", "center", "font"])
+                        .add_tag_attributes("td", &["width", "height", "align", "valign", "bgcolor", "style", "colspan", "rowspan"])
+                        .add_tag_attributes("th", &["width", "height", "align", "valign", "bgcolor", "style", "colspan", "rowspan"])
+                        .add_tag_attributes("table", &["width", "height", "align", "border", "cellpadding", "cellspacing", "bgcolor", "style"])
+                        .add_tag_attributes("tr", &["bgcolor", "style", "align", "valign"])
+                        .add_tag_attributes("img", &["width", "height", "alt", "title", "style"])
+                        .add_tag_attributes("font", &["color", "size", "face"])
+                        .add_tag_attributes("div", &["style", "align", "dir"])
+                        .add_tag_attributes("span", &["style", "dir"])
+                        .add_tag_attributes("p", &["style", "align", "dir"])
+                        .add_tag_attributes("a", &["style", "title", "name"])
+                        .link_rel(Some("noopener noreferrer"))
+                        .url_schemes(std::collections::HashSet::from(["http".into(), "https".into(), "mailto".into(), "cid".into(), "data".into()]));
+                    builder.clean(html).to_string()
                 }
 
                 // Set up a UserContentManager to intercept link clicks via JS message handler
@@ -2529,12 +2538,18 @@ impl NorthMailWindow {
                     .build();
                 web_view.set_vexpand(true);
                 web_view.set_hexpand(true);
+                // Suppress WebKit's default context menu (Reload etc. would break load_html)
+                web_view.connect_context_menu(|_wv, _menu, _hit_test| {
+                    true // returning true = suppress default menu
+                });
                 if let Some(settings) = WebViewExt::settings(&web_view) {
                     settings.set_enable_javascript(true);  // Needed for our click interceptor
                     settings.set_auto_load_images(true);
                     settings.set_allow_modal_dialogs(false);
                     settings.set_enable_html5_database(false);
                     settings.set_enable_html5_local_storage(false);
+                    settings.set_allow_file_access_from_file_urls(false);
+                    settings.set_allow_universal_access_from_file_urls(false);
                 }
                 let body_box_crash = body_box.clone();
                 let html_fallback = html.clone();
@@ -3746,8 +3761,9 @@ impl NorthMailWindow {
                                 let _ = std::process::Command::new("xdg-open").arg(path).spawn();
                             } else {
                                 // Forwarded attachment - write to temp file first
-                                let temp_dir = std::env::temp_dir();
-                                let temp_path = temp_dir.join(&filename_for_open);
+                                let temp_dir = std::env::temp_dir().join("northmail-attachments");
+                                let _ = std::fs::create_dir_all(&temp_dir);
+                                let temp_path = temp_dir.join(sanitize_filename(&filename_for_open));
                                 if std::fs::write(&temp_path, &data_for_open).is_ok() {
                                     let _ = std::process::Command::new("xdg-open").arg(&temp_path).spawn();
                                 }
@@ -5118,6 +5134,17 @@ fn build_attachment_row(attachment: ParsedAttachment) -> adw::ActionRow {
     row
 }
 
+/// Sanitize a filename from untrusted email content to prevent path traversal
+fn sanitize_filename(filename: &str) -> String {
+    // Strip directory components and path traversal
+    let name = filename
+        .rsplit(['/', '\\']).next().unwrap_or(filename)
+        .replace("..", "_");
+    // Truncate to reasonable length
+    let name: String = name.chars().take(255).collect();
+    if name.is_empty() { "attachment".to_string() } else { name }
+}
+
 fn open_attachment(filename: &str, data: &Rc<Vec<u8>>, widget: &impl gtk4::prelude::IsA<gtk4::Widget>) {
     let temp_dir = std::env::temp_dir().join("northmail-attachments");
     if std::fs::create_dir_all(&temp_dir).is_err() {
@@ -5125,7 +5152,7 @@ fn open_attachment(filename: &str, data: &Rc<Vec<u8>>, widget: &impl gtk4::prelu
         return;
     }
 
-    let temp_path = temp_dir.join(filename);
+    let temp_path = temp_dir.join(sanitize_filename(filename));
     if let Err(e) = std::fs::write(&temp_path, data.as_slice()) {
         tracing::warn!("Failed to write temp attachment: {}", e);
         return;

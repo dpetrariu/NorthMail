@@ -16,32 +16,23 @@ fn escape_markup(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Format email date for display (like Apple Mail)
-/// Input: "Sat, 08 Feb 2025 14:30:45 +0000" or similar
-/// Output: "2:30 PM" (today), "Yesterday", "Feb 7", "12/25/24"
-fn format_date(date_str: &str) -> String {
-    // Try to parse the date
-    if let Some(formatted) = try_parse_email_date(date_str) {
-        return formatted;
+/// Format email date for display using system locale settings.
+/// Uses date_epoch (preferred) or falls back to parsing date_str.
+/// Output: locale time (today), "Yesterday", locale short date (this year), locale date (older)
+fn format_date(date_str: &str, date_epoch: Option<i64>) -> String {
+    // Try epoch-based formatting first (most reliable, locale-aware)
+    if let Some(epoch) = date_epoch {
+        if let Some(formatted) = format_date_from_epoch(epoch) {
+            return formatted;
+        }
     }
 
     // Fallback: just show a cleaned up version
-    // Remove timezone offset and seconds
     let cleaned = date_str
         .trim()
         .replace(" +0000", "")
         .replace(" -0000", "");
 
-    // Try to extract just time or date
-    if let Some(time_start) = cleaned.rfind(' ') {
-        let time_part = &cleaned[time_start + 1..];
-        // If it looks like a time (HH:MM:SS), strip seconds
-        if time_part.len() >= 5 && time_part.chars().nth(2) == Some(':') {
-            return time_part[..5].to_string();
-        }
-    }
-
-    // Just return first 10 chars or the whole thing
     if cleaned.len() > 16 {
         cleaned[..16].to_string()
     } else {
@@ -49,53 +40,46 @@ fn format_date(date_str: &str) -> String {
     }
 }
 
-fn try_parse_email_date(date_str: &str) -> Option<String> {
-    // Parse RFC 2822 style date: "Sat, 08 Feb 2025 14:30:45 +0000"
-    let parts: Vec<&str> = date_str.split_whitespace().collect();
+fn format_date_from_epoch(epoch: i64) -> Option<String> {
+    let dt = glib::DateTime::from_unix_local(epoch).ok()?;
+    let now = glib::DateTime::now_local().ok()?;
 
-    if parts.len() >= 5 {
-        // Extract components
-        let day: u32 = parts.get(1)?.parse().ok()?;
-        let month_str = *parts.get(2)?;
-        let year: i32 = parts.get(3)?.parse().ok()?;
-        let time_str = *parts.get(4)?;
+    let msg_year = dt.year();
+    let msg_day = dt.day_of_year();
+    let now_year = now.year();
+    let now_day = now.day_of_year();
 
-        // Parse time (HH:MM:SS)
-        let time_parts: Vec<&str> = time_str.split(':').collect();
-        let hour: u32 = time_parts.get(0)?.parse().ok()?;
-        let minute: u32 = time_parts.get(1)?.parse().ok()?;
-
-        // Get current date for comparison
-        let now = glib::DateTime::now_local().ok()?;
-        let today_day = now.day_of_month();
-        let today_month = now.month();
-        let today_year = now.year();
-
-        let month = match month_str.to_lowercase().as_str() {
-            "jan" => 1, "feb" => 2, "mar" => 3, "apr" => 4,
-            "may" => 5, "jun" => 6, "jul" => 7, "aug" => 8,
-            "sep" => 9, "oct" => 10, "nov" => 11, "dec" => 12,
-            _ => return None,
-        };
-
-        // Format based on how old the message is
-        if year == today_year && month == today_month && day as i32 == today_day {
-            // Today - show time
-            let hour_12 = if hour == 0 { 12 } else if hour > 12 { hour - 12 } else { hour };
-            let am_pm = if hour < 12 { tr("AM") } else { tr("PM") };
-            Some(format!("{}:{:02} {}", hour_12, minute, am_pm))
-        } else if year == today_year && month == today_month && day as i32 == today_day - 1 {
-            // Yesterday
-            Some(tr("Yesterday"))
-        } else if year == today_year {
-            // This year - show month and day
-            Some(format!("{} {}", month_str, day))
-        } else {
-            // Older - show short date
-            Some(format!("{}/{}/{}", month, day, year % 100))
-        }
+    if msg_year == now_year && msg_day == now_day {
+        // Today — show locale time (respects 12h/24h system setting)
+        dt.format("%X")
+            // Strip seconds from locale time (e.g. "14:30:45" → "14:30", "2:30:45 PM" → "2:30 PM")
+            .map(|s| {
+                let s = s.to_string();
+                // Remove :SS before optional AM/PM
+                if let Some(pos) = s.rfind(':') {
+                    let after = &s[pos + 1..];
+                    // Check if after the last colon there are exactly 2 digits (possibly followed by AM/PM)
+                    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if digits.len() == 2 {
+                        let remainder = &after[2..];
+                        format!("{}{}", &s[..pos], remainder)
+                    } else {
+                        s
+                    }
+                } else {
+                    s
+                }
+            })
+            .ok()
+    } else if msg_year == now_year && now_day - msg_day == 1 {
+        // Yesterday
+        Some(tr("Yesterday"))
+    } else if msg_year == now_year {
+        // This year — show locale month + day (e.g. "Feb 7" or "7 fév.")
+        dt.format("%b %-e").map(|s| s.to_string()).ok()
     } else {
-        None
+        // Older — show locale short date (e.g. "02/07/24" or "07.02.24")
+        dt.format("%x").map(|s| s.to_string()).ok()
     }
 }
 
@@ -1558,7 +1542,7 @@ impl MessageList {
         top_row.append(&sender_label);
 
         // Date (formatted nicely)
-        let formatted_date = format_date(&msg.date);
+        let formatted_date = format_date(&msg.date, msg.date_epoch);
         let date_label = gtk4::Label::builder()
             .label(&formatted_date)
             .css_classes(["dim-label", "caption"])

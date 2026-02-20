@@ -15,6 +15,11 @@ use std::time::Duration;
 
 type TlsStream = async_native_tls::TlsStream<TcpStream>;
 
+/// Escape a string for use in IMAP quoted strings (RFC 3501 §4.3)
+fn escape_imap_quoted(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// Event returned from IDLE mode
 #[derive(Debug, Clone, PartialEq)]
 pub enum IdleEvent {
@@ -244,7 +249,7 @@ impl SimpleImapClient {
     /// Select a folder
     pub async fn select(&mut self, folder: &str) -> ImapResult<Folder> {
         let tag = self.next_tag();
-        let cmd = format!("{} SELECT \"{}\"\r\n", tag, folder);
+        let cmd = format!("{} SELECT \"{}\"\r\n", tag, escape_imap_quoted(folder));
 
         let stream = self
             .stream
@@ -1257,7 +1262,7 @@ impl SimpleImapClient {
         let cmd = format!(
             "{} APPEND \"{}\"{} {{{}}}\r\n",
             tag,
-            folder,
+            escape_imap_quoted(folder),
             flags_str,
             message_data.len()
         );
@@ -1382,7 +1387,7 @@ impl SimpleImapClient {
     /// Copy a message to another folder by UID
     pub async fn uid_copy(&mut self, uid: u32, dest_folder: &str) -> ImapResult<()> {
         let tag = self.next_tag();
-        let cmd = format!("{} UID COPY {} \"{}\"\r\n", tag, uid, dest_folder);
+        let cmd = format!("{} UID COPY {} \"{}\"\r\n", tag, uid, escape_imap_quoted(dest_folder));
 
         let stream = self
             .stream
@@ -1620,7 +1625,7 @@ impl SimpleImapClient {
 
     pub async fn create_folder(&mut self, folder_path: &str) -> ImapResult<()> {
         let tag = self.next_tag();
-        let cmd = format!("{} CREATE \"{}\"\r\n", tag, folder_path);
+        let cmd = format!("{} CREATE \"{}\"\r\n", tag, escape_imap_quoted(folder_path));
 
         let stream = self
             .stream
@@ -1659,7 +1664,7 @@ impl SimpleImapClient {
     /// Rename a folder (mailbox) on the server
     pub async fn rename_folder(&mut self, from: &str, to: &str) -> ImapResult<()> {
         let tag = self.next_tag();
-        let cmd = format!("{} RENAME \"{}\" \"{}\"\r\n", tag, from, to);
+        let cmd = format!("{} RENAME \"{}\" \"{}\"\r\n", tag, escape_imap_quoted(from), escape_imap_quoted(to));
 
         let stream = self
             .stream
@@ -1698,7 +1703,7 @@ impl SimpleImapClient {
     /// Delete a folder (mailbox) from the server
     pub async fn delete_folder(&mut self, folder_path: &str) -> ImapResult<()> {
         let tag = self.next_tag();
-        let cmd = format!("{} DELETE \"{}\"\r\n", tag, folder_path);
+        let cmd = format!("{} DELETE \"{}\"\r\n", tag, escape_imap_quoted(folder_path));
 
         let stream = self
             .stream

@@ -1,7 +1,6 @@
 # Rust build artifacts
 /target/
 **/*.rs.bk
-Cargo.lock
 
 # IDE
 .idea/
@@ -15,6 +14,7 @@ Cargo.lock
 /_build/
 /builddir/
 /.flatpak-builder/
+/cargo/
 
 # Generated files
 *.o
