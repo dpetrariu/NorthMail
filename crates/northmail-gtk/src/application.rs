@@ -389,6 +389,10 @@ mod imp {
         /// UIDs pending IMAP deletion: (folder_id, uid) pairs
         /// Prevents re-insertion from cache/sync while IMAP move is in flight
         pub(super) pending_deletes: RefCell<HashSet<(i64, u32)>>,
+        /// In-memory cache of domain favicons: domain -> Some(png_bytes) or None (negative)
+        pub(super) favicon_cache: RefCell<HashMap<String, Option<Vec<u8>>>>,
+        /// Domains currently being fetched (dedup in-flight requests)
+        pub(super) favicon_fetch_in_progress: RefCell<HashSet<String>>,
     }
 
     #[glib::object_subclass]
@@ -489,7 +493,8 @@ mod imp {
 
                 // Set the default window icon based on user preference
                 let icon_settings = gio::Settings::new(APP_ID);
-                let icon_name = if icon_settings.string("app-icon") == "system" {
+                let theme = gtk4::IconTheme::for_display(&gtk4::gdk::Display::default().unwrap());
+                let icon_name = if icon_settings.string("app-icon") == "system" && theme.has_icon("email") {
                     "email"
                 } else {
                     "org.northmail.NorthMail"
@@ -518,13 +523,7 @@ mod imp {
             if desktop_src.exists() {
                 let _ = std::fs::create_dir_all(&desktop_dst_dir);
                 if let Ok(contents) = std::fs::read_to_string(&desktop_src) {
-                    // Determine which icon name to use from GSettings
-                    let icon_setting = gio::Settings::new(APP_ID);
-                    let desktop_icon = if icon_setting.string("app-icon") == "system" {
-                        "email"
-                    } else {
-                        "org.northmail.NorthMail"
-                    };
+                    let desktop_icon = "org.northmail.NorthMail";
                     // Rewrite Exec= and Icon= for the dev binary and icon preference
                     let exe = std::env::current_exe().unwrap_or_default();
                     let patched = contents
@@ -7437,7 +7436,10 @@ impl NorthMailApplication {
 
         appearance_group.add(&theme_row);
 
-        // App Icon picker
+        // App Icon picker — only shown when the current icon theme provides an "email" icon
+        let theme = gtk4::IconTheme::for_display(&gtk4::gdk::Display::default().unwrap());
+        let has_system_email_icon = theme.has_icon("email");
+
         let icon_picker_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
         icon_picker_box.set_halign(gtk4::Align::Center);
         icon_picker_box.set_margin_top(8);
@@ -7469,7 +7471,7 @@ impl NorthMailApplication {
         // Set initial state from GSettings
         let icon_settings = self.settings();
         let current_icon = icon_settings.string("app-icon");
-        if current_icon == "system" {
+        if current_icon == "system" && has_system_email_icon {
             system_btn.set_active(true);
         } else {
             custom_btn.set_active(true);
@@ -7529,7 +7531,9 @@ impl NorthMailApplication {
         icon_group.add(&restart_box);
 
         general_page.add(&appearance_group);
-        general_page.add(&icon_group);
+        if has_system_email_icon {
+            general_page.add(&icon_group);
+        }
 
         // Sync group
         let sync_group = adw::PreferencesGroup::builder()
@@ -8529,6 +8533,122 @@ impl NorthMailApplication {
             .iter()
             .find(|(_, e, _)| e.to_lowercase() == email_lower)
             .and_then(|(_, _, photo)| photo.clone())
+    }
+
+    /// Returns the favicon cache directory, creating it if needed
+    fn favicon_cache_dir() -> std::path::PathBuf {
+        let dir = glib::user_cache_dir().join("northmail").join("favicons");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// Fetch a domain favicon asynchronously. Calls `callback` on the main thread
+    /// with `Some(png_bytes)` on success or `None` on failure/unknown domain.
+    /// Uses in-memory + on-disk caching. Skips if already in progress for this domain.
+    pub fn fetch_favicon_async(
+        &self,
+        domain: &str,
+        callback: impl FnOnce(Option<Vec<u8>>) + 'static,
+    ) {
+        let domain = domain.to_lowercase();
+
+        // 1. Check in-memory cache
+        {
+            let cache = self.imp().favicon_cache.borrow();
+            if let Some(entry) = cache.get(&domain) {
+                callback(entry.clone());
+                return;
+            }
+        }
+
+        // 2. Skip if already fetching this domain
+        {
+            let mut in_progress = self.imp().favicon_fetch_in_progress.borrow_mut();
+            if in_progress.contains(&domain) {
+                return;
+            }
+            in_progress.insert(domain.clone());
+        }
+
+        let app = self.clone();
+        let domain_clone = domain.clone();
+
+        glib::spawn_future_local(async move {
+            let (sender, receiver) = std::sync::mpsc::channel::<Option<Vec<u8>>>();
+            let domain_for_thread = domain_clone.clone();
+
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let result = Self::fetch_favicon_inner(&domain_for_thread).await;
+                    let _ = sender.send(result);
+                });
+            });
+
+            // Poll for result
+            let result = loop {
+                match receiver.try_recv() {
+                    Ok(result) => break result,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        glib::timeout_future(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        break None;
+                    }
+                }
+            };
+
+            // Update caches and call back
+            app.imp().favicon_cache.borrow_mut().insert(domain_clone.clone(), result.clone());
+            app.imp().favicon_fetch_in_progress.borrow_mut().remove(&domain_clone);
+            callback(result);
+        });
+    }
+
+    /// Inner async function that checks disk cache then fetches from network
+    async fn fetch_favicon_inner(domain: &str) -> Option<Vec<u8>> {
+        let cache_dir = Self::favicon_cache_dir();
+        let png_path = cache_dir.join(format!("{}.png", domain));
+        let none_path = cache_dir.join(format!("{}.none", domain));
+
+        // Check disk cache
+        if none_path.exists() {
+            return None;
+        }
+        if let Ok(bytes) = std::fs::read(&png_path) {
+            if !bytes.is_empty() {
+                return Some(bytes);
+            }
+        }
+
+        // Fetch from Google favicon service
+        let url = format!(
+            "https://www.google.com/s2/favicons?domain={}&sz=128",
+            domain
+        );
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .ok()?;
+
+        let resp = client.get(&url).send().await.ok()?;
+        if !resp.status().is_success() {
+            let _ = std::fs::write(&none_path, b"");
+            return None;
+        }
+
+        let bytes = resp.bytes().await.ok()?;
+
+        // Reject tiny placeholders (Google returns ~120-byte default icon for unknown domains)
+        if bytes.len() <= 200 {
+            let _ = std::fs::write(&none_path, b"");
+            return None;
+        }
+
+        let data = bytes.to_vec();
+        let _ = std::fs::write(&png_path, &data);
+        Some(data)
     }
 
     /// Fetch ALL contacts from EDS address books (called once at startup)

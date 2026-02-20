@@ -5,7 +5,7 @@ use crate::widgets::{FolderSidebar, MessageList, MessageView};
 use gtk4::{gio, glib, prelude::*, subclass::prelude::*};
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use tracing::debug;
 
@@ -147,8 +147,61 @@ fn get_initials(name: &str, email: &str) -> String {
     }
 }
 
-/// Create an avatar widget with contact photo or colored initials
-fn create_avatar(name: &str, email: &str, photo: Option<&[u8]>) -> gtk4::Widget {
+/// Extract the registrable domain from a full domain string.
+/// e.g. "accounts.nintendo.com" → "nintendo.com", "mail.co.uk" → "mail.co.uk"
+fn base_domain(domain: &str) -> &str {
+    // Common two-part TLDs where the registrable domain needs 3 segments
+    const TWO_PART_TLDS: &[&str] = &[
+        "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "net.uk",
+        "co.jp", "or.jp", "ne.jp", "ac.jp", "go.jp",
+        "com.au", "net.au", "org.au", "edu.au",
+        "com.br", "org.br", "net.br",
+        "co.nz", "net.nz", "org.nz",
+        "co.kr", "or.kr", "ne.kr",
+        "co.in", "net.in", "org.in",
+        "com.mx", "org.mx", "net.mx",
+        "co.za", "org.za", "net.za",
+        "com.cn", "net.cn", "org.cn",
+        "com.tw", "org.tw", "net.tw",
+        "co.il", "org.il", "net.il",
+        "com.ar", "org.ar", "net.ar",
+        "com.tr", "org.tr", "net.tr",
+    ];
+
+    let parts: Vec<&str> = domain.split('.').collect();
+    if parts.len() <= 2 {
+        return domain;
+    }
+
+    // Check if it ends with a two-part TLD
+    let suffix = format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1]);
+    if TWO_PART_TLDS.contains(&suffix.as_str()) {
+        if parts.len() <= 3 {
+            return domain;
+        }
+        // Take last 3 parts: "x.co.uk"
+        let start = domain.len()
+            - parts[parts.len() - 3].len()
+            - 1 - parts[parts.len() - 2].len()
+            - 1 - parts[parts.len() - 1].len();
+        return &domain[start..];
+    }
+
+    // Take last 2 parts: "nintendo.com"
+    let start = domain.len()
+        - parts[parts.len() - 2].len()
+        - 1 - parts[parts.len() - 1].len();
+    &domain[start..]
+}
+
+/// Create an avatar widget with contact photo or colored initials.
+/// Returns `(widget, Option<favicon_slot>)`. If the contact has a photo, favicon_slot is None.
+/// Otherwise, favicon_slot is a shared slot that can be filled later to swap initials for a favicon.
+fn create_avatar(
+    name: &str,
+    email: &str,
+    photo: Option<&[u8]>,
+) -> (gtk4::Widget, Option<(gtk4::DrawingArea, Rc<RefCell<Option<gtk4::cairo::ImageSurface>>>)>) {
     // Try to create a texture from photo bytes
     let texture = photo.and_then(|bytes| {
         let gbytes = glib::Bytes::from(bytes);
@@ -198,13 +251,15 @@ fn create_avatar(name: &str, email: &str, photo: Option<&[u8]>) -> gtk4::Widget 
                 let _ = cr.paint();
             });
 
-            return drawing_area.upcast();
+            return (drawing_area.upcast(), None);
         }
     }
 
-    // Fallback: colored initials
+    // Fallback: colored initials (with favicon slot for async upgrade)
     let initials = get_initials(name, email);
     let (r, g, b) = string_to_avatar_color(email);
+    let favicon_slot: Rc<RefCell<Option<gtk4::cairo::ImageSurface>>> = Rc::new(RefCell::new(None));
+    let slot_for_draw = favicon_slot.clone();
 
     let drawing_area = gtk4::DrawingArea::builder()
         .width_request(40)
@@ -213,10 +268,30 @@ fn create_avatar(name: &str, email: &str, photo: Option<&[u8]>) -> gtk4::Widget 
         .build();
 
     drawing_area.set_draw_func(move |_, cr, width, height| {
-        let radius = (width.min(height) as f64) / 2.0;
+        let size = width.min(height) as f64;
+        let radius = size / 2.0;
         let cx = width as f64 / 2.0;
         let cy = height as f64 / 2.0;
 
+        // Check if a favicon has been loaded
+        if let Some(ref surface) = *slot_for_draw.borrow() {
+            cr.arc(cx, cy, radius, 0.0, 2.0 * std::f64::consts::PI);
+            let _ = cr.clip();
+
+            let surf_w = surface.width() as f64;
+            let surf_h = surface.height() as f64;
+            let scale = size / surf_w.min(surf_h);
+            let offset_x = cx - (surf_w * scale) / 2.0;
+            let offset_y = cy - (surf_h * scale) / 2.0;
+
+            cr.translate(offset_x, offset_y);
+            cr.scale(scale, scale);
+            cr.set_source_surface(surface, 0.0, 0.0).expect("set_source_surface");
+            let _ = cr.paint();
+            return;
+        }
+
+        // Draw colored initials
         cr.arc(cx, cy, radius, 0.0, 2.0 * std::f64::consts::PI);
         cr.set_source_rgb(r, g, b);
         let _ = cr.fill();
@@ -233,7 +308,7 @@ fn create_avatar(name: &str, email: &str, photo: Option<&[u8]>) -> gtk4::Widget 
         let _ = cr.show_text(&initials);
     });
 
-    drawing_area.upcast()
+    (drawing_area.clone().upcast(), Some((drawing_area, favicon_slot)))
 }
 
 mod imp {
@@ -398,12 +473,6 @@ mod imp {
     impl ObjectImpl for NorthMailWindow {
         fn constructed(&self) {
             self.parent_constructed();
-
-            // Set header bar icon based on user preference
-            let icon_settings = gio::Settings::new("org.northmail.NorthMail");
-            if icon_settings.string("app-icon") == "system" {
-                self.app_icon_image.set_icon_name(Some("email"));
-            }
 
             let obj = self.obj();
             obj.setup_widgets();
@@ -703,7 +772,7 @@ impl NorthMailWindow {
              }
              /* Star button styling */
              .star-button {
-                 color: alpha(@window_fg_color, 0.3);
+                 color: alpha(@window_fg_color, 0.55);
                  min-width: 24px;
                  min-height: 24px;
                  padding: 2px;
@@ -729,6 +798,16 @@ impl NorthMailWindow {
              }
              row:selected .star-button:hover {
                  color: #f5c211;
+             }
+             /* Read/unread button styling — matches star-button off state */
+             .read-button {
+                 color: alpha(@window_fg_color, 0.55);
+                 min-width: 24px;
+                 min-height: 24px;
+                 padding: 2px;
+             }
+             .read-button:hover {
+                 color: @window_fg_color;
              }
              /* Star indicator in message list */
              .star-indicator {
@@ -1797,7 +1876,7 @@ impl NorthMailWindow {
             let read_button = gtk4::Button::builder()
                 .icon_name(if msg.is_read { "mail-unread-symbolic" } else { "mail-read-symbolic" })
                 .tooltip_text(&read_tooltip)
-                .css_classes(["flat", "dim-label"])
+                .css_classes(["flat", "read-button"])
                 .build();
             // Track current read state in a Cell so clicked handler can toggle it
             let is_read_state = Rc::new(Cell::new(msg.is_read));
@@ -1886,11 +1965,44 @@ impl NorthMailWindow {
 
                 (email, name)
             };
-            let contact_photo = self.application()
-                .and_then(|app| app.downcast_ref::<NorthMailApplication>().cloned())
+            let app_ref = self.application()
+                .and_then(|app| app.downcast_ref::<NorthMailApplication>().cloned());
+            let contact_photo = app_ref.as_ref()
                 .and_then(|app| app.get_contact_photo(&from_email));
-            let avatar = create_avatar(&from_name, &from_email, contact_photo.as_deref());
+            let (avatar, favicon_slot) = create_avatar(&from_name, &from_email, contact_photo.as_deref());
             sender_row.append(&avatar);
+
+            // If no contact photo, try fetching a domain favicon
+            if let (Some((drawing_area, slot)), Some(app)) = (favicon_slot, app_ref) {
+                if let Some(domain) = from_email.rsplit('@').next().map(base_domain) {
+                    let da = drawing_area.clone();
+                    let slot_cb = slot.clone();
+                    app.fetch_favicon_async(domain, move |png_bytes| {
+                        if let Some(bytes) = png_bytes {
+                            let gbytes = glib::Bytes::from(&bytes);
+                            if let Ok(tex) = gtk4::gdk::Texture::from_bytes(&gbytes) {
+                                let tw = tex.width();
+                                let th = tex.height();
+                                let stride = gtk4::cairo::Format::ARgb32
+                                    .stride_for_width(tw as u32)
+                                    .unwrap_or(tw * 4);
+                                let mut pixel_data = vec![0u8; (stride * th) as usize];
+                                tex.download(&mut pixel_data, stride as usize);
+                                if let Ok(surface) = gtk4::cairo::ImageSurface::create_for_data(
+                                    pixel_data,
+                                    gtk4::cairo::Format::ARgb32,
+                                    tw,
+                                    th,
+                                    stride,
+                                ) {
+                                    *slot_cb.borrow_mut() = Some(surface);
+                                    da.queue_draw();
+                                }
+                            }
+                        }
+                    });
+                }
+            }
 
             // Sender name and email (clickable to compose)
             let sender_info = gtk4::Box::builder()
