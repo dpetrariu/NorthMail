@@ -2356,6 +2356,12 @@ impl NorthMailWindow {
                 if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
                     let msg_folder_id = if msg.folder_id != 0 { Some(msg.folder_id) } else { None };
                     app.fetch_message_body(uid, msg_folder_id, move |result| {
+                        // Guard: skip if user has already navigated to a different message
+                        if *window_for_fetch.imp().current_message_uid.borrow() != Some(uid) {
+                            debug!("Body fetch for UID {} arrived but user moved on, discarding", uid);
+                            return;
+                        }
+
                         // Clear loading indicator
                         while let Some(child) = body_box_ref.first_child() {
                             body_box_ref.remove(&child);
@@ -2400,6 +2406,9 @@ impl NorthMailWindow {
                                     if let Some(app) = window_retry.application() {
                                         if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
                                             app.fetch_message_body(uid_retry, folder_id_retry, move |result| {
+                                                if *window_retry.imp().current_message_uid.borrow() != Some(uid_retry) {
+                                                    return;
+                                                }
                                                 while let Some(child) = body_box_retry.first_child() {
                                                     body_box_retry.remove(&child);
                                                 }
@@ -2708,6 +2717,9 @@ impl NorthMailWindow {
             if let Some(app) = window_for_retry.application() {
                 if let Some(app) = app.downcast_ref::<NorthMailApplication>() {
                     app.fetch_message_body(uid, msg_folder_id, move |result| {
+                        if *w.imp().current_message_uid.borrow() != Some(uid) {
+                            return;
+                        }
                         while let Some(child) = bb.first_child() {
                             bb.remove(&child);
                         }
