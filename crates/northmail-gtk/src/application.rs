@@ -3148,10 +3148,11 @@ impl NorthMailApplication {
                         .iter()
                         .map(|account| {
                             let is_supported = Self::is_supported_account(account);
+                            let label = account.display_label();
                             let email_display = if is_supported {
-                                account.email.clone()
+                                label.to_string()
                             } else {
-                                format!("{} ({})", account.email, tr("unsupported"))
+                                format!("{} ({})", label, tr("unsupported"))
                             };
 
                             let db_folders = cached_folders_map
@@ -3230,10 +3231,11 @@ impl NorthMailApplication {
                             .iter()
                             .map(|account| {
                                 let is_supported = Self::is_supported_account(account);
+                                let label = account.display_label();
                                 let email_display = if is_supported {
-                                    account.email.clone()
+                                    label.to_string()
                                 } else {
-                                    format!("{} ({})", account.email, tr("unsupported"))
+                                    format!("{} ({})", label, tr("unsupported"))
                                 };
 
                                 let db_folders = cached_folders_map
@@ -3289,15 +3291,18 @@ impl NorthMailApplication {
     }
 
     /// Load cached messages for a folder from the database
-    /// Runs database operations in a tokio runtime since sqlx requires it
+    /// Runs database operations in a tokio runtime since sqlx requires it.
+    /// When a filter is active, applies it to the initial load.
     async fn load_cached_messages(
         &self,
         account_id: &str,
         folder_path: &str,
+        filter: &northmail_core::models::MessageFilter,
     ) -> Option<(i64, Vec<MessageInfo>)> {
         let db = self.database()?.clone();
         let account_id_str = account_id.to_string();
         let folder_path_str = folder_path.to_string();
+        let f = filter.clone();
 
         // Run database operations in a thread with tokio runtime
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -3310,8 +3315,12 @@ impl NorthMailApplication {
                     .get_or_create_folder_id(&account_id_str, &folder_path_str)
                     .await?;
 
-                // Load cached messages
-                let messages = db.get_messages(folder_id, 100, 0).await?;
+                // Load cached messages, applying filter if active
+                let messages = if f.is_active() {
+                    db.get_messages_filtered(folder_id, 100, 0, &f).await?
+                } else {
+                    db.get_messages(folder_id, 100, 0).await?
+                };
                 Ok::<_, northmail_core::CoreError>((folder_id, messages))
             });
             let _ = sender.send(result);
@@ -3365,24 +3374,37 @@ impl NorthMailApplication {
     }
 
     /// Check if cache has more messages beyond what's loaded
-    async fn check_cache_has_more(&self, folder_id: i64, loaded_count: i64) -> bool {
+    async fn check_cache_has_more(&self, folder_id: i64, loaded_count: i64, filter: &northmail_core::models::MessageFilter) -> bool {
         let db = match self.database() {
             Some(db) => db.clone(),
             None => return false,
         };
 
         let starred_aid = self.imp().starred_account_id.borrow().clone();
+        let f = filter.clone();
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = match folder_id {
-                -1 => rt.block_on(db.get_inbox_message_count()),
-                -2 => rt.block_on(db.get_starred_count()),
-                -3 => {
-                    let aid = starred_aid.as_deref().unwrap_or("");
-                    rt.block_on(db.get_starred_count_for_account(aid))
+            let result = if f.is_active() {
+                match folder_id {
+                    -1 => rt.block_on(db.get_inbox_messages_filtered_count(&f)),
+                    -2 => rt.block_on(db.get_starred_messages_filtered_count(&f)),
+                    -3 => {
+                        let aid = starred_aid.as_deref().unwrap_or("");
+                        rt.block_on(db.get_starred_count_for_account_filtered(aid, &f))
+                    }
+                    _ => rt.block_on(db.get_messages_filtered_count(folder_id, &f)),
                 }
-                _ => rt.block_on(db.get_message_count(folder_id)),
+            } else {
+                match folder_id {
+                    -1 => rt.block_on(db.get_inbox_message_count()),
+                    -2 => rt.block_on(db.get_starred_count()),
+                    -3 => {
+                        let aid = starred_aid.as_deref().unwrap_or("");
+                        rt.block_on(db.get_starred_count_for_account(aid))
+                    }
+                    _ => rt.block_on(db.get_message_count(folder_id)),
+                }
             };
             let _ = sender.send(result);
         });
@@ -3705,12 +3727,15 @@ impl NorthMailApplication {
         let generation = self.imp().fetch_generation.get() + 1;
         self.imp().fetch_generation.set(generation);
 
+        // Read filter state before async block so initial load respects it
+        let filter = self.current_filter();
+
         glib::spawn_future_local(async move {
             info!("Fetching messages for {}/{}", account_email, folder_path);
 
             // Phase 1: Try to load from cache first (instant display)
             let has_cache = if let Some((folder_id, cached_messages)) = app
-                .load_cached_messages(&account_id, &folder_path)
+                .load_cached_messages(&account_id, &folder_path, &filter)
                 .await
             {
                 let loaded_count = cached_messages.len() as i64;
@@ -3753,7 +3778,7 @@ impl NorthMailApplication {
                             });
 
                             // Check if there are more messages in cache
-                            let has_more = app.check_cache_has_more(folder_id, loaded_count).await;
+                            let has_more = app.check_cache_has_more(folder_id, loaded_count, &filter).await;
                             message_list.set_can_load_more(has_more);
                         }
                     }
@@ -5025,7 +5050,8 @@ impl NorthMailApplication {
                         let cache_folder_id = app.imp().cache_folder_id.get();
                         let cache_offset = app.imp().cache_offset.get();
                         if cache_folder_id > 0 {
-                            let has_more = app.check_cache_has_more(cache_folder_id, cache_offset).await;
+                            let current_filter = app.current_filter();
+                            let has_more = app.check_cache_has_more(cache_folder_id, cache_offset, &current_filter).await;
                             if let Some(window) = app.active_window() {
                                 if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
                                     if let Some(message_list) = win.message_list() {
@@ -5106,7 +5132,8 @@ impl NorthMailApplication {
                         let cache_folder_id = app.imp().cache_folder_id.get();
                         let cache_offset = app.imp().cache_offset.get();
                         if cache_folder_id > 0 {
-                            let has_more = app.check_cache_has_more(cache_folder_id, cache_offset).await;
+                            let current_filter = app.current_filter();
+                            let has_more = app.check_cache_has_more(cache_folder_id, cache_offset, &current_filter).await;
                             if let Some(window) = app.active_window() {
                                 if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
                                     if let Some(message_list) = win.message_list() {
@@ -5486,16 +5513,27 @@ impl NorthMailApplication {
             }
         };
 
+        // Read filter state so initial load respects it
+        let filter = self.current_filter();
+
         glib::spawn_future_local(async move {
             info!("Fetching unified inbox (all accounts)");
 
             let (sender, receiver) = std::sync::mpsc::channel();
+            let f = filter.clone();
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 let result = rt.block_on(async {
-                    let messages = db.get_inbox_messages(100, 0).await?;
-                    let total = db.get_inbox_message_count().await?;
+                    let (messages, total) = if f.is_active() {
+                        let msgs = db.get_inbox_messages_filtered(100, 0, &f).await?;
+                        let count = db.get_inbox_messages_filtered_count(&f).await?;
+                        (msgs, count)
+                    } else {
+                        let msgs = db.get_inbox_messages(100, 0).await?;
+                        let count = db.get_inbox_message_count().await?;
+                        (msgs, count)
+                    };
                     Ok::<_, northmail_core::CoreError>((messages, total))
                 });
                 let _ = sender.send(result);
@@ -5585,16 +5623,26 @@ impl NorthMailApplication {
             }
         };
 
+        let filter = self.current_filter();
+
         glib::spawn_future_local(async move {
             info!("Fetching starred messages (all accounts)");
 
             let (sender, receiver) = std::sync::mpsc::channel();
+            let f = filter.clone();
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 let result = rt.block_on(async {
-                    let messages = db.get_starred_messages(100, 0).await?;
-                    let total = db.get_starred_count().await?;
+                    let (messages, total) = if f.is_active() {
+                        let msgs = db.get_starred_messages_filtered(100, 0, &f).await?;
+                        let count = db.get_starred_messages_filtered_count(&f).await?;
+                        (msgs, count)
+                    } else {
+                        let msgs = db.get_starred_messages(100, 0).await?;
+                        let count = db.get_starred_count().await?;
+                        (msgs, count)
+                    };
                     Ok::<_, northmail_core::CoreError>((messages, total))
                 });
                 let _ = sender.send(result);
@@ -5683,17 +5731,27 @@ impl NorthMailApplication {
             }
         };
 
+        let filter = self.current_filter();
+
         glib::spawn_future_local(async move {
             info!("Fetching starred messages for account {}", account_id_owned);
 
             let (sender, receiver) = std::sync::mpsc::channel();
             let aid = account_id_owned.clone();
+            let f = filter.clone();
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 let result = rt.block_on(async {
-                    let messages = db.get_starred_messages_for_account(&aid, 100, 0).await?;
-                    let total = db.get_starred_count_for_account(&aid).await?;
+                    let (messages, total) = if f.is_active() {
+                        let msgs = db.get_starred_messages_for_account_filtered(&aid, 100, 0, &f).await?;
+                        let count = db.get_starred_count_for_account_filtered(&aid, &f).await?;
+                        (msgs, count)
+                    } else {
+                        let msgs = db.get_starred_messages_for_account(&aid, 100, 0).await?;
+                        let count = db.get_starred_count_for_account(&aid).await?;
+                        (msgs, count)
+                    };
                     Ok::<_, northmail_core::CoreError>((messages, total))
                 });
                 let _ = sender.send(result);
@@ -5748,6 +5806,19 @@ impl NorthMailApplication {
                 }
             }
         });
+    }
+
+    /// Read the current filter state from the message list widget.
+    /// Returns a default (inactive) filter if no window/message list is available.
+    fn current_filter(&self) -> northmail_core::models::MessageFilter {
+        if let Some(window) = self.active_window() {
+            if let Some(win) = window.downcast_ref::<NorthMailWindow>() {
+                if let Some(ml) = win.message_list() {
+                    return ml.get_message_filter();
+                }
+            }
+        }
+        northmail_core::models::MessageFilter::default()
     }
 
     /// Handle filter-changed: re-query DB with current filter state

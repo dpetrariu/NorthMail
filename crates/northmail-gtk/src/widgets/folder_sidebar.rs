@@ -421,8 +421,8 @@ impl FolderSidebar {
             .folders-list .section-header-label {
                 font-weight: normal;
             }
-            /* Folder entries and headers - smaller font */
-            .folders-list > row * {
+            /* Folder entries and headers - smaller font (exclude popovers) */
+            .folders-list > row *:not(popover *) {
                 font-size: 0.9em;
             }
             .folders-list .folder-entry-row {

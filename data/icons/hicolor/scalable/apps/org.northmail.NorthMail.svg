@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <!-- Envelope body gradient: darker blue at bottom, lighter at top -->
+    <linearGradient id="bodyGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#62a0ea"/>
+      <stop offset="1" stop-color="#1a5fb4"/>
+    </linearGradient>
+    <!-- Front face gradient -->
+    <linearGradient id="frontGrad" x1="0.5" y1="0" x2="0.5" y2="1">
+      <stop offset="0" stop-color="#3584e4"/>
+      <stop offset="0.5" stop-color="#1c71d8"/>
+      <stop offset="1" stop-color="#1a5fb4"/>
+    </linearGradient>
+    <!-- Flap gradient: white to light grey -->
+    <linearGradient id="flapGrad" x1="0.5" y1="0" x2="0.5" y2="1">
+      <stop offset="0" stop-color="#f6f5f4"/>
+      <stop offset="0.6" stop-color="#deddda"/>
+      <stop offset="1" stop-color="#c0bfbc"/>
+    </linearGradient>
+    <!-- Inner shadow on flap -->
+    <linearGradient id="flapShadow" x1="0.5" y1="0" x2="0.5" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.5"/>
+      <stop offset="1" stop-color="#000000" stop-opacity="0.08"/>
+    </linearGradient>
+    <!-- Left side panel gradient -->
+    <linearGradient id="leftGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#1a5fb4"/>
+      <stop offset="1" stop-color="#3584e4"/>
+    </linearGradient>
+    <!-- Right side panel gradient -->
+    <linearGradient id="rightGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#3584e4"/>
+      <stop offset="1" stop-color="#62a0ea"/>
+    </linearGradient>
+    <!-- Drop shadow -->
+    <filter id="shadow" x="-5%" y="-5%" width="110%" height="115%">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#000" flood-opacity="0.25"/>
+    </filter>
+  </defs>
+
+  <!-- Envelope group with shadow -->
+  <g filter="url(#shadow)">
+    <!-- Back panel (blue envelope body) -->
+    <rect x="56" y="128" width="400" height="280" rx="24" ry="24" fill="url(#bodyGrad)"/>
+
+    <!-- Front bottom panel (darker blue, the triangular fold) -->
+    <path d="M56,180 L256,340 L456,180 L456,384 Q456,408 432,408 L80,408 Q56,408 56,384 Z" fill="url(#frontGrad)"/>
+
+    <!-- Left triangular panel -->
+    <path d="M56,148 L56,384 Q56,408 80,408 L256,340 Z" fill="url(#leftGrad)" opacity="0.3"/>
+
+    <!-- Right triangular panel -->
+    <path d="M456,148 L456,384 Q456,408 432,408 L256,340 Z" fill="url(#rightGrad)" opacity="0.3"/>
+
+    <!-- Front V-fold overlay for depth -->
+    <path d="M56,180 L256,340 L456,180 L456,384 Q456,408 432,408 L80,408 Q56,408 56,384 Z" fill="url(#frontGrad)" opacity="0.7"/>
+
+    <!-- Top flap (white/grey, folded down as V) -->
+    <path d="M80,128 Q56,128 56,152 L56,160 L256,310 L456,160 L456,152 Q456,128 432,128 Z" fill="url(#flapGrad)"/>
+
+    <!-- Flap highlight line -->
+    <path d="M80,128 Q56,128 56,152 L56,160 L256,310 L456,160 L456,152 Q456,128 432,128 Z" fill="url(#flapShadow)" opacity="0.4"/>
+
+    <!-- Subtle edge highlight on flap -->
+    <path d="M60,155 L256,302 L452,155" fill="none" stroke="#ffffff" stroke-width="1" opacity="0.3"/>
+
+    <!-- Bottom fold line highlight -->
+    <path d="M56,180 L256,340 L456,180" fill="none" stroke="#ffffff" stroke-width="0.5" opacity="0.2"/>
+  </g>
+</svg>

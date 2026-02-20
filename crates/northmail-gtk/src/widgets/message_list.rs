@@ -1360,7 +1360,9 @@ impl MessageList {
         }
     }
 
-    /// Append more messages to the existing list
+    /// Append more messages to the existing list (pagination).
+    /// Does NOT delegate to the filter-changed callback since these are
+    /// already-filtered results from the DB — we just rebuild client-side.
     pub fn append_messages(&self, messages: Vec<MessageInfo>) {
         let imp = self.imp();
 
@@ -1381,8 +1383,9 @@ impl MessageList {
             });
         }
 
-        // Rebuild visible rows to show sorted messages
-        self.rebuild_visible_rows();
+        // Rebuild rows directly (skip filter-callback delegation since
+        // load_more_from_cache already queried with the active filter)
+        self.rebuild_visible_rows_direct();
         self.finish_loading_more();
     }
 
@@ -2068,6 +2071,8 @@ impl MessageList {
     }
 
     /// Rebuild visible rows from stored messages (used after status updates)
+    /// Rebuild visible rows, delegating to the filter-changed callback if a
+    /// DB-level filter is active. Used when filter state changes.
     fn rebuild_visible_rows(&self) {
         let imp = self.imp();
 
@@ -2079,6 +2084,14 @@ impl MessageList {
                 return;
             }
         }
+
+        self.rebuild_visible_rows_direct();
+    }
+
+    /// Rebuild visible rows using client-side filtering only.
+    /// Used by append_messages where the DB query already applied filters.
+    fn rebuild_visible_rows_direct(&self) {
+        let imp = self.imp();
 
         let list_box = imp.list_box.borrow();
         let scrolled = imp.scrolled.borrow();

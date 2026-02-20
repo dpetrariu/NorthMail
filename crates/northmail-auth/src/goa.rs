@@ -119,6 +119,18 @@ pub struct GoaAccount {
     pub smtp_host: Option<String>,
     /// Authentication type
     pub auth_type: GoaAuthType,
+    /// Presentation identity (user-editable display name from GNOME Settings)
+    pub presentation_identity: Option<String>,
+}
+
+impl GoaAccount {
+    /// Returns the best label for display: presentation_identity if set, otherwise email.
+    pub fn display_label(&self) -> &str {
+        self.presentation_identity
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.email)
+    }
 }
 
 /// Manager for GNOME Online Accounts
@@ -212,6 +224,8 @@ impl GoaManager {
             let id = account_proxy.id().await.unwrap_or_default();
             let provider_type = account_proxy.provider_type().await.unwrap_or_default();
             let provider_name = account_proxy.provider_name().await.unwrap_or_default();
+            let presentation_identity = account_proxy.presentation_identity().await.ok()
+                .filter(|s| !s.is_empty());
             let email = mail_proxy.email_address().await.unwrap_or_default();
             let imap_host = mail_proxy.imap_host().await.ok();
             let imap_username = mail_proxy.imap_user_name().await.ok();
@@ -247,6 +261,7 @@ impl GoaManager {
                 imap_username,
                 smtp_host,
                 auth_type,
+                presentation_identity,
             });
         }
 

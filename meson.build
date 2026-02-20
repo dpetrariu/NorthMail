@@ -54,6 +54,12 @@ foreach size : icon_sizes
   )
 endforeach
 
+# Install scalable SVG icon
+install_data(
+  'data' / 'icons' / 'hicolor' / 'scalable' / 'apps' / 'org.northmail.NorthMail.svg',
+  install_dir: datadir / 'icons' / 'hicolor' / 'scalable' / 'apps',
+)
+
 # Install symbolic icons
 install_data(
   'data' / 'icons' / 'hicolor' / 'symbolic' / 'actions' / 'dock-left-symbolic.svg',

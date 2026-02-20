@@ -41,7 +41,7 @@
   <url type="homepage">https://github.com/dpetrariu/NorthMail</url>
   <url type="bugtracker">https://github.com/dpetrariu/NorthMail/issues</url>
   <url type="vcs-browser">https://github.com/dpetrariu/NorthMail</url>
-  <url type="translate">https://github.com/dpetrariu/NorthMail/tree/main/po</url>
+  <url type="translate">https://github.com/dpetrariu/NorthMail/tree/master/po</url>
 
   <developer id="org.northmail">
     <name>NorthMail Contributors</name>
