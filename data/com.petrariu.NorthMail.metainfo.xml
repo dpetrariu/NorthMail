@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>org.northmail.NorthMail</id>
+  <id>com.petrariu.NorthMail</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
 
@@ -24,7 +24,7 @@
     </ul>
   </description>
 
-  <launchable type="desktop-id">org.northmail.NorthMail.desktop</launchable>
+  <launchable type="desktop-id">com.petrariu.NorthMail.desktop</launchable>
 
   <branding>
     <color type="primary" scheme_preference="light">#62a0ea</color>
@@ -43,7 +43,7 @@
   <url type="vcs-browser">https://github.com/dpetrariu/NorthMail</url>
   <url type="translate">https://github.com/dpetrariu/NorthMail/tree/master/po</url>
 
-  <developer id="org.northmail">
+  <developer id="com.petrariu">
     <name>NorthMail Contributors</name>
   </developer>
 

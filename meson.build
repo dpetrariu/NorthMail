@@ -9,7 +9,7 @@ project('northmail',
 i18n = import('i18n')
 gnome = import('gnome')
 
-application_id = 'org.northmail.NorthMail'
+application_id = 'com.petrariu.NorthMail'
 version = meson.project_version()
 prefix = get_option('prefix')
 bindir = prefix / get_option('bindir')
@@ -25,8 +25,8 @@ subdir('po')
 
 # Install desktop file (with translations merged in)
 i18n.merge_file(
-  input: 'data/org.northmail.NorthMail.desktop.in',
-  output: 'org.northmail.NorthMail.desktop',
+  input: 'data/com.petrariu.NorthMail.desktop.in',
+  output: 'com.petrariu.NorthMail.desktop',
   type: 'desktop',
   po_dir: 'po',
   install: true,
@@ -35,13 +35,13 @@ i18n.merge_file(
 
 # Install metainfo
 install_data(
-  'data/org.northmail.NorthMail.metainfo.xml',
+  'data/com.petrariu.NorthMail.metainfo.xml',
   install_dir: datadir / 'metainfo',
 )
 
 # Install GSchema
 install_data(
-  'data/org.northmail.NorthMail.gschema.xml',
+  'data/com.petrariu.NorthMail.gschema.xml',
   install_dir: datadir / 'glib-2.0' / 'schemas',
 )
 
@@ -49,14 +49,14 @@ install_data(
 icon_sizes = ['16x16', '32x32', '48x48', '64x64', '128x128', '256x256', '512x512']
 foreach size : icon_sizes
   install_data(
-    'data' / 'icons' / 'hicolor' / size / 'apps' / 'org.northmail.NorthMail.svg',
+    'data' / 'icons' / 'hicolor' / size / 'apps' / 'com.petrariu.NorthMail.svg',
     install_dir: datadir / 'icons' / 'hicolor' / size / 'apps',
   )
 endforeach
 
 # Install scalable SVG icon
 install_data(
-  'data' / 'icons' / 'hicolor' / 'scalable' / 'apps' / 'org.northmail.NorthMail.svg',
+  'data' / 'icons' / 'hicolor' / 'scalable' / 'apps' / 'com.petrariu.NorthMail.svg',
   install_dir: datadir / 'icons' / 'hicolor' / 'scalable' / 'apps',
 )
 
@@ -68,7 +68,7 @@ install_data(
 
 # Compile schemas for development
 gnome.compile_schemas(
-  depend_files: files('data/org.northmail.NorthMail.gschema.xml'),
+  depend_files: files('data/com.petrariu.NorthMail.gschema.xml'),
 )
 
 # Build Rust project using Cargo

@@ -338,7 +338,7 @@ mod imp {
                                                 <property name="margin-start">4</property>
                                                 <child>
                                                     <object class="GtkImage" id="app_icon_image">
-                                                        <property name="icon-name">org.northmail.NorthMail</property>
+                                                        <property name="icon-name">com.petrariu.NorthMail</property>
                                                         <property name="pixel-size">28</property>
                                                     </object>
                                                 </child>

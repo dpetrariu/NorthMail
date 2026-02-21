@@ -14,14 +14,14 @@ use northmail_imap::{ImapClient, SimpleImapClient};
 use mail_parser::MimeHeaders;
 use tracing::{debug, error, info, warn};
 
-const APP_ID: &str = "org.northmail.NorthMail";
+const APP_ID: &str = "com.petrariu.NorthMail";
 
 /// Resolve which icon to use: "email" if user chose system and theme has it, else custom
 fn resolve_app_icon(settings: &gio::Settings, theme: &gtk4::IconTheme) -> String {
     if settings.string("app-icon") == "system" && theme.has_icon("email") {
         "email".to_string()
     } else {
-        "org.northmail.NorthMail".to_string()
+        "com.petrariu.NorthMail".to_string()
     }
 }
 
@@ -491,7 +491,7 @@ mod imp {
                 let icon_theme = gtk4::IconTheme::for_display(&display);
 
                 // Add bundled resource path for icons
-                icon_theme.add_resource_path("/org/northmail/NorthMail/icons");
+                icon_theme.add_resource_path("/com/petrariu/NorthMail/icons");
 
                 // Add project's data/icons directory for development builds
                 let exe_path = std::env::current_exe().ok();
@@ -551,13 +551,13 @@ mod imp {
             };
 
             // Install desktop file
-            let desktop_src = project_root.join("data").join("org.northmail.NorthMail.desktop");
+            let desktop_src = project_root.join("data").join("com.petrariu.NorthMail.desktop");
             let desktop_dst_dir = home.join(".local/share/applications");
-            let desktop_dst = desktop_dst_dir.join("org.northmail.NorthMail.desktop");
+            let desktop_dst = desktop_dst_dir.join("com.petrariu.NorthMail.desktop");
             if desktop_src.exists() {
                 let _ = std::fs::create_dir_all(&desktop_dst_dir);
                 if let Ok(contents) = std::fs::read_to_string(&desktop_src) {
-                    let desktop_icon = "org.northmail.NorthMail";
+                    let desktop_icon = "com.petrariu.NorthMail";
                     // Rewrite Exec= and Icon= for the dev binary and icon preference
                     let exe = std::env::current_exe().unwrap_or_default();
                     let patched = contents
@@ -580,9 +580,9 @@ mod imp {
             }
 
             // Install icon
-            let icon_src = project_root.join("data/icons/hicolor/128x128/apps/org.northmail.NorthMail.png");
+            let icon_src = project_root.join("data/icons/hicolor/128x128/apps/com.petrariu.NorthMail.png");
             let icon_dst_dir = home.join(".local/share/icons/hicolor/128x128/apps");
-            let icon_dst = icon_dst_dir.join("org.northmail.NorthMail.png");
+            let icon_dst = icon_dst_dir.join("com.petrariu.NorthMail.png");
             if icon_src.exists() && !icon_dst.exists() {
                 let _ = std::fs::create_dir_all(&icon_dst_dir);
                 if std::fs::copy(&icon_src, &icon_dst).is_ok() {
@@ -607,7 +607,7 @@ impl NorthMailApplication {
         glib::Object::builder()
             .property("application-id", APP_ID)
             .property("flags", gio::ApplicationFlags::FLAGS_NONE)
-            .property("resource-base-path", "/org/northmail/NorthMail")
+            .property("resource-base-path", "/com/petrariu/NorthMail")
             .build()
     }
 
@@ -1062,7 +1062,7 @@ impl NorthMailApplication {
                         .join("hicolor")
                         .join("128x128")
                         .join("apps")
-                        .join("org.northmail.NorthMail.png");
+                        .join("com.petrariu.NorthMail.png");
                     if dev_icon.exists() {
                         return dev_icon.to_string_lossy().to_string();
                     }
@@ -1072,8 +1072,8 @@ impl NorthMailApplication {
 
         // Try installed paths
         let installed_paths = [
-            "/usr/share/icons/hicolor/128x128/apps/org.northmail.NorthMail.png",
-            "/usr/local/share/icons/hicolor/128x128/apps/org.northmail.NorthMail.png",
+            "/usr/share/icons/hicolor/128x128/apps/com.petrariu.NorthMail.png",
+            "/usr/local/share/icons/hicolor/128x128/apps/com.petrariu.NorthMail.png",
         ];
         for path in &installed_paths {
             if std::path::Path::new(path).exists() {
@@ -1084,7 +1084,7 @@ impl NorthMailApplication {
         // Try home directory
         if let Ok(home) = std::env::var("HOME") {
             let home_icon = format!(
-                "{}/.local/share/icons/hicolor/128x128/apps/org.northmail.NorthMail.png",
+                "{}/.local/share/icons/hicolor/128x128/apps/com.petrariu.NorthMail.png",
                 home
             );
             if std::path::Path::new(&home_icon).exists() {
@@ -1093,7 +1093,7 @@ impl NorthMailApplication {
         }
 
         // Fallback to icon name (may not show the colored icon)
-        "org.northmail.NorthMail".to_string()
+        "com.petrariu.NorthMail".to_string()
     }
 
     /// Get sender and subject of the latest inbox message for an account
@@ -7511,7 +7511,7 @@ impl NorthMailApplication {
             button
         };
 
-        let custom_btn = make_icon_button("org.northmail.NorthMail", "NorthMail");
+        let custom_btn = make_icon_button("com.petrariu.NorthMail", "NorthMail");
         let system_btn = make_icon_button("email", &tr("System"));
         system_btn.set_group(Some(&custom_btn));
 
@@ -7547,7 +7547,7 @@ impl NorthMailApplication {
             // Update desktop file immediately so GNOME has the right icon on next launch
             if let Ok(home) = std::env::var("HOME") {
                 let desktop_path = std::path::PathBuf::from(&home)
-                    .join(".local/share/applications/org.northmail.NorthMail.desktop");
+                    .join(".local/share/applications/com.petrariu.NorthMail.desktop");
                 if let Ok(contents) = std::fs::read_to_string(&desktop_path) {
                     let patched = contents
                         .lines()

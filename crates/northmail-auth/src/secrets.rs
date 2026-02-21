@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use tracing::{debug, info};
 
 /// Schema for storing NorthMail credentials
-const SCHEMA_NAME: &str = "org.northmail.Credentials";
+const SCHEMA_NAME: &str = "com.petrariu.NorthMail.Credentials";
 
 /// Manages secure storage of credentials
 pub struct SecretStore {

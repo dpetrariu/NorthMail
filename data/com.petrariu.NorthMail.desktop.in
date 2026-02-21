@@ -2,12 +2,12 @@
 Name=NorthMail
 Comment=A modern email client for GNOME
 Exec=northmail %U
-Icon=org.northmail.NorthMail
+Icon=com.petrariu.NorthMail
 Terminal=false
 Type=Application
 Categories=GNOME;GTK;Network;Email;
 Keywords=email;mail;gmail;imap;
 StartupNotify=true
-StartupWMClass=org.northmail.NorthMail
+StartupWMClass=com.petrariu.NorthMail
 MimeType=x-scheme-handler/mailto;
 X-GNOME-UsesNotifications=true

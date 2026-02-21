@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <gresources>
-  <gresource prefix="/org/northmail/NorthMail/icons/scalable/actions">
+  <gresource prefix="/com/petrariu/NorthMail/icons/scalable/actions">
     <file alias="dock-left-symbolic.svg">icons/hicolor/symbolic/actions/dock-left-symbolic.svg</file>
     <file alias="mail-inbox-symbolic.svg">icons/hicolor/symbolic/actions/mail-inbox-symbolic.svg</file>
     <file alias="funnel-symbolic.svg">icons/hicolor/symbolic/actions/funnel-symbolic.svg</file>
   </gresource>
-  <gresource prefix="/org/northmail/NorthMail/icons/scalable/apps">
-    <file alias="org.northmail.NorthMail.svg">icons/hicolor/scalable/apps/org.northmail.NorthMail.svg</file>
+  <gresource prefix="/com/petrariu/NorthMail/icons/scalable/apps">
+    <file alias="com.petrariu.NorthMail.svg">icons/hicolor/scalable/apps/com.petrariu.NorthMail.svg</file>
   </gresource>
 </gresources>

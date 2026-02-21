@@ -65,10 +65,10 @@ cargo build --release
 
 ```bash
 # Build and install
-flatpak-builder --user --install build-aux/org.northmail.NorthMail.json
+flatpak-builder --user --install build-aux/com.petrariu.NorthMail.json
 
 # Run
-flatpak run org.northmail.NorthMail
+flatpak run com.petrariu.NorthMail
 ```
 
 ## Gmail Setup

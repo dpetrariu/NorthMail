@@ -1,5 +1,5 @@
 {
-    "app-id" : "org.northmail.NorthMail",
+    "app-id" : "com.petrariu.NorthMail",
     "runtime" : "org.gnome.Platform",
     "runtime-version" : "47",
     "sdk" : "org.gnome.Sdk",

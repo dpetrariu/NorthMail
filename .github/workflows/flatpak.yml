@@ -21,7 +21,7 @@ jobs:
       - name: Build Flatpak
         uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
-          manifest-path: build-aux/org.northmail.NorthMail.json
+          manifest-path: build-aux/com.petrariu.NorthMail.json
           bundle: NorthMail.flatpak
           cache-key: flatpak-builder-${{ github.sha }}
 

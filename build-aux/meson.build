@@ -9,7 +9,7 @@ project('northmail',
 i18n = import('i18n')
 gnome = import('gnome')
 
-application_id = 'org.northmail.NorthMail'
+application_id = 'com.petrariu.NorthMail'
 version = meson.project_version()
 prefix = get_option('prefix')
 bindir = prefix / get_option('bindir')
@@ -26,25 +26,25 @@ dependency('sqlite3', version: '>= 3.40')
 
 # Install desktop file
 install_data(
-  'data' / 'org.northmail.NorthMail.desktop',
+  'data' / 'com.petrariu.NorthMail.desktop',
   install_dir: datadir / 'applications',
 )
 
 # Install metainfo
 install_data(
-  'data' / 'org.northmail.NorthMail.metainfo.xml',
+  'data' / 'com.petrariu.NorthMail.metainfo.xml',
   install_dir: datadir / 'metainfo',
 )
 
 # Install GSchema
 install_data(
-  'data' / 'org.northmail.NorthMail.gschema.xml',
+  'data' / 'com.petrariu.NorthMail.gschema.xml',
   install_dir: datadir / 'glib-2.0' / 'schemas',
 )
 
 # Compile schemas
 gnome.compile_schemas(
-  depend_files: files('data' / 'org.northmail.NorthMail.gschema.xml'),
+  depend_files: files('data' / 'com.petrariu.NorthMail.gschema.xml'),
 )
 
 # Build Rust project
