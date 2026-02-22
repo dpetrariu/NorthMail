@@ -57,8 +57,16 @@ glib-compile-schemas data/
 # Build with Cargo
 cargo build --release
 
-# Run
-./target/release/northmail
+# Run (set GSETTINGS_SCHEMA_DIR so the app finds its schema)
+GSETTINGS_SCHEMA_DIR=data ./target/release/northmail
+```
+
+To get the app icon in your taskbar/dock, install the desktop file and icons:
+
+```bash
+cp data/com.petrariu.NorthMail.desktop ~/.local/share/applications/
+cp -r data/icons/hicolor/* ~/.local/share/icons/hicolor/
+gtk4-update-icon-cache ~/.local/share/icons/hicolor/
 ```
 
 ### Install from Release
