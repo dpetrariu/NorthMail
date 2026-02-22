@@ -71,24 +71,32 @@ gtk4-update-icon-cache ~/.local/share/icons/hicolor/
 
 ### Install from Release
 
-Download the latest package from [Releases](https://github.com/dpetrariu/NorthMail/releases).
+Download the latest package for your platform from [Releases](https://github.com/dpetrariu/NorthMail/releases).
 
-**Flatpak** (any distro):
+| Package | Architecture | Platform |
+|---------|-------------|----------|
+| `NorthMail.flatpak` | x86_64 | Any Linux (Flatpak) |
+| `NorthMail-aarch64.flatpak` | aarch64 | Any Linux (Flatpak) |
+| `northmail_*_amd64.deb` | x86_64 | Debian / Ubuntu |
+| `northmail_*_arm64.deb` | aarch64 | Debian / Ubuntu |
+| `northmail-*.x86_64.rpm` | x86_64 | Fedora / RHEL |
+| `northmail-*.aarch64.rpm` | aarch64 | Fedora / RHEL |
+
+**Flatpak:**
 ```bash
-flatpak install NorthMail-aarch64.flatpak   # ARM64
-flatpak install NorthMail.flatpak            # x86_64
+flatpak install NorthMail.flatpak
 flatpak run com.petrariu.NorthMail
 ```
 
-**Fedora/RHEL** (aarch64):
+**Debian/Ubuntu:**
 ```bash
-sudo dnf install northmail-0.1.0.aarch64.rpm
+sudo dpkg -i northmail_*_amd64.deb
+sudo apt-get install -f   # install dependencies
 ```
 
-**Debian/Ubuntu** (arm64):
+**Fedora/RHEL:**
 ```bash
-sudo dpkg -i northmail_0.1.0_arm64.deb
-sudo apt-get install -f   # install dependencies
+sudo dnf install northmail-*.x86_64.rpm
 ```
 
 ### Flatpak (build from source)
