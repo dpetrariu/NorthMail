@@ -61,13 +61,32 @@ cargo build --release
 ./target/release/northmail
 ```
 
-### Flatpak
+### Install from Release
+
+Download the latest package from [Releases](https://github.com/dpetrariu/NorthMail/releases).
+
+**Flatpak** (any distro):
+```bash
+flatpak install NorthMail-aarch64.flatpak   # ARM64
+flatpak install NorthMail.flatpak            # x86_64
+flatpak run com.petrariu.NorthMail
+```
+
+**Fedora/RHEL** (aarch64):
+```bash
+sudo dnf install northmail-0.1.0.aarch64.rpm
+```
+
+**Debian/Ubuntu** (arm64):
+```bash
+sudo dpkg -i northmail_0.1.0_arm64.deb
+sudo apt-get install -f   # install dependencies
+```
+
+### Flatpak (build from source)
 
 ```bash
-# Build and install
 flatpak-builder --user --install build-aux/com.petrariu.NorthMail.json
-
-# Run
 flatpak run com.petrariu.NorthMail
 ```
 
