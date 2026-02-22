@@ -1224,57 +1224,77 @@ impl MessageList {
                             let start = anchor.min(index);
                             let end = anchor.max(index);
 
-                            // If Ctrl isn't also held, clear existing selection first
-                            if !has_ctrl {
-                                lb.unselect_all();
-                            }
-
-                            // Select all rows in the range
+                            // Collect UIDs from filtered list first, before any GTK calls
                             let mut uids = imp.selected_uids.borrow_mut();
                             if !has_ctrl {
                                 uids.clear();
                             }
                             for i in start..=end {
-                                if let Some(r) = lb.row_at_index(i) {
-                                    lb.select_row(Some(&r));
-                                    if let Some(msg) = filtered.get(i as usize) {
-                                        if !uids.contains(&msg.uid) {
-                                            uids.push(msg.uid);
-                                        }
+                                if let Some(msg) = filtered.get(i as usize) {
+                                    if !uids.contains(&msg.uid) {
+                                        uids.push(msg.uid);
                                     }
                                 }
                             }
+                            drop(uids);
+                            drop(filtered);
+                            drop(messages);
+
+                            // Now update GTK selection with is_rebuilding guard to prevent
+                            // row_selected signal from re-borrowing messages/selected_uids
+                            imp.is_rebuilding.set(true);
+                            if !has_ctrl {
+                                lb.unselect_all();
+                            }
+                            for i in start..=end {
+                                if let Some(r) = lb.row_at_index(i) {
+                                    lb.select_row(Some(&r));
+                                }
+                            }
+                            imp.is_rebuilding.set(false);
                             // Don't update anchor on shift-click (preserve it for further shift-clicks)
-                            tracing::debug!("Shift-select: {} messages selected (range {}..={})", uids.len(), start, end);
+                            tracing::debug!("Shift-select: range {}..={}", start, end);
                         } else if has_ctrl {
                             // Ctrl+click: toggle individual row in selection
                             let is_selected = lb.selected_rows().iter().any(|r| r.index() == index);
                             let mut uids = imp.selected_uids.borrow_mut();
 
                             if is_selected {
-                                // GTK already selected it; if we want toggle behavior, unselect
-                                lb.unselect_row(&row);
                                 if let Some(msg) = filtered.get(index as usize) {
                                     uids.retain(|u| *u != msg.uid);
                                 }
                             } else {
-                                lb.select_row(Some(&row));
                                 if let Some(msg) = filtered.get(index as usize) {
                                     if !uids.contains(&msg.uid) {
                                         uids.push(msg.uid);
                                     }
                                 }
                             }
+                            drop(uids);
+                            drop(filtered);
+                            drop(messages);
+
+                            // Update GTK selection with guard
+                            imp.is_rebuilding.set(true);
+                            if is_selected {
+                                lb.unselect_row(&row);
+                            } else {
+                                lb.select_row(Some(&row));
+                            }
+                            imp.is_rebuilding.set(false);
                             imp.anchor_index.set(Some(index));
-                            tracing::debug!("Ctrl-select: {} messages selected", uids.len());
+                            tracing::debug!("Ctrl-select toggle at index={}", index);
                         } else {
                             // Plain click: select only this row, show message
-                            lb.unselect_all();
-                            lb.select_row(Some(&row));
                             imp.anchor_index.set(Some(index));
                             let clicked_uid = filtered.get(index as usize).map(|m| m.uid);
                             drop(filtered);
                             drop(messages);
+                            // Update GTK selection after dropping borrows
+                            imp.is_rebuilding.set(true);
+                            lb.unselect_all();
+                            lb.select_row(Some(&row));
+                            imp.is_rebuilding.set(false);
                             if let Some(uid) = clicked_uid {
                                 tracing::debug!("Row clicked: index={}, uid={}", index, uid);
                                 let mut uids = imp.selected_uids.borrow_mut();
