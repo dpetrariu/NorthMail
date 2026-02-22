@@ -1,4 +1,4 @@
-name: Flatpak Build
+name: Build Packages
 
 on:
   push:
@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   flatpak:
-    name: Build Flatpak Bundle
+    name: Flatpak x86_64
     runs-on: ubuntu-latest
     container:
       image: bilelmoussaoui/flatpak-github-actions:gnome-47
@@ -39,3 +39,184 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: NorthMail.flatpak
+
+  deb:
+    name: DEB x86_64
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libgtk-4-dev libadwaita-1-dev \
+            libgoa-1.0-dev libsecret-1-dev libwebkitgtk-6.0-dev \
+            libsqlite3-dev libssl-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Strip binary
+        run: strip target/release/northmail
+
+      - name: Package DEB
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          VERSION=${VERSION:-0.1.0}
+          PKG_DIR=northmail_${VERSION}_amd64
+          mkdir -p ${PKG_DIR}/DEBIAN
+          mkdir -p ${PKG_DIR}/usr/bin
+          mkdir -p ${PKG_DIR}/usr/share/applications
+          mkdir -p ${PKG_DIR}/usr/share/metainfo
+          mkdir -p ${PKG_DIR}/usr/share/glib-2.0/schemas
+          mkdir -p ${PKG_DIR}/usr/share/icons/hicolor/scalable/apps
+          for size in 16x16 32x32 48x48 64x64 128x128 256x256 512x512; do
+            mkdir -p ${PKG_DIR}/usr/share/icons/hicolor/${size}/apps
+            cp data/icons/hicolor/${size}/apps/com.petrariu.NorthMail.svg \
+              ${PKG_DIR}/usr/share/icons/hicolor/${size}/apps/
+          done
+          cp target/release/northmail ${PKG_DIR}/usr/bin/
+          cp data/com.petrariu.NorthMail.desktop ${PKG_DIR}/usr/share/applications/
+          cp data/com.petrariu.NorthMail.metainfo.xml ${PKG_DIR}/usr/share/metainfo/
+          cp data/com.petrariu.NorthMail.gschema.xml ${PKG_DIR}/usr/share/glib-2.0/schemas/
+          cp data/icons/hicolor/scalable/apps/com.petrariu.NorthMail.svg \
+            ${PKG_DIR}/usr/share/icons/hicolor/scalable/apps/
+          INSTALLED_SIZE=$(du -sk ${PKG_DIR} | cut -f1)
+          cat > ${PKG_DIR}/DEBIAN/control << EOF
+          Package: northmail
+          Version: ${VERSION}
+          Architecture: amd64
+          Maintainer: Daniel Petrariu <daniel@petrariu.com>
+          Depends: libgtk-4-1 (>= 4.14), libadwaita-1-0 (>= 1.4), libwebkitgtk-6.0-4 (>= 2.44), libsqlite3-0 (>= 3.40), libsecret-1-0 (>= 0.20), gnome-online-accounts (>= 3.50)
+          Installed-Size: ${INSTALLED_SIZE}
+          Section: mail
+          Priority: optional
+          Homepage: https://github.com/dpetrariu/NorthMail
+          Description: A modern email client for GNOME
+           NorthMail is a modern, simple email client designed for the GNOME desktop.
+           It focuses on providing a clean, distraction-free email experience with
+           excellent Gmail support via GNOME Online Accounts.
+          EOF
+          cat > ${PKG_DIR}/DEBIAN/postinst << 'SCRIPT'
+          #!/bin/sh
+          set -e
+          glib-compile-schemas /usr/share/glib-2.0/schemas/ || true
+          gtk4-update-icon-cache /usr/share/icons/hicolor/ || true
+          update-desktop-database /usr/share/applications/ || true
+          SCRIPT
+          chmod 755 ${PKG_DIR}/DEBIAN/postinst
+          dpkg-deb --root-owner-group --build ${PKG_DIR} northmail_${VERSION}_amd64.deb
+
+      - name: Upload DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: NorthMail-deb
+          path: northmail_*_amd64.deb
+
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: northmail_*_amd64.deb
+
+  rpm:
+    name: RPM x86_64
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:42
+
+    steps:
+      - name: Install dependencies
+        run: |
+          dnf install -y gcc gcc-c++ gtk4-devel libadwaita-devel \
+            gnome-online-accounts-devel libsecret-devel webkitgtk6.0-devel \
+            sqlite-devel openssl-devel rpm-build git
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Build
+        run: |
+          source $HOME/.cargo/env
+          cargo build --release
+          strip target/release/northmail
+
+      - name: Package RPM
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          VERSION=${VERSION:-0.1.0}
+          RPM_DIR=$HOME/rpmbuild
+          mkdir -p ${RPM_DIR}/{BUILD,RPMS,SOURCES,SPECS,SRPMS,BUILDROOT}
+          STAGING=/tmp/northmail-${VERSION}
+          mkdir -p ${STAGING}/usr/bin
+          mkdir -p ${STAGING}/usr/share/applications
+          mkdir -p ${STAGING}/usr/share/metainfo
+          mkdir -p ${STAGING}/usr/share/glib-2.0/schemas
+          mkdir -p ${STAGING}/usr/share/icons/hicolor/scalable/apps
+          for size in 16x16 32x32 48x48 64x64 128x128 256x256 512x512; do
+            mkdir -p ${STAGING}/usr/share/icons/hicolor/${size}/apps
+            cp data/icons/hicolor/${size}/apps/com.petrariu.NorthMail.svg \
+              ${STAGING}/usr/share/icons/hicolor/${size}/apps/
+          done
+          cp target/release/northmail ${STAGING}/usr/bin/
+          cp data/com.petrariu.NorthMail.desktop ${STAGING}/usr/share/applications/
+          cp data/com.petrariu.NorthMail.metainfo.xml ${STAGING}/usr/share/metainfo/
+          cp data/com.petrariu.NorthMail.gschema.xml ${STAGING}/usr/share/glib-2.0/schemas/
+          cp data/icons/hicolor/scalable/apps/com.petrariu.NorthMail.svg \
+            ${STAGING}/usr/share/icons/hicolor/scalable/apps/
+          cat > ${RPM_DIR}/SPECS/northmail.spec << SPEC
+          Name:           northmail
+          Version:        ${VERSION}
+          Release:        1%{?dist}
+          Summary:        A modern email client for GNOME
+          License:        GPL-3.0-or-later
+          URL:            https://github.com/dpetrariu/NorthMail
+          Requires:       gtk4 >= 4.14
+          Requires:       libadwaita >= 1.4
+          Requires:       webkit6gtk >= 2.44
+          Requires:       sqlite >= 3.40
+          Requires:       libsecret >= 0.20
+          Requires:       gnome-online-accounts >= 3.50
+          %description
+          NorthMail is a modern, simple email client designed for the GNOME desktop.
+          %install
+          cp -a /tmp/northmail-${VERSION}/* %{buildroot}/
+          %files
+          %{_bindir}/northmail
+          %{_datadir}/applications/com.petrariu.NorthMail.desktop
+          %{_datadir}/metainfo/com.petrariu.NorthMail.metainfo.xml
+          %{_datadir}/glib-2.0/schemas/com.petrariu.NorthMail.gschema.xml
+          %{_datadir}/icons/hicolor/*/apps/com.petrariu.NorthMail.svg
+          %post
+          glib-compile-schemas %{_datadir}/glib-2.0/schemas/ &>/dev/null || :
+          gtk4-update-icon-cache %{_datadir}/icons/hicolor/ &>/dev/null || :
+          update-desktop-database %{_datadir}/applications/ &>/dev/null || :
+          %postun
+          glib-compile-schemas %{_datadir}/glib-2.0/schemas/ &>/dev/null || :
+          gtk4-update-icon-cache %{_datadir}/icons/hicolor/ &>/dev/null || :
+          update-desktop-database %{_datadir}/applications/ &>/dev/null || :
+          SPEC
+          rpmbuild --define "_topdir ${RPM_DIR}" -bb ${RPM_DIR}/SPECS/northmail.spec
+          cp ${RPM_DIR}/RPMS/x86_64/*.rpm northmail-${VERSION}.x86_64.rpm
+
+      - name: Upload RPM
+        uses: actions/upload-artifact@v4
+        with:
+          name: NorthMail-rpm
+          path: northmail-*.x86_64.rpm
+
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: northmail-*.x86_64.rpm
