@@ -2053,57 +2053,37 @@ impl MessageList {
     /// Add context menu to a message row using a manual Popover + Box + Buttons.
     /// We avoid PopoverMenu/gio::Menu because GTK4 inherits the selected row's
     /// white text color into the popover, making menu items invisible.
+    /// Popovers are created lazily on right-click to avoid GTK finalization warnings.
     fn add_row_context_menu(&self, row: &gtk4::ListBoxRow, msg: &MessageInfo) {
-        let msg_uid = msg.uid;
-
-        // Build the single-message popover (always created)
-        let single_popover = self.build_single_context_menu(row, msg);
-
-        // Track when single popover closes
-        let widget_for_close = self.clone();
-        single_popover.connect_closed(move |_| {
-            widget_for_close.imp().context_menu_open.set(false);
-        });
-
-        // Store a RefCell for the dynamically created bulk popover
-        let bulk_popover: Rc<std::cell::RefCell<Option<gtk4::Popover>>> = Rc::new(std::cell::RefCell::new(None));
+        let msg_clone = msg.clone();
 
         // Right-click gesture
         let gesture = gtk4::GestureClick::new();
         gesture.set_button(3);
-        let single_popover_clone = single_popover.clone();
         let widget_for_gesture = self.clone();
         let row_weak = row.downgrade();
-        let bulk_popover_clone = bulk_popover.clone();
         gesture.connect_pressed(move |gesture, _n, x, y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
             widget_for_gesture.imp().context_menu_open.set(true);
 
+            let Some(row) = row_weak.upgrade() else { return };
+
             let sel_count = widget_for_gesture.selection_count();
-            let is_in_selection = widget_for_gesture.imp().selected_uids.borrow().contains(&msg_uid);
+            let is_in_selection = widget_for_gesture.imp().selected_uids.borrow().contains(&msg_clone.uid);
 
-            if sel_count > 1 && is_in_selection {
-                // Show bulk context menu
-                // Clean up previous bulk popover if any
-                if let Some(old) = bulk_popover_clone.borrow_mut().take() {
-                    old.unparent();
-                }
-
-                if let Some(row) = row_weak.upgrade() {
-                    let popover = widget_for_gesture.build_bulk_context_menu(&row, sel_count);
-                    let w = widget_for_gesture.clone();
-                    popover.connect_closed(move |_| {
-                        w.imp().context_menu_open.set(false);
-                    });
-                    popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-                    popover.popup();
-                    *bulk_popover_clone.borrow_mut() = Some(popover);
-                }
+            let popover = if sel_count > 1 && is_in_selection {
+                widget_for_gesture.build_bulk_context_menu(&row, sel_count)
             } else {
-                // Show single-message context menu
-                single_popover_clone.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-                single_popover_clone.popup();
-            }
+                widget_for_gesture.build_single_context_menu(&row, &msg_clone)
+            };
+
+            let w = widget_for_gesture.clone();
+            popover.connect_closed(move |p| {
+                w.imp().context_menu_open.set(false);
+                p.unparent();
+            });
+            popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.popup();
         });
         row.add_controller(gesture);
     }
