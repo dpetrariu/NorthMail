@@ -66,8 +66,7 @@ jobs:
 
       - name: Package DEB
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
-          VERSION=${VERSION:-0.1.0}
+          if [[ "$GITHUB_REF_NAME" == v* ]]; then VERSION=${GITHUB_REF_NAME#v}; else VERSION=0.1.0; fi
           PKG_DIR=northmail_${VERSION}_amd64
           mkdir -p ${PKG_DIR}/DEBIAN
           mkdir -p ${PKG_DIR}/usr/bin
@@ -153,8 +152,7 @@ jobs:
 
       - name: Package RPM
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
-          VERSION=${VERSION:-0.1.0}
+          if [[ "$GITHUB_REF_NAME" == v* ]]; then VERSION=${GITHUB_REF_NAME#v}; else VERSION=0.1.0; fi
           RPM_DIR=$HOME/rpmbuild
           mkdir -p ${RPM_DIR}/{BUILD,RPMS,SOURCES,SPECS,SRPMS,BUILDROOT}
           STAGING=/tmp/northmail-${VERSION}
