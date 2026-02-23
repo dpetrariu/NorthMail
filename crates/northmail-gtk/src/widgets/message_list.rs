@@ -912,6 +912,13 @@ impl MessageList {
     }
 
     /// Check if a message passes all active filters and search query
+    /// Extract the message UID stored on a ListBoxRow via its widget name.
+    fn uid_from_row(row: &gtk4::ListBoxRow) -> Option<u32> {
+        row.widget_name()
+            .strip_prefix("msg-uid-")
+            .and_then(|s| s.parse::<u32>().ok())
+    }
+
     fn message_matches(&self, msg: &MessageInfo) -> bool {
         self.message_matches_with_options(msg, false)
     }
@@ -1212,11 +1219,6 @@ impl MessageList {
 
                         let index = row.index();
                         let imp = widget.imp();
-                        let messages = imp.messages.borrow();
-                        let skip_search = imp.is_search_results.get();
-                        let filtered: Vec<&MessageInfo> = messages.iter()
-                            .filter(|m| widget.message_matches_with_options(m, skip_search))
-                            .collect();
 
                         if has_shift {
                             // Shift+click: range select from anchor to clicked row
@@ -1224,21 +1226,21 @@ impl MessageList {
                             let start = anchor.min(index);
                             let end = anchor.max(index);
 
-                            // Collect UIDs from filtered list first, before any GTK calls
+                            // Collect UIDs directly from row widgets (not index-based lookup)
                             let mut uids = imp.selected_uids.borrow_mut();
                             if !has_ctrl {
                                 uids.clear();
                             }
                             for i in start..=end {
-                                if let Some(msg) = filtered.get(i as usize) {
-                                    if !uids.contains(&msg.uid) {
-                                        uids.push(msg.uid);
+                                if let Some(r) = lb.row_at_index(i) {
+                                    if let Some(uid) = MessageList::uid_from_row(&r) {
+                                        if !uids.contains(&uid) {
+                                            uids.push(uid);
+                                        }
                                     }
                                 }
                             }
                             drop(uids);
-                            drop(filtered);
-                            drop(messages);
 
                             // Now update GTK selection with is_rebuilding guard to prevent
                             // row_selected signal from re-borrowing messages/selected_uids
@@ -1257,22 +1259,21 @@ impl MessageList {
                         } else if has_ctrl {
                             // Ctrl+click: toggle individual row in selection
                             let is_selected = lb.selected_rows().iter().any(|r| r.index() == index);
+                            let clicked_uid = MessageList::uid_from_row(&row);
                             let mut uids = imp.selected_uids.borrow_mut();
 
                             if is_selected {
-                                if let Some(msg) = filtered.get(index as usize) {
-                                    uids.retain(|u| *u != msg.uid);
+                                if let Some(uid) = clicked_uid {
+                                    uids.retain(|u| *u != uid);
                                 }
                             } else {
-                                if let Some(msg) = filtered.get(index as usize) {
-                                    if !uids.contains(&msg.uid) {
-                                        uids.push(msg.uid);
+                                if let Some(uid) = clicked_uid {
+                                    if !uids.contains(&uid) {
+                                        uids.push(uid);
                                     }
                                 }
                             }
                             drop(uids);
-                            drop(filtered);
-                            drop(messages);
 
                             // Update GTK selection with guard
                             imp.is_rebuilding.set(true);
@@ -1287,9 +1288,7 @@ impl MessageList {
                         } else {
                             // Plain click: select only this row, show message
                             imp.anchor_index.set(Some(index));
-                            let clicked_uid = filtered.get(index as usize).map(|m| m.uid);
-                            drop(filtered);
-                            drop(messages);
+                            let clicked_uid = MessageList::uid_from_row(&row);
                             // Update GTK selection after dropping borrows
                             imp.is_rebuilding.set(true);
                             lb.unselect_all();
@@ -1316,15 +1315,9 @@ impl MessageList {
                         if let Some(row) = row {
                             let index = row.index();
                             let imp = widget_kb.imp();
-                            let messages = imp.messages.borrow();
-                            let skip_search = imp.is_search_results.get();
-                            let filtered: Vec<&MessageInfo> = messages.iter()
-                                .filter(|m| widget_kb.message_matches_with_options(m, skip_search))
-                                .collect();
-                            if let Some(msg) = filtered.get(index as usize) {
-                                let uid = msg.uid;
-                                drop(filtered);
-                                drop(messages);
+                            // Read UID directly from the row widget instead of
+                            // index-based lookup which can desync with GTK rows.
+                            if let Some(uid) = MessageList::uid_from_row(row) {
                                 let mut uids = imp.selected_uids.borrow_mut();
                                 uids.clear();
                                 uids.push(uid);
@@ -1446,6 +1439,11 @@ impl MessageList {
         let row = gtk4::ListBoxRow::builder()
             .activatable(true)
             .build();
+
+        // Store the message UID on the row so click/keyboard handlers
+        // can identify which message this row represents without
+        // relying on index-based lookup (which can desync).
+        row.set_widget_name(&format!("msg-uid-{}", msg.uid));
 
         // Main horizontal box
         let hbox = gtk4::Box::builder()
