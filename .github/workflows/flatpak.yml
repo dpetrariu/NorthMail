@@ -82,7 +82,7 @@ jobs:
           mkdir -p ${PKG_DIR}/usr/share/icons/hicolor/scalable/apps
           for size in 16x16 32x32 48x48 64x64 128x128 256x256 512x512; do
             mkdir -p ${PKG_DIR}/usr/share/icons/hicolor/${size}/apps
-            cp data/icons/hicolor/${size}/apps/com.petrariu.NorthMail.svg \
+            cp data/icons/hicolor/${size}/apps/com.petrariu.NorthMail.png \
               ${PKG_DIR}/usr/share/icons/hicolor/${size}/apps/
           done
           cp target/release/northmail ${PKG_DIR}/usr/bin/
@@ -176,7 +176,7 @@ jobs:
           mkdir -p ${STAGING}/usr/share/icons/hicolor/scalable/apps
           for size in 16x16 32x32 48x48 64x64 128x128 256x256 512x512; do
             mkdir -p ${STAGING}/usr/share/icons/hicolor/${size}/apps
-            cp data/icons/hicolor/${size}/apps/com.petrariu.NorthMail.svg \
+            cp data/icons/hicolor/${size}/apps/com.petrariu.NorthMail.png \
               ${STAGING}/usr/share/icons/hicolor/${size}/apps/
           done
           cp target/release/northmail ${STAGING}/usr/bin/
@@ -207,7 +207,7 @@ jobs:
           %{_datadir}/applications/com.petrariu.NorthMail.desktop
           %{_datadir}/metainfo/com.petrariu.NorthMail.metainfo.xml
           %{_datadir}/glib-2.0/schemas/com.petrariu.NorthMail.gschema.xml
-          %{_datadir}/icons/hicolor/*/apps/com.petrariu.NorthMail.svg
+          %{_datadir}/icons/hicolor/*/apps/com.petrariu.NorthMail.png
           %post
           glib-compile-schemas %{_datadir}/glib-2.0/schemas/ &>/dev/null || :
           gtk4-update-icon-cache %{_datadir}/icons/hicolor/ &>/dev/null || :
