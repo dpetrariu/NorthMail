@@ -387,10 +387,6 @@ mod imp {
         pub(super) last_inbox_counts: RefCell<HashMap<String, i64>>,
         /// IMAP IDLE manager for real-time push notifications
         pub(super) idle_manager: OnceCell<Arc<IdleManager>>,
-        /// Receiver for IDLE manager events
-        pub(super) idle_event_receiver: RefCell<Option<std::sync::mpsc::Receiver<IdleManagerEvent>>>,
-        /// Receiver for GOA account change events
-        pub(super) goa_event_receiver: RefCell<Option<std::sync::mpsc::Receiver<northmail_auth::GoaAccountEvent>>>,
         /// Accounts currently being synced (prevents duplicate concurrent syncs)
         pub(super) syncing_accounts: RefCell<std::collections::HashSet<String>>,
         /// Accounts that have done a full folder LIST this session (skip cache on first sync)
@@ -1130,92 +1126,87 @@ impl NorthMailApplication {
 
     /// Initialize the IDLE manager and start event loop
     fn init_idle_manager(&self) {
-        let (idle_manager, event_rx) = IdleManager::new();
+        let app = self.clone();
 
-        // Store the manager and receiver
+        // Create an async channel — wakes the GLib main loop only when events arrive
+        let (sender, mut receiver) = futures::channel::mpsc::unbounded::<IdleManagerEvent>();
+
+        let idle_manager = IdleManager::new(sender);
+
+        // Store the manager
         if self.imp().idle_manager.set(idle_manager.clone()).is_err() {
             warn!("IDLE manager already initialized");
             return;
         }
-        self.imp().idle_event_receiver.replace(Some(event_rx));
 
-        info!("IDLE manager initialized");
-
-        // Start the event loop
-        self.start_idle_event_loop();
-
-        // Start IDLE for all accounts (will happen after accounts are loaded)
-        // The actual IDLE connections will be started in load_accounts or after sync
-    }
-
-    /// Start the IDLE event processing loop
-    fn start_idle_event_loop(&self) {
-        let app = self.clone();
-
-        // Poll for IDLE events every 500ms
-        glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
-            let receiver = app.imp().idle_event_receiver.borrow();
-            if let Some(rx) = receiver.as_ref() {
-                while let Ok(event) = rx.try_recv() {
-                    match event {
-                        IdleManagerEvent::NewMail { account_id } => {
-                            info!("IDLE: New mail for account {}", account_id);
-                            // Trigger a quick sync for this account
-                            app.quick_sync_account(&account_id);
-                        }
-                        IdleManagerEvent::ConnectionLost { account_id } => {
-                            warn!("IDLE: Connection lost for account {}", account_id);
-                            // Will auto-reconnect via the worker
-                        }
-                        IdleManagerEvent::NotSupported { account_id } => {
-                            warn!("IDLE: Not supported for account {}, falling back to periodic sync", account_id);
-                            // Stop the IDLE worker - periodic sync timer handles polling
-                            if let Some(idle_mgr) = app.imp().idle_manager.get() {
-                                idle_mgr.stop_idle(&account_id);
-                            }
+        // Spawn a future on the GLib main loop that awaits events — zero CPU at idle
+        glib::spawn_future_local(async move {
+            use futures::StreamExt;
+            while let Some(event) = receiver.next().await {
+                match event {
+                    IdleManagerEvent::NewMail { account_id } => {
+                        info!("IDLE: New mail for account {}", account_id);
+                        app.quick_sync_account(&account_id);
+                    }
+                    IdleManagerEvent::ConnectionLost { account_id } => {
+                        warn!("IDLE: Connection lost for account {}", account_id);
+                        // Will auto-reconnect via the worker
+                    }
+                    IdleManagerEvent::NotSupported { account_id } => {
+                        warn!("IDLE: Not supported for account {}, falling back to periodic sync", account_id);
+                        if let Some(idle_mgr) = app.imp().idle_manager.get() {
+                            idle_mgr.stop_idle(&account_id);
                         }
                     }
                 }
             }
-            glib::ControlFlow::Continue
         });
+
+        info!("IDLE manager initialized");
     }
 
     /// Start monitoring GOA account changes (additions/removals) at runtime
     fn start_goa_account_monitor(&self) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.imp().goa_event_receiver.replace(Some(rx));
+        let (std_tx, std_rx) = std::sync::mpsc::channel();
 
         // Spawn background thread with its own tokio runtime
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            if let Err(e) = rt.block_on(northmail_auth::GoaManager::watch_account_changes(tx)) {
+            if let Err(e) = rt.block_on(northmail_auth::GoaManager::watch_account_changes(std_tx)) {
                 warn!("GOA account watcher stopped with error: {}", e);
             }
         });
 
-        info!("GOA account monitor started");
+        // Create an async channel and bridge from the std channel
+        let (async_tx, mut async_rx) = futures::channel::mpsc::unbounded::<northmail_auth::GoaAccountEvent>();
 
-        // Poll for GOA events every 500ms (same pattern as IDLE event loop)
+        // Bridge thread: blocks on std_rx.recv() (zero CPU when idle), forwards to async channel
+        std::thread::spawn(move || {
+            while let Ok(event) = std_rx.recv() {
+                if async_tx.unbounded_send(event).is_err() {
+                    break;
+                }
+            }
+        });
+
         let app = self.clone();
-        glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
-            let receiver = app.imp().goa_event_receiver.borrow();
-            if let Some(rx) = receiver.as_ref() {
-                while let Ok(event) = rx.try_recv() {
-                    match event {
-                        northmail_auth::GoaAccountEvent::AccountAdded => {
-                            info!("GOA: Account added, reloading accounts");
-                            app.reload_goa_accounts();
-                        }
-                        northmail_auth::GoaAccountEvent::AccountRemoved => {
-                            info!("GOA: Account removed, reloading accounts");
-                            app.reload_goa_accounts();
-                        }
+        glib::spawn_future_local(async move {
+            use futures::StreamExt;
+            while let Some(event) = async_rx.next().await {
+                match event {
+                    northmail_auth::GoaAccountEvent::AccountAdded => {
+                        info!("GOA: Account added, reloading accounts");
+                        app.reload_goa_accounts();
+                    }
+                    northmail_auth::GoaAccountEvent::AccountRemoved => {
+                        info!("GOA: Account removed, reloading accounts");
+                        app.reload_goa_accounts();
                     }
                 }
             }
-            glib::ControlFlow::Continue
         });
+
+        info!("GOA account monitor started");
     }
 
     /// Reload GOA accounts after a runtime change (account added/removed)

@@ -4,11 +4,11 @@
 //! detecting new mail in real-time and sending events to the main application.
 
 use std::collections::HashMap;
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use futures::channel::mpsc as futures_mpsc;
 use northmail_imap::{IdleEvent, SimpleImapClient};
 use tracing::{debug, error, info, warn};
 
@@ -60,21 +60,17 @@ struct IdleWorkerHandle {
 pub struct IdleManager {
     /// Active workers keyed by account ID
     workers: Mutex<HashMap<String, IdleWorkerHandle>>,
-    /// Channel to send events to the application
-    event_tx: mpsc::Sender<IdleManagerEvent>,
+    /// Channel to send events to the application (async-aware, zero CPU when idle)
+    event_tx: futures_mpsc::UnboundedSender<IdleManagerEvent>,
 }
 
 impl IdleManager {
-    /// Create a new IDLE manager
-    ///
-    /// Returns the manager and a receiver for events
-    pub fn new() -> (Arc<Self>, mpsc::Receiver<IdleManagerEvent>) {
-        let (event_tx, event_rx) = mpsc::channel();
-        let manager = Arc::new(Self {
+    /// Create a new IDLE manager with the given sender
+    pub fn new(event_tx: futures_mpsc::UnboundedSender<IdleManagerEvent>) -> Arc<Self> {
+        Arc::new(Self {
             workers: Mutex::new(HashMap::new()),
             event_tx,
-        });
-        (manager, event_rx)
+        })
     }
 
     /// Start IDLE monitoring for an account
@@ -144,7 +140,7 @@ impl IdleManager {
 /// Worker loop that maintains IDLE connection for one account
 fn idle_worker_loop(
     credentials: IdleCredentials,
-    event_tx: mpsc::Sender<IdleManagerEvent>,
+    event_tx: futures_mpsc::UnboundedSender<IdleManagerEvent>,
     shutdown_rx: mpsc::Receiver<()>,
 ) {
     let account_id = credentials.account_id.clone();
@@ -192,7 +188,7 @@ fn idle_worker_loop(
 
             if let Err(e) = connect_result {
                 error!("IDLE connect failed for {}: {}", account_id, e);
-                let _ = event_tx.send(IdleManagerEvent::ConnectionLost {
+                let _ = event_tx.unbounded_send(IdleManagerEvent::ConnectionLost {
                     account_id: account_id.clone(),
                 });
 
@@ -235,7 +231,7 @@ fn idle_worker_loop(
                             warn!("IDLE DONE failed for {}: {}", account_id, e);
                             break; // Reconnect
                         }
-                        let _ = event_tx.send(IdleManagerEvent::NewMail {
+                        let _ = event_tx.unbounded_send(IdleManagerEvent::NewMail {
                             account_id: account_id.clone(),
                         });
                         // Re-select to refresh state
@@ -282,7 +278,7 @@ fn idle_worker_loop(
                     }
                     Ok(IdleEvent::ServerBye) => {
                         info!("Server closed IDLE connection for {}", account_id);
-                        let _ = event_tx.send(IdleManagerEvent::ConnectionLost {
+                        let _ = event_tx.unbounded_send(IdleManagerEvent::ConnectionLost {
                             account_id: account_id.clone(),
                         });
                         break; // Reconnect
@@ -293,14 +289,14 @@ fn idle_worker_loop(
                         // instead of '+' continuation
                         if err_msg.contains("Expected '+' continuation") {
                             warn!("IDLE not supported by server for {}: {}", account_id, err_msg);
-                            let _ = event_tx.send(IdleManagerEvent::NotSupported {
+                            let _ = event_tx.unbounded_send(IdleManagerEvent::NotSupported {
                                 account_id: account_id.clone(),
                             });
                             let _ = client.logout().await;
                             return; // Stop entirely - don't reconnect
                         }
                         error!("IDLE error for {}: {}", account_id, e);
-                        let _ = event_tx.send(IdleManagerEvent::ConnectionLost {
+                        let _ = event_tx.unbounded_send(IdleManagerEvent::ConnectionLost {
                             account_id: account_id.clone(),
                         });
                         break; // Reconnect
